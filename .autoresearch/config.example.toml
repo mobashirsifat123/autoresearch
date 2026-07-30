@@ -1,0 +1,34 @@
+# Copy to .autoresearch/config.toml. Store API-key values only in environment variables.
+
+[providers.reasoning]
+kind = "openai_compatible"
+base_url = "https://api.example.com/v1"
+api_key_env = "AUTORESEARCH_LLM_API_KEY"
+concurrency = 4
+requests_per_second = 2
+max_retries = 2
+
+[providers.embeddings]
+kind = "external_embeddings"
+base_url = "https://api.example.com/v1"
+api_key_env = "AUTORESEARCH_EMBEDDING_API_KEY"
+embedding_dimension = 1536
+embedding_batch_size = 64
+concurrency = 4
+requests_per_second = 2
+
+[models.literature_extraction]
+provider = "reasoning"
+model = "provider-model-id"
+
+[models.research_reasoning]
+provider = "reasoning"
+model = "provider-model-id"
+
+[models.scientific_critic]
+provider = "reasoning"
+model = "provider-model-id"
+
+[models.embeddings]
+provider = "embeddings"
+model = "provider-embedding-model-id"

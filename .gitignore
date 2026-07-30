@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.py[cod]
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+.autoresearch/config.toml
+artifacts/
+downloads/
+dist/
+*.egg-info/
+node_modules/
+.DS_Store
