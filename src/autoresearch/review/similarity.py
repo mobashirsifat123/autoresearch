@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from datetime import datetime, timezone
+from collections.abc import Callable
 from typing import Sequence
 from uuid import uuid4
 
@@ -26,7 +27,16 @@ class ReviewRanker:
     def __init__(self, router: ModelRouter) -> None:
         self.router = router
 
-    async def rank(self, *, seed: SeedPaper, papers: Sequence[PaperRecord], reviews: Sequence[PaperReview], run_id: str) -> list[PriorityScore]:
+    async def rank(
+        self,
+        *,
+        seed: SeedPaper,
+        papers: Sequence[PaperRecord],
+        reviews: Sequence[PaperReview],
+        run_id: str,
+        embedded_vectors: Sequence[Sequence[float]] | None = None,
+        embedding_sink: Callable[[tuple[tuple[float, ...], ...]], None] | None = None,
+    ) -> list[PriorityScore]:
         review_by_paper = {review.paper_id: review for review in reviews}
         usable = [paper for paper in papers if paper.id in review_by_paper]
         if not usable:
@@ -34,11 +44,19 @@ class ReviewRanker:
         semantic_texts = [f"{seed.title} {seed.topic} {seed.text[:5000]}"] + [f"{paper.title} {paper.abstract} {review_by_paper[paper.id].problem}" for paper in usable]
         method_texts = [" ".join(seed.methods)] + [review_by_paper[paper.id].method for paper in usable]
         question_texts = [seed.research_question] + [review_by_paper[paper.id].research_question for paper in usable]
-        embedded = await self.router.embed([*semantic_texts, *method_texts, *question_texts], project_id=seed.project_id, run_id=run_id, operation="review_priority_embeddings")
+        if embedded_vectors is None:
+            embedded = await self.router.embed([*semantic_texts, *method_texts, *question_texts], project_id=seed.project_id, run_id=run_id, operation="review_priority_embeddings")
+            vectors = embedded.vectors
+            if embedding_sink:
+                embedding_sink(vectors)
+        else:
+            vectors = tuple(tuple(float(value) for value in vector) for vector in embedded_vectors)
         count = len(usable) + 1
-        semantic = embedded.vectors[:count]
-        methods = embedded.vectors[count:count * 2]
-        questions = embedded.vectors[count * 2:count * 3]
+        if len(vectors) != count * 3:
+            raise ValueError(f"Expected {count * 3} cached ranking vectors, received {len(vectors)}.")
+        semantic = vectors[:count]
+        methods = vectors[count:count * 2]
+        questions = vectors[count * 2:count * 3]
         maximum_citations = max((paper.citation_count for paper in usable), default=1) or 1
         current_year = datetime.now(timezone.utc).year
         provider, model = self.router.identity(ModelRole.EMBEDDINGS)

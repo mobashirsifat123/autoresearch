@@ -43,6 +43,20 @@ class ReviewRequest(BaseModel):
     max_runtime_seconds: float | None = Field(default=None, gt=0)
 
 
+class NoveltyRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    gap_id: str | None = Field(default=None)
+    max_cost_usd: float | None = Field(default=None, ge=0)
+    max_runtime_seconds: float | None = Field(default=None, gt=0)
+
+
+class ExperimentRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    candidate_id: str = Field(min_length=1)
+    max_cost_usd: float | None = Field(default=None, ge=0)
+    max_runtime_seconds: float | None = Field(default=None, gt=0)
+
+
 class ProjectRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     title: str = Field(min_length=1, max_length=200)
@@ -141,21 +155,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             await asyncio.sleep(0.4)
 
     async def execute_discovery(c: ApplicationContainer, run_id: str, request: DiscoverRequest, project_id: str) -> None:
-        parsed = c.discovery.parser.parse_seed(request.seed_paper)
         monitor = asyncio.create_task(monitor_run(c.repository, run_id))
         monitors[run_id] = monitor
         try:
+            parsed = c.discovery.parser.parse_seed(request.seed_paper)
             await c.discovery._execute(project_id, run_id, parsed, limit=request.limit, since_year=request.since_year, max_runtime_seconds=request.max_runtime_seconds)
         except asyncio.CancelledError:
             c.repository.cancel_run(run_id)
             emit(c.repository, run_id, "run.cancelled", {"run_id": run_id})
             raise
         except Exception as exc:
+            if c.repository.get_run(run_id) and c.repository.get_run(run_id).status is RunStatus.RUNNING:
+                c.repository.finish_run(run_id, error=redact_text(f"{type(exc).__name__}: {exc}"))
             emit(c.repository, run_id, "run.error", {"message": redact_text(f"{type(exc).__name__}: {exc}")})
         finally:
             c.repository.set_project_budget(project_id, hard_stop=request.max_cost_usd) if request.max_cost_usd is not None else None
             if not monitor.done():
-                await asyncio.sleep(0)
+                await monitor
             monitors.pop(run_id, None)
 
     async def execute_review(c: ApplicationContainer, run_id: str, project_id: str, request: ReviewRequest) -> None:
@@ -170,6 +186,44 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except Exception as exc:
             emit(c.repository, run_id, "run.error", {"message": redact_text(f"{type(exc).__name__}: {exc}")})
         finally:
+            if not monitor.done():
+                await monitor
+            monitors.pop(run_id, None)
+
+    async def execute_invent(c: ApplicationContainer, run_id: str, project_id: str, request: NoveltyRequest) -> None:
+        monitor = asyncio.create_task(monitor_run(c.repository, run_id))
+        monitors[run_id] = monitor
+        try:
+            await c.novelty.generate_portfolio(project_id, gap_id=request.gap_id)
+            c.repository.finish_run(run_id)
+        except asyncio.CancelledError:
+            c.repository.cancel_run(run_id)
+            emit(c.repository, run_id, "run.cancelled", {"run_id": run_id})
+            raise
+        except Exception as exc:
+            c.repository.finish_run(run_id, error=redact_text(f"{type(exc).__name__}: {exc}"))
+            emit(c.repository, run_id, "run.error", {"message": redact_text(f"{type(exc).__name__}: {exc}")})
+        finally:
+            if not monitor.done():
+                await monitor
+            monitors.pop(run_id, None)
+
+    async def execute_experiment(c: ApplicationContainer, run_id: str, project_id: str, request: ExperimentRequest) -> None:
+        monitor = asyncio.create_task(monitor_run(c.repository, run_id))
+        monitors[run_id] = monitor
+        try:
+            await c.experiment.execute_candidate(request.candidate_id)
+            c.repository.finish_run(run_id)
+        except asyncio.CancelledError:
+            c.repository.cancel_run(run_id)
+            emit(c.repository, run_id, "run.cancelled", {"run_id": run_id})
+            raise
+        except Exception as exc:
+            c.repository.finish_run(run_id, error=redact_text(f"{type(exc).__name__}: {exc}"))
+            emit(c.repository, run_id, "run.error", {"message": redact_text(f"{type(exc).__name__}: {exc}")})
+        finally:
+            if not monitor.done():
+                await monitor
             monitors.pop(run_id, None)
 
     def mutation_key(header: str | None) -> str:
@@ -185,8 +239,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return {"pipelines": [
             {"key": PipelineKind.DISCOVERY.value, "name": "Study Search", "enabled": True, "reason": None},
             {"key": PipelineKind.REVIEW.value, "name": "Deep Literature Review", "enabled": True, "reason": None},
-            {"key": PipelineKind.NOVELTY.value, "name": "Novelty Generation", "enabled": False, "reason": "Novelty pipeline is not implemented in the Python backend."},
-            {"key": PipelineKind.EXPERIMENT.value, "name": "Experiment Design and Execution", "enabled": False, "reason": "Experiment pipeline is not implemented in the Python backend."},
+            {"key": PipelineKind.NOVELTY.value, "name": "Novelty Generation", "enabled": True, "reason": None},
+            {"key": PipelineKind.EXPERIMENT.value, "name": "Experiment Design and Execution", "enabled": True, "reason": None},
             {"key": PipelineKind.REINVENTION.value, "name": "Result-Conditioned Reinvention", "enabled": False, "reason": "Reinvention pipeline is not implemented in the Python backend."},
         ]}
 
@@ -198,7 +252,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             provider = c.router.registry.get(name)
             config = getattr(provider, "config", None)
             key_env = getattr(config, "api_key_env", None)
-            entries.append({"name": name, "kind": getattr(config, "kind", None), "base_url": getattr(config, "base_url", None), "configured": bool(os.getenv(key_env, "")) if key_env else False, "capabilities": sorted(str(item.value) for item in getattr(provider, "capabilities", ()))})
+            entries.append({"name": name, "kind": getattr(config, "kind", None), "base_url": redact_text(str(getattr(config, "base_url", None))), "configured": bool(os.getenv(key_env, "")) if key_env else False, "capabilities": sorted(str(item.value) for item in getattr(provider, "capabilities", ()))})
         roles = []
         for role, assignment in c.router.assignments.items():
             roles.append({"role": role.value, "provider": assignment.provider, "model": assignment.model, "fallbacks": list(assignment.fallbacks)})
@@ -216,9 +270,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return {"projects": [dataclass_payload(item) for item in c.repository.list_projects()]}
 
     @app.post("/v1/projects", status_code=201, dependencies=[Depends(require_auth)])
-    async def create_project(payload: ProjectRequest):
+    async def create_project(payload: ProjectRequest, idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
         c = container()
-        return dataclass_payload(c.repository.create_project(payload.title))
+        key = mutation_key(idempotency_key)
+        prior = c.repository.project_idempotency(key)
+        if prior:
+            return prior["response"]
+        response = dataclass_payload(c.repository.create_project(payload.title))
+        c.repository.save_project_idempotency(key, str(response["id"]), response)
+        return response
 
     @app.get("/v1/projects/{project_id}", dependencies=[Depends(require_auth)])
     async def get_project(project_id: str):
@@ -234,7 +294,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         prior = c.repository.idempotency(key)
         if prior:
             return prior["response"]
-        run = c.repository.create_run(project_id, PipelineKind.DISCOVERY, payload.model_dump())
+        input_data = payload.model_dump()
+        input_data["seed_input"] = input_data.pop("seed_paper")
+        run = c.repository.create_run(project_id, PipelineKind.DISCOVERY, input_data)
         if payload.max_cost_usd is not None:
             c.repository.set_project_budget(project_id, hard_stop=payload.max_cost_usd)
         response = {"run_id": run.id, "project_id": project_id, "kind": run.kind.value, "status": run.status.value}
@@ -243,6 +305,52 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         task = asyncio.create_task(execute_discovery(c, run.id, payload, project_id))
         tasks[run.id] = task
         task.add_done_callback(lambda _task: tasks.pop(run.id, None))
+        return response
+
+    @app.post("/v1/runs/{run_id}/resume", status_code=202, dependencies=[Depends(require_auth)])
+    async def resume_run(run_id: str, idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
+        c = container()
+        run = c.repository.get_run(run_id)
+        if not run:
+            raise HTTPException(status_code=404, detail={"code": "run_not_found", "message": f"Run '{run_id}' was not found."})
+        if run.kind not in {PipelineKind.DISCOVERY, PipelineKind.REVIEW}:
+            raise HTTPException(status_code=409, detail={"code": "capability_unavailable", "message": f"Pipeline '{run.kind.value}' cannot be resumed."})
+        if run_id in tasks and not tasks[run_id].done():
+            return {"run_id": run_id, "project_id": run.project_id, "kind": run.kind.value, "status": run.status.value}
+        key = mutation_key(idempotency_key)
+        prior = c.repository.idempotency(key)
+        if prior:
+            return prior["response"]
+        c.repository.resume_run(run_id)
+        response = {"run_id": run_id, "project_id": run.project_id, "kind": run.kind.value, "status": RunStatus.RUNNING.value}
+        c.repository.save_idempotency(key, "resume", run_id, response)
+        emit(c.repository, run_id, "run.resumed", response)
+
+        async def resume_operation() -> None:
+            monitor = asyncio.create_task(monitor_run(c.repository, run_id))
+            monitors[run_id] = monitor
+            try:
+                if run.kind is PipelineKind.DISCOVERY:
+                    await c.discovery.resume(run_id)
+                else:
+                    await c.review.resume(run_id)
+            except asyncio.CancelledError:
+                c.repository.cancel_run(run_id)
+                emit(c.repository, run_id, "run.cancelled", {"run_id": run_id})
+                raise
+            except Exception as exc:
+                current = c.repository.get_run(run_id)
+                if current and current.status is RunStatus.RUNNING:
+                    c.repository.finish_run(run_id, error=redact_text(f"{type(exc).__name__}: {exc}"))
+                emit(c.repository, run_id, "run.error", {"message": redact_text(f"{type(exc).__name__}: {exc}")})
+            finally:
+                if not monitor.done():
+                    await monitor
+                monitors.pop(run_id, None)
+
+        task = asyncio.create_task(resume_operation())
+        tasks[run_id] = task
+        task.add_done_callback(lambda _task: tasks.pop(run_id, None))
         return response
 
     @app.post("/v1/projects/{project_id}/review", status_code=202, dependencies=[Depends(require_auth)])
@@ -264,9 +372,47 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         task.add_done_callback(lambda _task: tasks.pop(run.id, None))
         return response
 
+    @app.post("/v1/projects/{project_id}/invent", status_code=202, dependencies=[Depends(require_auth)])
+    async def invent(project_id: str, payload: NoveltyRequest, idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
+        c = container()
+        project_or_404(c.repository, project_id)
+        key = mutation_key(idempotency_key)
+        prior = c.repository.idempotency(key)
+        if prior:
+            return prior["response"]
+        run = c.repository.create_run(project_id, PipelineKind.NOVELTY, payload.model_dump())
+        if payload.max_cost_usd is not None:
+            c.repository.set_project_budget(project_id, hard_stop=payload.max_cost_usd)
+        response = {"run_id": run.id, "project_id": project_id, "kind": run.kind.value, "status": run.status.value}
+        c.repository.save_idempotency(key, "invent", run.id, response)
+        emit(c.repository, run.id, "run.created", response)
+        task = asyncio.create_task(execute_invent(c, run.id, project_id, payload))
+        tasks[run.id] = task
+        task.add_done_callback(lambda _task: tasks.pop(run.id, None))
+        return response
+
+    @app.post("/v1/projects/{project_id}/experiment", status_code=202, dependencies=[Depends(require_auth)])
+    async def experiment(project_id: str, payload: ExperimentRequest, idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
+        c = container()
+        project_or_404(c.repository, project_id)
+        key = mutation_key(idempotency_key)
+        prior = c.repository.idempotency(key)
+        if prior:
+            return prior["response"]
+        run = c.repository.create_run(project_id, PipelineKind.EXPERIMENT, payload.model_dump())
+        if payload.max_cost_usd is not None:
+            c.repository.set_project_budget(project_id, hard_stop=payload.max_cost_usd)
+        response = {"run_id": run.id, "project_id": project_id, "kind": run.kind.value, "status": run.status.value}
+        c.repository.save_idempotency(key, "experiment", run.id, response)
+        emit(c.repository, run.id, "run.created", response)
+        task = asyncio.create_task(execute_experiment(c, run.id, project_id, payload))
+        tasks[run.id] = task
+        task.add_done_callback(lambda _task: tasks.pop(run.id, None))
+        return response
+
     @app.post("/v1/projects/{project_id}/{pipeline}", status_code=409, dependencies=[Depends(require_auth)])
     async def unavailable_pipeline(project_id: str, pipeline: str):
-        if pipeline in {"invent", "experiment", "reinvent"}:
+        if pipeline in {"reinvent"}:
             raise HTTPException(status_code=409, detail={"code": "capability_unavailable", "message": f"{pipeline} is not implemented in the Python backend."})
         raise HTTPException(status_code=404, detail={"code": "not_found", "message": "Unknown pipeline."})
 
@@ -302,6 +448,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         return
                 else:
                     idle += 1
+                    terminal = c.repository.get_run(run_id)
+                    if terminal and terminal.status in {RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED}:
+                        return
                 await asyncio.sleep(0.4)
 
         return StreamingResponse(stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
@@ -313,26 +462,46 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return {"artifacts": [dataclass_payload(item) for item in c.repository.artifacts_for_run(run_id)]}
 
     @app.post("/v1/runs/{run_id}/cancel", dependencies=[Depends(require_auth)])
-    async def cancel_run(run_id: str):
+    async def cancel_run(run_id: str, idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
         c = container()
-        run_payload(c.repository, run_id)
+        run = c.repository.get_run(run_id)
+        if not run:
+            raise HTTPException(status_code=404, detail={"code": "run_not_found", "message": f"Run '{run_id}' was not found."})
+        key = mutation_key(idempotency_key)
+        prior = c.repository.idempotency(key)
+        if prior:
+            return prior["response"]
+        if run.status is RunStatus.CANCELLED:
+            response = {"run_id": run_id, "status": RunStatus.CANCELLED.value}
+            c.repository.save_idempotency(key, "cancel", run_id, response)
+            return response
+        if run.status in {RunStatus.COMPLETED, RunStatus.FAILED}:
+            raise HTTPException(status_code=409, detail={"code": "run_not_cancellable", "message": f"Run '{run_id}' is already {run.status.value}."})
         task = tasks.get(run_id)
         if task and not task.done():
             task.cancel()
         c.repository.cancel_run(run_id)
         emit(c.repository, run_id, "run.cancelled", {"run_id": run_id})
-        return {"run_id": run_id, "status": RunStatus.CANCELLED.value}
+        response = {"run_id": run_id, "status": RunStatus.CANCELLED.value}
+        c.repository.save_idempotency(key, "cancel", run_id, response)
+        return response
 
     @app.post("/v1/runs/{run_id}/approve", dependencies=[Depends(require_auth)])
-    async def approve_run(run_id: str, payload: ApprovalRequest):
+    async def approve_run(run_id: str, payload: ApprovalRequest, idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
         c = container()
         run_payload(c.repository, run_id)
+        key = mutation_key(idempotency_key)
+        prior = c.repository.idempotency(key)
+        if prior:
+            return prior["response"]
         c.repository.set_approval(run_id, "approved" if payload.approved else "rejected", payload.reason)
         emit(c.repository, run_id, "run.approval", {"run_id": run_id, "approved": payload.approved, "reason": payload.reason})
-        return {"run_id": run_id, "status": "approved" if payload.approved else "rejected", "reason": payload.reason}
+        response = {"run_id": run_id, "status": "approved" if payload.approved else "rejected", "reason": payload.reason}
+        c.repository.save_idempotency(key, "approve", run_id, response)
+        return response
 
     @app.get("/v1/artifacts/{artifact_id}", dependencies=[Depends(require_auth)])
-    async def artifact(artifact_id: str):
+    async def artifact(artifact_id: str, offset: int = Query(default=0, ge=0), limit: int = Query(default=65536, ge=1, le=200000)):
         c = container()
         rows = c.repository.rows("SELECT * FROM artifacts WHERE id=?", (artifact_id,))
         if not rows:
@@ -343,7 +512,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=403, detail={"code": "artifact_forbidden", "message": "Artifact path is outside the artifact root."})
         if not path.exists():
             raise HTTPException(status_code=404, detail={"code": "artifact_missing", "message": "Artifact file is missing."})
-        return {"artifact": rows[0], "content": path.read_text(encoding="utf-8")}
+        size = path.stat().st_size
+        with path.open("rb") as handle:
+            handle.seek(offset)
+            payload = handle.read(limit)
+            next_offset = offset + len(payload)
+        truncated = next_offset < size
+        return {"artifact": rows[0], "content": payload.decode("utf-8", errors="replace"), "offset": offset, "next_offset": next_offset if truncated else None, "size": size, "truncated": truncated}
 
     return app
 

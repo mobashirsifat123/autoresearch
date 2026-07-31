@@ -13,6 +13,7 @@ from autoresearch.providers.capabilities import ModelRole
 from autoresearch.providers.router import ModelRouter
 
 REVIEW_PROMPT_VERSION = "paper-review-v1"
+HIERARCHICAL_REVIEW_PROMPT_VERSION = "paper-review-hierarchical-v1"
 _STRING_ARRAY = {"type": "array", "items": {"type": "string"}}
 REVIEW_SCHEMA = {
     "type": "object",
@@ -59,25 +60,44 @@ class PaperReviewExtractor:
     def __init__(self, router: ModelRouter) -> None:
         self.router = router
 
-    async def extract(self, paper: PaperRecord, *, run_id: str, chunks: tuple[DocumentChunk, ...], fallback_text: str = "") -> ReviewBundle:
+    async def extract(self, paper: PaperRecord, *, run_id: str, chunks: tuple[DocumentChunk, ...], fallback_text: str = "", hierarchical: bool = False) -> ReviewBundle:
         source_text = "\n\n".join(f"[PAGE {chunk.page_start}; SECTION {chunk.section}]\n{chunk.text}" for chunk in chunks)
         if not source_text.strip():
             source_text = fallback_text or paper.abstract
         if not source_text.strip():
             raise ValueError(f"Paper '{paper.title}' has neither extractable PDF text nor abstract metadata.")
+        if not hierarchical or len(source_text) <= 40_000:
+            return await self._extract_source(paper, run_id=run_id, source_text=source_text, prompt_version=REVIEW_PROMPT_VERSION, operation="paper_review")
+
+        groups = _source_groups(chunks, max_characters=35_000)
+        if not groups:
+            groups = (source_text,)
+        leaves = [
+            await self._extract_source(
+                paper,
+                run_id=run_id,
+                source_text=group,
+                prompt_version=HIERARCHICAL_REVIEW_PROMPT_VERSION,
+                operation=f"paper_review_leaf_{index}",
+            )
+            for index, group in enumerate(groups, start=1)
+        ]
+        return self._merge_leaves(paper, run_id, leaves)
+
+    async def _extract_source(self, paper: PaperRecord, *, run_id: str, source_text: str, prompt_version: str, operation: str) -> ReviewBundle:
         payload = await self.router.structured_output(
             ModelRole.LITERATURE_EXTRACTION,
             messages=[
                 {"role": "system", "content": "Act as a rigorous scientific reviewer. Every evidence item must quote an exact contiguous excerpt from the supplied source. Do not infer missing results."},
-                {"role": "user", "content": f"Prompt version: {REVIEW_PROMPT_VERSION}\nPaper ID: {paper.id}\nTitle: {paper.title}\n\nSOURCE:\n{source_text[:100_000]}\n\nReturn one object with problem, research_question, method, datasets[], experimental_protocol, results[], ablations[], limitations[], failure_modes[], confidence, and evidence_spans[]. Each evidence span requires claim_type, statement, excerpt, page, section, confidence."},
+                {"role": "user", "content": f"Prompt version: {prompt_version}\nPaper ID: {paper.id}\nTitle: {paper.title}\n\nSOURCE:\n{source_text[:100_000]}\n\nReturn one object with problem, research_question, method, datasets[], experimental_protocol, results[], ablations[], limitations[], failure_modes[], confidence, and evidence_spans[]. Each evidence span requires claim_type, statement, excerpt, page, section, confidence."},
             ],
             schema={"name": "paper_review", "schema": REVIEW_SCHEMA},
             project_id=paper.project_id,
             run_id=run_id,
-            operation="paper_review",
+            operation=operation,
         )
         provider, model = self.router.identity(ModelRole.LITERATURE_EXTRACTION)
-        claims = self._claims(payload.get("evidence_spans"), paper, run_id, source_text, provider, model)
+        claims = self._claims(payload.get("evidence_spans"), paper, run_id, source_text, provider, model, prompt_version)
         if not claims:
             raise ValueError(f"Paper '{paper.title}' review did not contain a verifiable source excerpt.")
         review_content = {
@@ -88,12 +108,46 @@ class PaperReviewExtractor:
             "failure_modes": _strings(payload.get("failure_modes")), "evidence_claim_ids": tuple(claim.id for claim in claims),
             "confidence": _confidence(payload.get("confidence")),
         }
-        provenance = ArtifactProvenance.create(project_id=paper.project_id, run_id=run_id, source_evidence=tuple(claim.id for claim in claims), provider=provider, model=model, prompt_version=REVIEW_PROMPT_VERSION, content=review_content)
+        provenance = ArtifactProvenance.create(project_id=paper.project_id, run_id=run_id, source_evidence=tuple(claim.id for claim in claims), provider=provider, model=model, prompt_version=prompt_version, content=review_content)
         review = PaperReview(uuid4().hex, paper.project_id, run_id, paper.id, review_content["problem"], review_content["research_question"], review_content["method"], review_content["datasets"], review_content["experimental_protocol"], review_content["results"], review_content["ablations"], review_content["limitations"], review_content["failure_modes"], review_content["evidence_claim_ids"], review_content["confidence"], provenance)
         return ReviewBundle(review, claims)
 
+    def _merge_leaves(self, paper: PaperRecord, run_id: str, leaves: list[ReviewBundle]) -> ReviewBundle:
+        claims = tuple(claim for leaf in leaves for claim in leaf.claims)
+        reviews = [leaf.review for leaf in leaves]
+        provider, model = self.router.identity(ModelRole.LITERATURE_EXTRACTION)
+        content = {
+            "problem": _longest(review.problem for review in reviews),
+            "research_question": _longest(review.research_question for review in reviews),
+            "method": _longest(review.method for review in reviews),
+            "datasets": _unique(item for review in reviews for item in review.datasets),
+            "experimental_protocol": _longest(review.experimental_protocol for review in reviews),
+            "results": _unique(item for review in reviews for item in review.results),
+            "ablations": _unique(item for review in reviews for item in review.ablations),
+            "limitations": _unique(item for review in reviews for item in review.limitations),
+            "failure_modes": _unique(item for review in reviews for item in review.failure_modes),
+            "evidence_claim_ids": tuple(claim.id for claim in claims),
+            "confidence": round(sum(review.confidence for review in reviews) / len(reviews), 6),
+        }
+        provenance = ArtifactProvenance.create(
+            project_id=paper.project_id,
+            run_id=run_id,
+            source_evidence=content["evidence_claim_ids"],
+            provider=provider,
+            model=model,
+            prompt_version=HIERARCHICAL_REVIEW_PROMPT_VERSION,
+            content=content,
+        )
+        review = PaperReview(
+            uuid4().hex, paper.project_id, run_id, paper.id, content["problem"], content["research_question"],
+            content["method"], content["datasets"], content["experimental_protocol"], content["results"],
+            content["ablations"], content["limitations"], content["failure_modes"], content["evidence_claim_ids"],
+            content["confidence"], provenance,
+        )
+        return ReviewBundle(review, claims)
+
     @staticmethod
-    def _claims(value: object, paper: PaperRecord, run_id: str, source_text: str, provider: str, model: str) -> tuple[EvidenceClaim, ...]:
+    def _claims(value: object, paper: PaperRecord, run_id: str, source_text: str, provider: str, model: str, prompt_version: str = REVIEW_PROMPT_VERSION) -> tuple[EvidenceClaim, ...]:
         if not isinstance(value, list):
             return ()
         normalized_source = _normalize(source_text)
@@ -106,7 +160,7 @@ class PaperReviewExtractor:
             if not excerpt or not statement or _normalize(excerpt) not in normalized_source:
                 continue
             content = {"paper_id": paper.id, "statement": statement, "excerpt": excerpt, "page": raw.get("page"), "section": raw.get("section")}
-            provenance = ArtifactProvenance.create(project_id=paper.project_id, run_id=run_id, source_evidence=(f"paper:{paper.id}",), provider=provider, model=model, prompt_version=REVIEW_PROMPT_VERSION, content=content)
+            provenance = ArtifactProvenance.create(project_id=paper.project_id, run_id=run_id, source_evidence=(f"paper:{paper.id}",), provider=provider, model=model, prompt_version=prompt_version, content=content)
             page = _page(raw.get("page"))
             claims.append(EvidenceClaim(uuid4().hex, paper.project_id, run_id, paper.id, _string(raw.get("claim_type")) or "finding", statement, excerpt, page, _string(raw.get("section")) or None, _confidence(raw.get("confidence")), provenance))
         return tuple(claims)
@@ -146,3 +200,27 @@ def _page(value: object) -> int | None:
         return page if page > 0 else None
     except (TypeError, ValueError):
         return None
+
+
+def _source_groups(chunks: tuple[DocumentChunk, ...], *, max_characters: int) -> tuple[str, ...]:
+    groups: list[str] = []
+    current: list[str] = []
+    size = 0
+    for chunk in chunks:
+        rendered = f"[PAGE {chunk.page_start}; SECTION {chunk.section}]\n{chunk.text}"
+        if current and size + len(rendered) > max_characters:
+            groups.append("\n\n".join(current))
+            current, size = [], 0
+        current.append(rendered)
+        size += len(rendered)
+    if current:
+        groups.append("\n\n".join(current))
+    return tuple(groups)
+
+
+def _unique(values) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(value for value in values if value))
+
+
+def _longest(values) -> str:
+    return max((value for value in values if value), key=len)

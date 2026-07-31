@@ -8,7 +8,9 @@ from typing import Any
 
 _PATTERNS = (
     re.compile(r"(?i)(authorization\s*[:=]\s*(?:bearer\s+)?)[^\s,;]+"),
-    re.compile(r"(?i)((?:api[-_ ]?key|token|secret|password)\s*[:=]\s*)[^\s,;]+"),
+    re.compile(r"(?i)((?:api[-_ ]?key|token|secret|password)\s*[:=]\s*)[^\s,;&#]+"),
+    re.compile(r"(?i)(https?://)[^/@\s]+:[^/@\s]+@"),
+    re.compile(r"(?i)([?&](?:access_token|api_key|key|token|secret|password)=)[^&#\s]+"),
 )
 
 

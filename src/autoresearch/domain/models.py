@@ -306,6 +306,287 @@ class ArtifactReference:
     created_at: str = field(default_factory=utc_now)
 
 
+class PriorArtStatus(StrEnum):
+    UNSUPPORTED = "unsupported"
+    POTENTIALLY_NOVEL = "potentially_novel"
+    PARTIAL_OVERLAP = "partial_overlap"
+    INCREMENTAL = "incremental"
+    KNOWN_METHOD = "known_method"
+    EXPERT_REVIEW_REQUIRED = "expert_review_required"
+
+
+class CandidateStatus(StrEnum):
+    GENERATED = "generated"
+    REVISING = "revising"
+    REJECTED = "rejected"
+    PORTFOLIO_SELECTED = "portfolio_selected"
+
+
+class ExperimentDecision(StrEnum):
+    SUPPORTED = "supported"
+    PARTIALLY_SUPPORTED = "partially_supported"
+    NO_EFFECT = "no_effect"
+    IMPLEMENTATION_FAILURE = "implementation_failure"
+    OPTIMIZATION_FAILURE = "optimization_failure"
+    DATA_LIMITATION = "data_limitation"
+    EVALUATION_ARTIFACT = "evaluation_artifact"
+    COST_PROHIBITIVE = "cost_prohibitive"
+    DOMAIN_SPECIFIC = "domain_specific"
+    MECHANISM_CONTRADICTED = "mechanism_contradicted"
+
+
+@dataclass(frozen=True)
+class NoveltyCandidate:
+    id: str
+    project_id: str
+    run_id: str
+    gap_id: str
+    strategy: str
+    method: str
+    causal_mechanism: str
+    target_limitation: str
+    difference_from_existing: str
+    expected_effect: str
+    falsification_condition: str
+    minimum_validating_experiment: str
+    required_ablations: tuple[str, ...]
+    implementation_complexity: str
+    expected_compute: str
+    risks_and_objections: tuple[str, ...]
+    status: CandidateStatus
+    provenance: ArtifactProvenance
+
+
+@dataclass(frozen=True)
+class PriorArtAssessment:
+    id: str
+    project_id: str
+    run_id: str
+    candidate_id: str
+    closest_paper_ids: tuple[str, ...]
+    overlap_status: PriorArtStatus
+    mechanism_comparison: str
+    supporting_excerpts: tuple[str, ...]
+    unresolved_overlap: str
+    provenance: ArtifactProvenance
+
+
+@dataclass(frozen=True)
+class NoveltyCritique:
+    id: str
+    project_id: str
+    run_id: str
+    candidate_id: str
+    novelty_score: float
+    significance_score: float
+    causal_plausibility_score: float
+    falsifiability_score: float
+    experimental_discriminability_score: float
+    feasibility_score: float
+    implementation_risk_score: float
+    expected_information_gain_score: float
+    compute_efficiency_score: float
+    publication_potential_score: float
+    objections: tuple[str, ...]
+    failure_scenarios: tuple[str, ...]
+    provenance: ArtifactProvenance
+
+    def __post_init__(self) -> None:
+        values = (
+            self.novelty_score, self.significance_score, self.causal_plausibility_score,
+            self.falsifiability_score, self.experimental_discriminability_score, self.feasibility_score,
+            self.implementation_risk_score, self.expected_information_gain_score,
+            self.compute_efficiency_score, self.publication_potential_score
+        )
+        if any(not 0.0 <= v <= 1.0 for v in values):
+            raise ValueError("All critique scores must be between 0 and 1.")
+
+
+@dataclass(frozen=True)
+class CandidateRevision:
+    id: str
+    project_id: str
+    run_id: str
+    original_candidate_id: str
+    revised_candidate_id: str
+    critique_id: str
+    revision_count: int
+    changes_made: str
+    provenance: ArtifactProvenance
+
+
+@dataclass(frozen=True)
+class NoveltyPortfolio:
+    id: str
+    project_id: str
+    run_id: str
+    low_risk_candidate_id: str
+    balanced_candidate_id: str
+    high_risk_candidate_id: str
+    selection_reasons: Mapping[str, str]
+    provenance: ArtifactProvenance
+
+
+@dataclass(frozen=True)
+class ExperimentSpec:
+    id: str
+    project_id: str
+    run_id: str
+    candidate_id: str
+    hypothesis: str
+    causal_mechanism: str
+    falsification_condition: str
+    repository: str
+    baseline_commit: str
+    dataset_identity: str
+    dataset_checksum: str
+    split_definition: str
+    baseline_configuration: str
+    proposed_change: str
+    independent_variables: tuple[str, ...]
+    controlled_variables: tuple[str, ...]
+    metrics: tuple[str, ...]
+    random_seeds: tuple[int, ...]
+    ablations: tuple[str, ...]
+    robustness_tests: tuple[str, ...]
+    statistical_plan: str
+    compute_budget: str
+    stopping_conditions: tuple[str, ...]
+    expected_outputs: tuple[str, ...]
+    artifact_contract: str
+    provenance: ArtifactProvenance
+
+
+@dataclass(frozen=True)
+class EnvironmentManifest:
+    id: str
+    project_id: str
+    run_id: str
+    spec_id: str
+    operating_system: str
+    python_version: str
+    environment_manager: str
+    dependency_lock_checksum: str
+    cuda_compatibility: str
+    gpu_model: str
+    gpu_memory: str
+    disk_space: str
+    dataset_paths: tuple[str, ...]
+    sample_counts: Mapping[str, int]
+    splits: tuple[str, ...]
+    pretrained_checkpoint_identity: str
+    reproducibility_flags: str
+    provenance: ArtifactProvenance
+
+
+@dataclass(frozen=True)
+class ValidationReport:
+    id: str
+    project_id: str
+    run_id: str
+    manifest_id: str
+    schema_validation_passed: bool
+    static_checks_passed: bool
+    unit_tests_passed: bool
+    import_test_passed: bool
+    one_batch_forward_passed: bool
+    backward_gradient_passed: bool
+    checkpoint_save_reload_passed: bool
+    short_smoke_training_passed: bool
+    evaluation_parsing_passed: bool
+    budget_approval_passed: bool
+    details: Mapping[str, Any]
+    provenance: ArtifactProvenance
+
+    @property
+    def passed(self) -> bool:
+        return all((
+            self.schema_validation_passed, self.static_checks_passed, self.unit_tests_passed,
+            self.import_test_passed, self.one_batch_forward_passed, self.backward_gradient_passed,
+            self.checkpoint_save_reload_passed, self.short_smoke_training_passed,
+            self.evaluation_parsing_passed, self.budget_approval_passed
+        ))
+
+
+@dataclass(frozen=True)
+class ExecutionJob:
+    id: str
+    project_id: str
+    run_id: str
+    spec_id: str
+    worker: str
+    stage: str
+    status: RunStatus
+    started_at: str = field(default_factory=utc_now)
+    completed_at: str | None = None
+    timeout_seconds: int = 3600
+    retry_policy: str = "none"
+
+
+@dataclass(frozen=True)
+class ExecutionResult:
+    id: str
+    project_id: str
+    run_id: str
+    job_id: str
+    exit_code: int
+    stdout: str
+    stderr: str
+    structured_metrics: Mapping[str, Any]
+    gpu_telemetry: Mapping[str, Any]
+    checkpoint_manifest: tuple[str, ...]
+    failure_classification: str | None
+    provenance: ArtifactProvenance
+
+
+@dataclass(frozen=True)
+class StatisticalAnalysis:
+    id: str
+    project_id: str
+    run_id: str
+    spec_id: str
+    baseline_metrics: Mapping[str, Any]
+    proposed_metrics: Mapping[str, Any]
+    effect_size: Mapping[str, float]
+    confidence_intervals: Mapping[str, tuple[float, float]]
+    seed_level_results: tuple[Mapping[str, Any], ...]
+    ablation_contributions: Mapping[str, float]
+    parameter_count_diff: int
+    flops_latency_diff: float | None
+    training_inference_cost: float
+    failure_case_analysis: str
+    hypothesis_support_assessment: str
+    provenance: ArtifactProvenance
+
+
+@dataclass(frozen=True)
+class ExperimentReport:
+    id: str
+    project_id: str
+    run_id: str
+    analysis_id: str
+    literature_motivation: str
+    research_gap: str
+    hypothesis: str
+    proposed_method: str
+    implementation_diff: str
+    lineage: str
+    dataset_split: str
+    exact_commands: tuple[str, ...]
+    baseline_results: Mapping[str, Any]
+    aggregated_results: Mapping[str, Any]
+    uncertainty: str
+    ablations: str
+    robustness_tests: str
+    failed_runs: int
+    cost: float
+    limitations: str
+    reproducibility_instructions: str
+    decision: ExperimentDecision
+    decision_evidence: str
+    provenance: ArtifactProvenance
+
+
 def dataclass_payload(value: Any) -> dict[str, Any]:
     """Serialize nested dataclasses and enums into a JSON-compatible mapping."""
     return json.loads(json.dumps(asdict(value), default=str))

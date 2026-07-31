@@ -30,10 +30,25 @@ from autoresearch.domain.models import (
     SearchCandidate,
     SeedPaper,
     utc_now,
+    PriorArtStatus,
+    CandidateStatus,
+    ExperimentDecision,
+    NoveltyCandidate,
+    PriorArtAssessment,
+    NoveltyCritique,
+    CandidateRevision,
+    NoveltyPortfolio,
+    ExperimentSpec,
+    EnvironmentManifest,
+    ValidationReport,
+    ExecutionJob,
+    ExecutionResult,
+    StatisticalAnalysis,
+    ExperimentReport,
 )
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 class ResearchRepository:
@@ -73,6 +88,9 @@ class ResearchRepository:
             if current < 3:
                 connection.executescript(_SCHEMA_V3)
                 connection.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(?,?)", (3, utc_now()))
+            if current < 4:
+                connection.executescript(_SCHEMA_V4)
+                connection.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(?,?)", (4, utc_now()))
             latest = int(connection.execute("SELECT COALESCE(MAX(version), 0) FROM schema_migrations").fetchone()[0])
             if latest != SCHEMA_VERSION:
                 raise RuntimeError(f"Unsupported database schema v{latest}; expected v{SCHEMA_VERSION}.")
@@ -132,7 +150,12 @@ class ResearchRepository:
             params.append(status.value)
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
         rows = self.rows(f"SELECT id FROM pipeline_runs{where} ORDER BY started_at DESC", tuple(params))
-        return [self.get_run(row["id"]) for row in rows if self.get_run(row["id"])]
+        result: list[PipelineRun] = []
+        for row in rows:
+            run = self.get_run(row["id"])
+            if run:
+                result.append(run)
+        return result
 
     def cancel_run(self, run_id: str) -> None:
         self.execute("UPDATE pipeline_runs SET status=?,completed_at=?,error=? WHERE id=? AND status IN (?,?)", (RunStatus.CANCELLED.value, utc_now(), "Cancelled by user.", run_id, RunStatus.RUNNING.value, RunStatus.PENDING.value))
@@ -378,6 +401,15 @@ class ResearchRepository:
     def save_idempotency(self, key: str, operation: str, run_id: str, response: dict[str, Any]) -> None:
         self.execute("INSERT OR IGNORE INTO api_idempotency(key,operation,run_id,response_json,created_at) VALUES(?,?,?,?,?)", (key, operation, run_id, _json(response), utc_now()))
 
+    def project_idempotency(self, key: str) -> dict[str, Any] | None:
+        row = self.row("SELECT * FROM api_project_idempotency WHERE key=?", (key,))
+        if row:
+            row["response"] = _loads(row.pop("response_json"), {})
+        return row
+
+    def save_project_idempotency(self, key: str, project_id: str, response: dict[str, Any]) -> None:
+        self.execute("INSERT OR IGNORE INTO api_project_idempotency(key,project_id,response_json,created_at) VALUES(?,?,?,?)", (key, project_id, _json(response), utc_now()))
+
     def approval(self, run_id: str) -> dict[str, Any] | None:
         return self.row("SELECT * FROM run_approvals WHERE run_id=?", (run_id,))
 
@@ -399,6 +431,136 @@ class ResearchRepository:
     def row(self, sql: str, params: tuple[Any, ...] = ()) -> dict[str, Any] | None:
         rows = self.rows(sql, params)
         return rows[0] if rows else None
+
+    # Novelty methods
+    def save_novelty_candidate(self, candidate: NoveltyCandidate) -> None:
+        self.execute(
+            "INSERT INTO novelty_candidates(id,project_id,run_id,gap_id,strategy,method,causal_mechanism,target_limitation,difference_from_existing,expected_effect,falsification_condition,minimum_validating_experiment,required_ablations_json,implementation_complexity,expected_compute,risks_and_objections_json,status,provenance_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (candidate.id, candidate.project_id, candidate.run_id, candidate.gap_id, candidate.strategy, candidate.method, candidate.causal_mechanism, candidate.target_limitation, candidate.difference_from_existing, candidate.expected_effect, candidate.falsification_condition, candidate.minimum_validating_experiment, _json(candidate.required_ablations), candidate.implementation_complexity, candidate.expected_compute, _json(candidate.risks_and_objections), candidate.status.value, _json_provenance(candidate.provenance))
+        )
+
+    def update_novelty_candidate_status(self, candidate_id: str, status: CandidateStatus) -> None:
+        self.execute("UPDATE novelty_candidates SET status=? WHERE id=?", (status.value, candidate_id))
+
+    def novelty_candidates(self, run_id: str) -> list[NoveltyCandidate]:
+        return [_novelty_candidate(row) for row in self.rows("SELECT * FROM novelty_candidates WHERE run_id=?", (run_id,))]
+
+    def get_novelty_candidate(self, candidate_id: str) -> NoveltyCandidate | None:
+        row = self.row("SELECT * FROM novelty_candidates WHERE id=?", (candidate_id,))
+        return _novelty_candidate(row) if row else None
+
+    def save_prior_art_assessment(self, assessment: PriorArtAssessment) -> None:
+        self.execute(
+            "INSERT INTO prior_art_assessments(id,project_id,run_id,candidate_id,closest_paper_ids_json,overlap_status,mechanism_comparison,supporting_excerpts_json,unresolved_overlap,provenance_json) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (assessment.id, assessment.project_id, assessment.run_id, assessment.candidate_id, _json(assessment.closest_paper_ids), assessment.overlap_status.value, assessment.mechanism_comparison, _json(assessment.supporting_excerpts), assessment.unresolved_overlap, _json_provenance(assessment.provenance))
+        )
+
+    def get_prior_art_assessment(self, candidate_id: str) -> PriorArtAssessment | None:
+        row = self.row("SELECT * FROM prior_art_assessments WHERE candidate_id=?", (candidate_id,))
+        return _prior_art_assessment(row) if row else None
+
+    def save_novelty_critique(self, critique: NoveltyCritique) -> None:
+        self.execute(
+            "INSERT INTO novelty_critiques(id,project_id,run_id,candidate_id,novelty_score,significance_score,causal_plausibility_score,falsifiability_score,experimental_discriminability_score,feasibility_score,implementation_risk_score,expected_information_gain_score,compute_efficiency_score,publication_potential_score,objections_json,failure_scenarios_json,provenance_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (critique.id, critique.project_id, critique.run_id, critique.candidate_id, critique.novelty_score, critique.significance_score, critique.causal_plausibility_score, critique.falsifiability_score, critique.experimental_discriminability_score, critique.feasibility_score, critique.implementation_risk_score, critique.expected_information_gain_score, critique.compute_efficiency_score, critique.publication_potential_score, _json(critique.objections), _json(critique.failure_scenarios), _json_provenance(critique.provenance))
+        )
+
+    def get_novelty_critique(self, candidate_id: str) -> NoveltyCritique | None:
+        row = self.row("SELECT * FROM novelty_critiques WHERE candidate_id=?", (candidate_id,))
+        return _novelty_critique(row) if row else None
+
+    def save_candidate_revision(self, revision: CandidateRevision) -> None:
+        self.execute(
+            "INSERT INTO candidate_revisions(id,project_id,run_id,original_candidate_id,revised_candidate_id,critique_id,revision_count,changes_made,provenance_json) VALUES(?,?,?,?,?,?,?,?,?)",
+            (revision.id, revision.project_id, revision.run_id, revision.original_candidate_id, revision.revised_candidate_id, revision.critique_id, revision.revision_count, revision.changes_made, _json_provenance(revision.provenance))
+        )
+
+    def candidate_revisions(self, original_candidate_id: str) -> list[CandidateRevision]:
+        return [_candidate_revision(row) for row in self.rows("SELECT * FROM candidate_revisions WHERE original_candidate_id=? ORDER BY revision_count", (original_candidate_id,))]
+
+    def save_novelty_portfolio(self, portfolio: NoveltyPortfolio) -> None:
+        self.execute(
+            "INSERT INTO novelty_portfolios(id,project_id,run_id,low_risk_candidate_id,balanced_candidate_id,high_risk_candidate_id,selection_reasons_json,provenance_json) VALUES(?,?,?,?,?,?,?,?)",
+            (portfolio.id, portfolio.project_id, portfolio.run_id, portfolio.low_risk_candidate_id, portfolio.balanced_candidate_id, portfolio.high_risk_candidate_id, _json(portfolio.selection_reasons), _json_provenance(portfolio.provenance))
+        )
+
+    def get_novelty_portfolio(self, run_id: str) -> NoveltyPortfolio | None:
+        row = self.row("SELECT * FROM novelty_portfolios WHERE run_id=?", (run_id,))
+        return _novelty_portfolio(row) if row else None
+
+    # Experiment methods
+    def save_experiment_spec(self, spec: ExperimentSpec) -> None:
+        self.execute(
+            "INSERT INTO experiment_specs(id,project_id,run_id,candidate_id,hypothesis,causal_mechanism,falsification_condition,repository,baseline_commit,dataset_identity,dataset_checksum,split_definition,baseline_configuration,proposed_change,independent_variables_json,controlled_variables_json,metrics_json,random_seeds_json,ablations_json,robustness_tests_json,statistical_plan,compute_budget,stopping_conditions_json,expected_outputs_json,artifact_contract,provenance_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (spec.id, spec.project_id, spec.run_id, spec.candidate_id, spec.hypothesis, spec.causal_mechanism, spec.falsification_condition, spec.repository, spec.baseline_commit, spec.dataset_identity, spec.dataset_checksum, spec.split_definition, spec.baseline_configuration, spec.proposed_change, _json(spec.independent_variables), _json(spec.controlled_variables), _json(spec.metrics), _json(spec.random_seeds), _json(spec.ablations), _json(spec.robustness_tests), spec.statistical_plan, spec.compute_budget, _json(spec.stopping_conditions), _json(spec.expected_outputs), spec.artifact_contract, _json_provenance(spec.provenance))
+        )
+
+    def get_experiment_spec(self, candidate_id: str) -> ExperimentSpec | None:
+        row = self.row("SELECT * FROM experiment_specs WHERE candidate_id=?", (candidate_id,))
+        return _experiment_spec(row) if row else None
+
+    def save_environment_manifest(self, manifest: EnvironmentManifest) -> None:
+        self.execute(
+            "INSERT INTO environment_manifests(id,project_id,run_id,spec_id,operating_system,python_version,environment_manager,dependency_lock_checksum,cuda_compatibility,gpu_model,gpu_memory,disk_space,dataset_paths_json,sample_counts_json,splits_json,pretrained_checkpoint_identity,reproducibility_flags,provenance_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (manifest.id, manifest.project_id, manifest.run_id, manifest.spec_id, manifest.operating_system, manifest.python_version, manifest.environment_manager, manifest.dependency_lock_checksum, manifest.cuda_compatibility, manifest.gpu_model, manifest.gpu_memory, manifest.disk_space, _json(manifest.dataset_paths), _json(manifest.sample_counts), _json(manifest.splits), manifest.pretrained_checkpoint_identity, manifest.reproducibility_flags, _json_provenance(manifest.provenance))
+        )
+
+    def get_environment_manifest(self, spec_id: str) -> EnvironmentManifest | None:
+        row = self.row("SELECT * FROM environment_manifests WHERE spec_id=?", (spec_id,))
+        return _environment_manifest(row) if row else None
+
+    def save_validation_report(self, report: ValidationReport) -> None:
+        self.execute(
+            "INSERT INTO validation_reports(id,project_id,run_id,manifest_id,schema_validation_passed,static_checks_passed,unit_tests_passed,import_test_passed,one_batch_forward_passed,backward_gradient_passed,checkpoint_save_reload_passed,short_smoke_training_passed,evaluation_parsing_passed,budget_approval_passed,details_json,provenance_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (report.id, report.project_id, report.run_id, report.manifest_id, int(report.schema_validation_passed), int(report.static_checks_passed), int(report.unit_tests_passed), int(report.import_test_passed), int(report.one_batch_forward_passed), int(report.backward_gradient_passed), int(report.checkpoint_save_reload_passed), int(report.short_smoke_training_passed), int(report.evaluation_parsing_passed), int(report.budget_approval_passed), _json(report.details), _json_provenance(report.provenance))
+        )
+
+    def get_validation_report(self, manifest_id: str) -> ValidationReport | None:
+        row = self.row("SELECT * FROM validation_reports WHERE manifest_id=?", (manifest_id,))
+        return _validation_report(row) if row else None
+
+    def save_execution_job(self, job: ExecutionJob) -> None:
+        self.execute(
+            "INSERT INTO execution_jobs(id,project_id,run_id,spec_id,worker,stage,status,started_at,completed_at,timeout_seconds,retry_policy) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET status=excluded.status,completed_at=excluded.completed_at",
+            (job.id, job.project_id, job.run_id, job.spec_id, job.worker, job.stage, job.status.value, job.started_at, job.completed_at, job.timeout_seconds, job.retry_policy)
+        )
+
+    def get_execution_job(self, job_id: str) -> ExecutionJob | None:
+        row = self.row("SELECT * FROM execution_jobs WHERE id=?", (job_id,))
+        return _execution_job(row) if row else None
+
+    def execution_jobs(self, spec_id: str) -> list[ExecutionJob]:
+        return [_execution_job(row) for row in self.rows("SELECT * FROM execution_jobs WHERE spec_id=? ORDER BY started_at", (spec_id,))]
+
+    def save_execution_result(self, result: ExecutionResult) -> None:
+        self.execute(
+            "INSERT INTO execution_results(id,project_id,run_id,job_id,exit_code,stdout,stderr,structured_metrics_json,gpu_telemetry_json,checkpoint_manifest_json,failure_classification,provenance_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (result.id, result.project_id, result.run_id, result.job_id, result.exit_code, result.stdout, result.stderr, _json(result.structured_metrics), _json(result.gpu_telemetry), _json(result.checkpoint_manifest), result.failure_classification, _json_provenance(result.provenance))
+        )
+
+    def get_execution_result(self, job_id: str) -> ExecutionResult | None:
+        row = self.row("SELECT * FROM execution_results WHERE job_id=?", (job_id,))
+        return _execution_result(row) if row else None
+
+    def save_statistical_analysis(self, analysis: StatisticalAnalysis) -> None:
+        self.execute(
+            "INSERT INTO statistical_analyses(id,project_id,run_id,spec_id,baseline_metrics_json,proposed_metrics_json,effect_size_json,confidence_intervals_json,seed_level_results_json,ablation_contributions_json,parameter_count_diff,flops_latency_diff,training_inference_cost,failure_case_analysis,hypothesis_support_assessment,provenance_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (analysis.id, analysis.project_id, analysis.run_id, analysis.spec_id, _json(analysis.baseline_metrics), _json(analysis.proposed_metrics), _json(analysis.effect_size), _json(analysis.confidence_intervals), _json(analysis.seed_level_results), _json(analysis.ablation_contributions), analysis.parameter_count_diff, analysis.flops_latency_diff, analysis.training_inference_cost, analysis.failure_case_analysis, analysis.hypothesis_support_assessment, _json_provenance(analysis.provenance))
+        )
+
+    def get_statistical_analysis(self, spec_id: str) -> StatisticalAnalysis | None:
+        row = self.row("SELECT * FROM statistical_analyses WHERE spec_id=?", (spec_id,))
+        return _statistical_analysis(row) if row else None
+
+    def save_experiment_report(self, report: ExperimentReport) -> None:
+        self.execute(
+            "INSERT INTO experiment_reports(id,project_id,run_id,analysis_id,literature_motivation,research_gap,hypothesis,proposed_method,implementation_diff,lineage,dataset_split,exact_commands_json,baseline_results_json,aggregated_results_json,uncertainty,ablations,robustness_tests,failed_runs,cost,limitations,reproducibility_instructions,decision,decision_evidence,provenance_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (report.id, report.project_id, report.run_id, report.analysis_id, report.literature_motivation, report.research_gap, report.hypothesis, report.proposed_method, report.implementation_diff, report.lineage, report.dataset_split, _json(report.exact_commands), _json(report.baseline_results), _json(report.aggregated_results), report.uncertainty, report.ablations, report.robustness_tests, report.failed_runs, report.cost, report.limitations, report.reproducibility_instructions, report.decision.value, report.decision_evidence, _json_provenance(report.provenance))
+        )
+
+    def get_experiment_report(self, analysis_id: str) -> ExperimentReport | None:
+        row = self.row("SELECT * FROM experiment_reports WHERE analysis_id=?", (analysis_id,))
+        return _experiment_report(row) if row else None
 
 
 def _json(value: Any) -> str:
@@ -446,6 +608,43 @@ def _score(row: dict[str, Any]) -> PriorityScore:
 
 def _gap(row: dict[str, Any]) -> ResearchGap:
     return ResearchGap(row["id"], row["project_id"], row["run_id"], row["statement"], tuple(_loads(row["supporting_paper_ids_json"], [])), tuple(_loads(row["supporting_claim_ids_json"], [])), row["why_unsolved"], row["missing_experiment"], row["falsification_test"], float(row["confidence"]), tuple(_loads(row["counter_evidence_claim_ids_json"], [])), GapClassification(row["classification"]), _provenance(row["provenance_json"]))
+
+
+def _novelty_candidate(row: dict[str, Any]) -> NoveltyCandidate:
+    return NoveltyCandidate(row["id"], row["project_id"], row["run_id"], row["gap_id"], row["strategy"], row["method"], row["causal_mechanism"], row["target_limitation"], row["difference_from_existing"], row["expected_effect"], row["falsification_condition"], row["minimum_validating_experiment"], tuple(_loads(row["required_ablations_json"], [])), row["implementation_complexity"], row["expected_compute"], tuple(_loads(row["risks_and_objections_json"], [])), CandidateStatus(row["status"]), _provenance(row["provenance_json"]))
+
+def _prior_art_assessment(row: dict[str, Any]) -> PriorArtAssessment:
+    return PriorArtAssessment(row["id"], row["project_id"], row["run_id"], row["candidate_id"], tuple(_loads(row["closest_paper_ids_json"], [])), PriorArtStatus(row["overlap_status"]), row["mechanism_comparison"], tuple(_loads(row["supporting_excerpts_json"], [])), row["unresolved_overlap"], _provenance(row["provenance_json"]))
+
+def _novelty_critique(row: dict[str, Any]) -> NoveltyCritique:
+    return NoveltyCritique(row["id"], row["project_id"], row["run_id"], row["candidate_id"], float(row["novelty_score"]), float(row["significance_score"]), float(row["causal_plausibility_score"]), float(row["falsifiability_score"]), float(row["experimental_discriminability_score"]), float(row["feasibility_score"]), float(row["implementation_risk_score"]), float(row["expected_information_gain_score"]), float(row["compute_efficiency_score"]), float(row["publication_potential_score"]), tuple(_loads(row["objections_json"], [])), tuple(_loads(row["failure_scenarios_json"], [])), _provenance(row["provenance_json"]))
+
+def _candidate_revision(row: dict[str, Any]) -> CandidateRevision:
+    return CandidateRevision(row["id"], row["project_id"], row["run_id"], row["original_candidate_id"], row["revised_candidate_id"], row["critique_id"], int(row["revision_count"]), row["changes_made"], _provenance(row["provenance_json"]))
+
+def _novelty_portfolio(row: dict[str, Any]) -> NoveltyPortfolio:
+    return NoveltyPortfolio(row["id"], row["project_id"], row["run_id"], row["low_risk_candidate_id"], row["balanced_candidate_id"], row["high_risk_candidate_id"], _loads(row["selection_reasons_json"], {}), _provenance(row["provenance_json"]))
+
+def _experiment_spec(row: dict[str, Any]) -> ExperimentSpec:
+    return ExperimentSpec(row["id"], row["project_id"], row["run_id"], row["candidate_id"], row["hypothesis"], row["causal_mechanism"], row["falsification_condition"], row["repository"], row["baseline_commit"], row["dataset_identity"], row["dataset_checksum"], row["split_definition"], row["baseline_configuration"], row["proposed_change"], tuple(_loads(row["independent_variables_json"], [])), tuple(_loads(row["controlled_variables_json"], [])), tuple(_loads(row["metrics_json"], [])), tuple(_loads(row["random_seeds_json"], [])), tuple(_loads(row["ablations_json"], [])), tuple(_loads(row["robustness_tests_json"], [])), row["statistical_plan"], row["compute_budget"], tuple(_loads(row["stopping_conditions_json"], [])), tuple(_loads(row["expected_outputs_json"], [])), row["artifact_contract"], _provenance(row["provenance_json"]))
+
+def _environment_manifest(row: dict[str, Any]) -> EnvironmentManifest:
+    return EnvironmentManifest(row["id"], row["project_id"], row["run_id"], row["spec_id"], row["operating_system"], row["python_version"], row["environment_manager"], row["dependency_lock_checksum"], row["cuda_compatibility"], row["gpu_model"], row["gpu_memory"], row["disk_space"], tuple(_loads(row["dataset_paths_json"], [])), _loads(row["sample_counts_json"], {}), tuple(_loads(row["splits_json"], [])), row["pretrained_checkpoint_identity"], row["reproducibility_flags"], _provenance(row["provenance_json"]))
+
+def _validation_report(row: dict[str, Any]) -> ValidationReport:
+    return ValidationReport(row["id"], row["project_id"], row["run_id"], row["manifest_id"], bool(row["schema_validation_passed"]), bool(row["static_checks_passed"]), bool(row["unit_tests_passed"]), bool(row["import_test_passed"]), bool(row["one_batch_forward_passed"]), bool(row["backward_gradient_passed"]), bool(row["checkpoint_save_reload_passed"]), bool(row["short_smoke_training_passed"]), bool(row["evaluation_parsing_passed"]), bool(row["budget_approval_passed"]), _loads(row["details_json"], {}), _provenance(row["provenance_json"]))
+
+def _execution_job(row: dict[str, Any]) -> ExecutionJob:
+    return ExecutionJob(row["id"], row["project_id"], row["run_id"], row["spec_id"], row["worker"], row["stage"], RunStatus(row["status"]), row["started_at"], row["completed_at"], int(row["timeout_seconds"]), row["retry_policy"])
+
+def _execution_result(row: dict[str, Any]) -> ExecutionResult:
+    return ExecutionResult(row["id"], row["project_id"], row["run_id"], row["job_id"], int(row["exit_code"]), row["stdout"], row["stderr"], _loads(row["structured_metrics_json"], {}), _loads(row["gpu_telemetry_json"], {}), tuple(_loads(row["checkpoint_manifest_json"], [])), row["failure_classification"], _provenance(row["provenance_json"]))
+
+def _statistical_analysis(row: dict[str, Any]) -> StatisticalAnalysis:
+    return StatisticalAnalysis(row["id"], row["project_id"], row["run_id"], row["spec_id"], _loads(row["baseline_metrics_json"], {}), _loads(row["proposed_metrics_json"], {}), _loads(row["effect_size_json"], {}), _loads(row["confidence_intervals_json"], {}), tuple(_loads(row["seed_level_results_json"], [])), _loads(row["ablation_contributions_json"], {}), int(row["parameter_count_diff"]), float(row["flops_latency_diff"]) if row["flops_latency_diff"] is not None else None, float(row["training_inference_cost"]), row["failure_case_analysis"], row["hypothesis_support_assessment"], _provenance(row["provenance_json"]))
+
+def _experiment_report(row: dict[str, Any]) -> ExperimentReport:
+    return ExperimentReport(row["id"], row["project_id"], row["run_id"], row["analysis_id"], row["literature_motivation"], row["research_gap"], row["hypothesis"], row["proposed_method"], row["implementation_diff"], row["lineage"], row["dataset_split"], tuple(_loads(row["exact_commands_json"], [])), _loads(row["baseline_results_json"], {}), _loads(row["aggregated_results_json"], {}), row["uncertainty"], row["ablations"], row["robustness_tests"], int(row["failed_runs"]), float(row["cost"]), row["limitations"], row["reproducibility_instructions"], ExperimentDecision(row["decision"]), row["decision_evidence"], _provenance(row["provenance_json"]))
 
 
 _SCHEMA_V1 = """
@@ -509,5 +708,233 @@ CREATE TABLE IF NOT EXISTS run_approvals(
   status TEXT NOT NULL,
   reason TEXT,
   updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS novelty_candidates(
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  run_id TEXT NOT NULL REFERENCES pipeline_runs(id),
+  gap_id TEXT NOT NULL,
+  strategy TEXT NOT NULL,
+  method TEXT NOT NULL,
+  causal_mechanism TEXT NOT NULL,
+  target_limitation TEXT NOT NULL,
+  difference_from_existing TEXT NOT NULL,
+  expected_effect TEXT NOT NULL,
+  falsification_condition TEXT NOT NULL,
+  minimum_validating_experiment TEXT NOT NULL,
+  required_ablations_json TEXT NOT NULL,
+  implementation_complexity TEXT NOT NULL,
+  expected_compute TEXT NOT NULL,
+  risks_and_objections_json TEXT NOT NULL,
+  status TEXT NOT NULL,
+  provenance_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS prior_art_assessments(
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  run_id TEXT NOT NULL REFERENCES pipeline_runs(id),
+  candidate_id TEXT NOT NULL REFERENCES novelty_candidates(id),
+  closest_paper_ids_json TEXT NOT NULL,
+  overlap_status TEXT NOT NULL,
+  mechanism_comparison TEXT NOT NULL,
+  supporting_excerpts_json TEXT NOT NULL,
+  unresolved_overlap TEXT NOT NULL,
+  provenance_json TEXT NOT NULL,
+  UNIQUE(candidate_id)
+);
+CREATE TABLE IF NOT EXISTS novelty_critiques(
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  run_id TEXT NOT NULL REFERENCES pipeline_runs(id),
+  candidate_id TEXT NOT NULL REFERENCES novelty_candidates(id),
+  novelty_score REAL NOT NULL,
+  significance_score REAL NOT NULL,
+  causal_plausibility_score REAL NOT NULL,
+  falsifiability_score REAL NOT NULL,
+  experimental_discriminability_score REAL NOT NULL,
+  feasibility_score REAL NOT NULL,
+  implementation_risk_score REAL NOT NULL,
+  expected_information_gain_score REAL NOT NULL,
+  compute_efficiency_score REAL NOT NULL,
+  publication_potential_score REAL NOT NULL,
+  objections_json TEXT NOT NULL,
+  failure_scenarios_json TEXT NOT NULL,
+  provenance_json TEXT NOT NULL,
+  UNIQUE(candidate_id)
+);
+CREATE TABLE IF NOT EXISTS candidate_revisions(
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  run_id TEXT NOT NULL REFERENCES pipeline_runs(id),
+  original_candidate_id TEXT NOT NULL REFERENCES novelty_candidates(id),
+  revised_candidate_id TEXT NOT NULL REFERENCES novelty_candidates(id),
+  critique_id TEXT NOT NULL REFERENCES novelty_critiques(id),
+  revision_count INTEGER NOT NULL,
+  changes_made TEXT NOT NULL,
+  provenance_json TEXT NOT NULL,
+  UNIQUE(original_candidate_id, revision_count)
+);
+CREATE TABLE IF NOT EXISTS novelty_portfolios(
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  run_id TEXT NOT NULL REFERENCES pipeline_runs(id),
+  low_risk_candidate_id TEXT NOT NULL REFERENCES novelty_candidates(id),
+  balanced_candidate_id TEXT NOT NULL REFERENCES novelty_candidates(id),
+  high_risk_candidate_id TEXT NOT NULL REFERENCES novelty_candidates(id),
+  selection_reasons_json TEXT NOT NULL,
+  provenance_json TEXT NOT NULL,
+  UNIQUE(run_id)
+);
+CREATE TABLE IF NOT EXISTS experiment_specs(
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  run_id TEXT NOT NULL REFERENCES pipeline_runs(id),
+  candidate_id TEXT NOT NULL REFERENCES novelty_candidates(id),
+  hypothesis TEXT NOT NULL,
+  causal_mechanism TEXT NOT NULL,
+  falsification_condition TEXT NOT NULL,
+  repository TEXT NOT NULL,
+  baseline_commit TEXT NOT NULL,
+  dataset_identity TEXT NOT NULL,
+  dataset_checksum TEXT NOT NULL,
+  split_definition TEXT NOT NULL,
+  baseline_configuration TEXT NOT NULL,
+  proposed_change TEXT NOT NULL,
+  independent_variables_json TEXT NOT NULL,
+  controlled_variables_json TEXT NOT NULL,
+  metrics_json TEXT NOT NULL,
+  random_seeds_json TEXT NOT NULL,
+  ablations_json TEXT NOT NULL,
+  robustness_tests_json TEXT NOT NULL,
+  statistical_plan TEXT NOT NULL,
+  compute_budget TEXT NOT NULL,
+  stopping_conditions_json TEXT NOT NULL,
+  expected_outputs_json TEXT NOT NULL,
+  artifact_contract TEXT NOT NULL,
+  provenance_json TEXT NOT NULL,
+  UNIQUE(candidate_id)
+);
+CREATE TABLE IF NOT EXISTS environment_manifests(
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  run_id TEXT NOT NULL REFERENCES pipeline_runs(id),
+  spec_id TEXT NOT NULL REFERENCES experiment_specs(id),
+  operating_system TEXT NOT NULL,
+  python_version TEXT NOT NULL,
+  environment_manager TEXT NOT NULL,
+  dependency_lock_checksum TEXT NOT NULL,
+  cuda_compatibility TEXT NOT NULL,
+  gpu_model TEXT NOT NULL,
+  gpu_memory TEXT NOT NULL,
+  disk_space TEXT NOT NULL,
+  dataset_paths_json TEXT NOT NULL,
+  sample_counts_json TEXT NOT NULL,
+  splits_json TEXT NOT NULL,
+  pretrained_checkpoint_identity TEXT NOT NULL,
+  reproducibility_flags TEXT NOT NULL,
+  provenance_json TEXT NOT NULL,
+  UNIQUE(spec_id)
+);
+CREATE TABLE IF NOT EXISTS validation_reports(
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  run_id TEXT NOT NULL REFERENCES pipeline_runs(id),
+  manifest_id TEXT NOT NULL REFERENCES environment_manifests(id),
+  schema_validation_passed INTEGER NOT NULL,
+  static_checks_passed INTEGER NOT NULL,
+  unit_tests_passed INTEGER NOT NULL,
+  import_test_passed INTEGER NOT NULL,
+  one_batch_forward_passed INTEGER NOT NULL,
+  backward_gradient_passed INTEGER NOT NULL,
+  checkpoint_save_reload_passed INTEGER NOT NULL,
+  short_smoke_training_passed INTEGER NOT NULL,
+  evaluation_parsing_passed INTEGER NOT NULL,
+  budget_approval_passed INTEGER NOT NULL,
+  details_json TEXT NOT NULL,
+  provenance_json TEXT NOT NULL,
+  UNIQUE(manifest_id)
+);
+CREATE TABLE IF NOT EXISTS execution_jobs(
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  run_id TEXT NOT NULL REFERENCES pipeline_runs(id),
+  spec_id TEXT NOT NULL REFERENCES experiment_specs(id),
+  worker TEXT NOT NULL,
+  stage TEXT NOT NULL,
+  status TEXT NOT NULL,
+  started_at TEXT NOT NULL,
+  completed_at TEXT,
+  timeout_seconds INTEGER NOT NULL,
+  retry_policy TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS execution_results(
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  run_id TEXT NOT NULL REFERENCES pipeline_runs(id),
+  job_id TEXT NOT NULL REFERENCES execution_jobs(id),
+  exit_code INTEGER NOT NULL,
+  stdout TEXT NOT NULL,
+  stderr TEXT NOT NULL,
+  structured_metrics_json TEXT NOT NULL,
+  gpu_telemetry_json TEXT NOT NULL,
+  checkpoint_manifest_json TEXT NOT NULL,
+  failure_classification TEXT,
+  provenance_json TEXT NOT NULL,
+  UNIQUE(job_id)
+);
+CREATE TABLE IF NOT EXISTS statistical_analyses(
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  run_id TEXT NOT NULL REFERENCES pipeline_runs(id),
+  spec_id TEXT NOT NULL REFERENCES experiment_specs(id),
+  baseline_metrics_json TEXT NOT NULL,
+  proposed_metrics_json TEXT NOT NULL,
+  effect_size_json TEXT NOT NULL,
+  confidence_intervals_json TEXT NOT NULL,
+  seed_level_results_json TEXT NOT NULL,
+  ablation_contributions_json TEXT NOT NULL,
+  parameter_count_diff INTEGER NOT NULL,
+  flops_latency_diff REAL,
+  training_inference_cost REAL NOT NULL,
+  failure_case_analysis TEXT NOT NULL,
+  hypothesis_support_assessment TEXT NOT NULL,
+  provenance_json TEXT NOT NULL,
+  UNIQUE(spec_id)
+);
+CREATE TABLE IF NOT EXISTS experiment_reports(
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  run_id TEXT NOT NULL REFERENCES pipeline_runs(id),
+  analysis_id TEXT NOT NULL REFERENCES statistical_analyses(id),
+  literature_motivation TEXT NOT NULL,
+  research_gap TEXT NOT NULL,
+  hypothesis TEXT NOT NULL,
+  proposed_method TEXT NOT NULL,
+  implementation_diff TEXT NOT NULL,
+  lineage TEXT NOT NULL,
+  dataset_split TEXT NOT NULL,
+  exact_commands_json TEXT NOT NULL,
+  baseline_results_json TEXT NOT NULL,
+  aggregated_results_json TEXT NOT NULL,
+  uncertainty TEXT NOT NULL,
+  ablations TEXT NOT NULL,
+  robustness_tests TEXT NOT NULL,
+  failed_runs INTEGER NOT NULL,
+  cost REAL NOT NULL,
+  limitations TEXT NOT NULL,
+  reproducibility_instructions TEXT NOT NULL,
+  decision TEXT NOT NULL,
+  decision_evidence TEXT NOT NULL,
+  provenance_json TEXT NOT NULL,
+  UNIQUE(analysis_id)
+);
+"""
+
+_SCHEMA_V4 = """
+CREATE TABLE IF NOT EXISTS api_project_idempotency(
+  key TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  response_json TEXT NOT NULL,
+  created_at TEXT NOT NULL
 );
 """
