@@ -33,7 +33,7 @@ from autoresearch.domain.models import (
 )
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 class ResearchRepository:
@@ -73,6 +73,9 @@ class ResearchRepository:
             if current < 3:
                 connection.executescript(_SCHEMA_V3)
                 connection.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(?,?)", (3, utc_now()))
+            if current < 4:
+                connection.executescript(_SCHEMA_V4)
+                connection.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(?,?)", (4, utc_now()))
             latest = int(connection.execute("SELECT COALESCE(MAX(version), 0) FROM schema_migrations").fetchone()[0])
             if latest != SCHEMA_VERSION:
                 raise RuntimeError(f"Unsupported database schema v{latest}; expected v{SCHEMA_VERSION}.")
@@ -132,7 +135,12 @@ class ResearchRepository:
             params.append(status.value)
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
         rows = self.rows(f"SELECT id FROM pipeline_runs{where} ORDER BY started_at DESC", tuple(params))
-        return [self.get_run(row["id"]) for row in rows if self.get_run(row["id"])]
+        result: list[PipelineRun] = []
+        for row in rows:
+            run = self.get_run(row["id"])
+            if run:
+                result.append(run)
+        return result
 
     def cancel_run(self, run_id: str) -> None:
         self.execute("UPDATE pipeline_runs SET status=?,completed_at=?,error=? WHERE id=? AND status IN (?,?)", (RunStatus.CANCELLED.value, utc_now(), "Cancelled by user.", run_id, RunStatus.RUNNING.value, RunStatus.PENDING.value))
@@ -378,6 +386,15 @@ class ResearchRepository:
     def save_idempotency(self, key: str, operation: str, run_id: str, response: dict[str, Any]) -> None:
         self.execute("INSERT OR IGNORE INTO api_idempotency(key,operation,run_id,response_json,created_at) VALUES(?,?,?,?,?)", (key, operation, run_id, _json(response), utc_now()))
 
+    def project_idempotency(self, key: str) -> dict[str, Any] | None:
+        row = self.row("SELECT * FROM api_project_idempotency WHERE key=?", (key,))
+        if row:
+            row["response"] = _loads(row.pop("response_json"), {})
+        return row
+
+    def save_project_idempotency(self, key: str, project_id: str, response: dict[str, Any]) -> None:
+        self.execute("INSERT OR IGNORE INTO api_project_idempotency(key,project_id,response_json,created_at) VALUES(?,?,?,?)", (key, project_id, _json(response), utc_now()))
+
     def approval(self, run_id: str) -> dict[str, Any] | None:
         return self.row("SELECT * FROM run_approvals WHERE run_id=?", (run_id,))
 
@@ -509,5 +526,14 @@ CREATE TABLE IF NOT EXISTS run_approvals(
   status TEXT NOT NULL,
   reason TEXT,
   updated_at TEXT NOT NULL
+);
+"""
+
+_SCHEMA_V4 = """
+CREATE TABLE IF NOT EXISTS api_project_idempotency(
+  key TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  response_json TEXT NOT NULL,
+  created_at TEXT NOT NULL
 );
 """

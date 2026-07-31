@@ -34,8 +34,8 @@ class ReviewSynthesisWriter:
         markdown_path.write_text(markdown, encoding="utf-8")
         evidence = tuple(dict.fromkeys((*gap.supporting_claim_ids, *gap.counter_evidence_claim_ids)))
         common = {"project_id": project_id, "run_id": run_id, "source_evidence": evidence, "provider": gap.provenance.provider, "model": gap.provenance.model, "prompt_version": gap.provenance.prompt_version}
-        json_artifact = ArtifactReference(uuid4().hex, artifact_type="gap_report_json", path=str(json_path), checksum=content_checksum(json_text), **common)
-        markdown_artifact = ArtifactReference(uuid4().hex, artifact_type="gap_report_markdown", path=str(markdown_path), checksum=content_checksum(markdown), **common)
+        json_artifact = ArtifactReference(content_checksum(f"gap_report_json|{run_id}")[:32], artifact_type="gap_report_json", path=str(json_path), checksum=content_checksum(json_text), **common)
+        markdown_artifact = ArtifactReference(content_checksum(f"gap_report_markdown|{run_id}")[:32], artifact_type="gap_report_markdown", path=str(markdown_path), checksum=content_checksum(markdown), **common)
         self.repository.save_artifact(json_artifact)
         self.repository.save_artifact(markdown_artifact)
         return json_artifact, markdown_artifact

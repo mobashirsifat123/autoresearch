@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -17,6 +18,7 @@ from autoresearch.providers.config import ModelAssignment
 from autoresearch.providers.registry import ProviderRegistry
 from autoresearch.providers.router import ModelRouter
 from autoresearch.providers.testing import FakeEmbeddingProvider, FakeLLMProvider
+from autoresearch.review.similarity import ReviewRanker
 from autoresearch.storage import ResearchRepository
 
 
@@ -140,4 +142,176 @@ async def test_complete_first_milestone_without_paid_api_keys(tmp_path):
     assert repository.integrity_check() == "ok"
     assert repository.row("SELECT COUNT(*) AS n FROM provider_usage")["n"] >= 24
     assert repository.review_failures(review.run_id) == []
+    await pipeline.close(); await router.close()
+
+
+class TrackingMetadataSource(DeterministicMetadataSource):
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def search(self, query: str, *, limit: int, since_year: int | None = None) -> SourceSearchResult:
+        self.calls += 1
+        return await super().search(query, limit=limit, since_year=since_year)
+
+
+class TrackingPdfResolver(DeterministicPdfResolver):
+    def __init__(self) -> None:
+        self.resolutions = 0
+        self.downloads = 0
+
+    async def resolve(self, paper: MetadataPaper) -> PdfResolution:
+        self.resolutions += 1
+        return await super().resolve(paper)
+
+    async def download(self, resolution: PdfResolution, target: Path) -> DownloadedPdf:
+        self.downloads += 1
+        return await super().download(resolution, target)
+
+
+class InterruptAfterDiscoveryPipeline(StudySearchPipeline):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.interrupt_once = True
+
+    async def discover(self, **kwargs):
+        result = await super().discover(**kwargs)
+        if self.interrupt_once:
+            self.interrupt_once = False
+            raise asyncio.CancelledError("simulated interruption after durable downloads")
+        return result
+
+
+class CountingEmbeddingProvider(FakeEmbeddingProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls = 0
+
+    async def embed_batch(self, *, model: str, texts):
+        self.calls += 1
+        return await super().embed_batch(model=model, texts=texts)
+
+
+class InterruptAfterEmbeddingRanker(ReviewRanker):
+    def __init__(self, router) -> None:
+        super().__init__(router)
+        self.interrupt_once = True
+
+    async def rank(self, **kwargs):
+        scores = await super().rank(**kwargs)
+        if self.interrupt_once:
+            self.interrupt_once = False
+            raise asyncio.CancelledError("simulated interruption after cached embeddings")
+        return scores
+
+
+def _tracking_router(repository):
+    llm = FakeLLMProvider(responder=_responder)
+    embeddings = CountingEmbeddingProvider()
+    registry = ProviderRegistry()
+    registry.register_llm("fake", llm)
+    registry.register_embeddings("fake_embeddings", embeddings)
+    assignments = {
+        ModelRole.LITERATURE_EXTRACTION: ModelAssignment(ModelRole.LITERATURE_EXTRACTION, "fake", "fake-model"),
+        ModelRole.RESEARCH_REASONING: ModelAssignment(ModelRole.RESEARCH_REASONING, "fake", "fake-model"),
+        ModelRole.SCIENTIFIC_CRITIC: ModelAssignment(ModelRole.SCIENTIFIC_CRITIC, "fake", "fake-model"),
+        ModelRole.EMBEDDINGS: ModelAssignment(ModelRole.EMBEDDINGS, "fake_embeddings", "fake-embedding-v1"),
+    }
+    return ModelRouter(registry, assignments, usage_sink=repository.record_provider_usage), llm, embeddings
+
+
+@pytest.mark.asyncio
+async def test_interrupted_discovery_resumes_without_repeating_searches_or_downloads(tmp_path):
+    repository = ResearchRepository(tmp_path / "autoresearch.sqlite3", tmp_path / "artifacts")
+    router, llm, _ = _tracking_router(repository)
+    source = TrackingMetadataSource()
+    resolver = TrackingPdfResolver()
+    pipeline = InterruptAfterDiscoveryPipeline(repository, [source], resolver, tmp_path / "downloads")
+    service = DiscoveryService(repository, router, pipeline)
+    seed = tmp_path / "seed.pdf"; _seed_pdf(seed)
+
+    with pytest.raises(asyncio.CancelledError):
+        await service.discover(seed, limit=20, since_year=2023)
+    run_id = repository.row("SELECT id FROM pipeline_runs WHERE kind='study_search'")["id"]
+    first_counts = (source.calls, resolver.resolutions, resolver.downloads, len(llm.calls))
+
+    resumed = await service.resume(run_id)
+    assert resumed.retrieved == 20
+    assert (source.calls, resolver.resolutions, resolver.downloads, len(llm.calls)) == first_counts
+    assert all(item["status"] == "completed" for item in repository.checkpoints(run_id))
+
+    repeated = await service.resume(run_id)
+    assert repeated.artifact_path == resumed.artifact_path
+    assert (source.calls, resolver.resolutions, resolver.downloads, len(llm.calls)) == first_counts
+    await pipeline.close(); await router.close()
+
+
+@pytest.mark.asyncio
+async def test_interrupted_review_reuses_reviews_and_cached_embeddings(tmp_path):
+    repository = ResearchRepository(tmp_path / "autoresearch.sqlite3", tmp_path / "artifacts")
+    router, llm, embeddings = _tracking_router(repository)
+    pipeline = StudySearchPipeline(repository, [DeterministicMetadataSource()], DeterministicPdfResolver(), tmp_path / "downloads")
+    discovery_service = DiscoveryService(repository, router, pipeline)
+    review_service = LiteratureReviewService(repository, router)
+    review_service.ranker = InterruptAfterEmbeddingRanker(router)
+    seed = tmp_path / "seed.pdf"; _seed_pdf(seed)
+    discovery = await discovery_service.discover(seed, limit=20, since_year=2023)
+
+    with pytest.raises(asyncio.CancelledError):
+        await review_service.review(discovery.project_id, top_k=5)
+    run_id = repository.row("SELECT id FROM pipeline_runs WHERE kind='deep_literature_review'")["id"]
+    paper_calls = sum("paper-review" in str(call["messages"][-1]["content"]) for call in llm.calls)
+    assert paper_calls == 20
+    assert len(repository.reviews(discovery.project_id, run_id)) == 20
+    assert embeddings.calls == 1
+
+    resumed = await review_service.resume(run_id)
+    assert resumed.reviewed == 20
+    assert embeddings.calls == 1
+    assert sum("paper-review" in str(call["messages"][-1]["content"]) for call in llm.calls) == 20
+
+    llm_count = len(llm.calls)
+    repeated = await review_service.resume(run_id)
+    assert repeated.json_report == resumed.json_report
+    assert embeddings.calls == 1 and len(llm.calls) == llm_count
+    await pipeline.close(); await router.close()
+
+
+class RecoveringMetadataSource(DeterministicMetadataSource):
+    name = "recovering_source"
+
+    def __init__(self) -> None:
+        self.attempts: dict[str, int] = {}
+
+    async def search(self, query: str, *, limit: int, since_year: int | None = None) -> SourceSearchResult:
+        self.attempts[query] = self.attempts.get(query, 0) + 1
+        if self.attempts[query] <= 3:
+            raise RuntimeError("temporary source outage")
+        result = await super().search(query, limit=limit, since_year=since_year)
+        papers = tuple(MetadataPaper(**{**paper.__dict__, "source": self.name}) for paper in result.papers)
+        return SourceSearchResult(self.name, result.query, papers, result.raw_checksum)
+
+
+@pytest.mark.asyncio
+async def test_partial_source_failure_recovers_without_repeating_successful_work(tmp_path):
+    repository = ResearchRepository(tmp_path / "autoresearch.sqlite3", tmp_path / "artifacts")
+    router, _, _ = _tracking_router(repository)
+    stable = TrackingMetadataSource()
+    recovering = RecoveringMetadataSource()
+    resolver = TrackingPdfResolver()
+    pipeline = StudySearchPipeline(repository, [stable, recovering], resolver, tmp_path / "downloads")
+    service = DiscoveryService(repository, router, pipeline)
+    seed = tmp_path / "seed.pdf"; _seed_pdf(seed)
+
+    first = await service.discover(seed, limit=20, since_year=2023)
+    assert first.retrieved == 20
+    assert len([item for item in repository.checkpoints(first.run_id) if item["status"] == "failed"]) == 4
+    stable_calls = stable.calls
+    acquisition_counts = (resolver.resolutions, resolver.downloads)
+
+    resumed = await service.resume(first.run_id)
+    assert resumed.retrieved == 20
+    assert stable.calls == stable_calls
+    assert (resolver.resolutions, resolver.downloads) == acquisition_counts
+    assert sum(attempts == 4 for attempts in recovering.attempts.values()) == 4
+    assert not [item for item in repository.checkpoints(first.run_id) if item["status"] == "failed"]
     await pipeline.close(); await router.close()

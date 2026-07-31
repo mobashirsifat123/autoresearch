@@ -8,7 +8,7 @@ def test_empty_database_migrates_idempotently(tmp_path):
     first = ResearchRepository(path, tmp_path / "artifacts")
     second = ResearchRepository(path, tmp_path / "artifacts")
     assert first.integrity_check() == "ok"
-    assert second.row("SELECT MAX(version) AS version FROM schema_migrations")["version"] == 3
+    assert second.row("SELECT MAX(version) AS version FROM schema_migrations")["version"] == 4
     assert second.row("SELECT name FROM sqlite_master WHERE type='table' AND name='api_events'") is not None
     tables = {row["name"] for row in second.rows("SELECT name FROM sqlite_master WHERE type='table'")}
     assert {"projects", "pipeline_runs", "pipeline_checkpoints", "papers", "paper_reviews", "evidence_claims", "research_gaps", "provider_usage", "artifacts"} <= tables

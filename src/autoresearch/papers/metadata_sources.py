@@ -197,16 +197,19 @@ class OpenReviewSource(HttpMetadataSource):
         super().__init__("https://api2.openreview.net", **kwargs)
 
     async def search(self, query: str, *, limit: int, since_year: int | None = None) -> SourceSearchResult:
-        payload = (await self._get("/notes/search", params={"term": query, "limit": min(limit, 1000), "offset": 0})).json()
+        payload = (await self._get("/notes/search", params={"term": query, "source": "forum", "limit": min(limit, 1000), "offset": 0})).json()
         papers = []
         for row in payload.get("notes") or []:
-            content = row.get("content") or {}
+            # Search may return a review/rebuttal note and attach the actual
+            # submission fields under forumContent. Prefer the forum payload so
+            # only paper metadata enters discovery.
+            content = row.get("forumContent") or row.get("content") or {}
             value = lambda key, default="": (content.get(key) or {}).get("value", default) if isinstance(content.get(key), dict) else content.get(key, default)
             date_ms = row.get("pdate") or row.get("cdate")
             year = int(time.gmtime(int(date_ms) / 1000).tm_year) if date_ms else None
             if since_year and year and year < since_year:
                 continue
-            identifier = _text(row.get("id"))
+            identifier = _text(row.get("forum") or row.get("id"))
             pdf_path = _text(value("pdf"))
             pdf = f"https://openreview.net{pdf_path}" if pdf_path.startswith("/") else _url(pdf_path)
             authors = value("authors", [])
