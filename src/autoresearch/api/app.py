@@ -1,0 +1,357 @@
+"""Thin HTTP/SSE boundary for the durable AutoResearch application services."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import time
+from contextlib import asynccontextmanager
+from dataclasses import asdict
+from pathlib import Path
+from typing import Any, AsyncIterator
+from uuid import uuid4
+
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel, ConfigDict, Field
+
+from autoresearch.application.factory import ApplicationContainer
+from autoresearch.application.services import DiscoveryOutcome, ReviewOutcome
+from autoresearch.domain.models import PipelineKind, RunStatus, dataclass_payload
+from autoresearch.providers.errors import ProviderError
+from autoresearch.providers.redaction import redact_text
+
+from . import __version__
+from ..application.config import Settings, load_settings
+
+
+class DiscoverRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    seed_paper: str = Field(min_length=1)
+    limit: int = Field(default=20, ge=1, le=100)
+    since_year: int | None = Field(default=None, ge=1900, le=2100)
+    max_cost_usd: float | None = Field(default=None, ge=0)
+    max_runtime_seconds: float | None = Field(default=None, gt=0)
+
+
+class ReviewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    top_k: int = Field(default=5, ge=1, le=15)
+    hierarchical: bool = True
+    max_cost_usd: float | None = Field(default=None, ge=0)
+    max_runtime_seconds: float | None = Field(default=None, gt=0)
+
+
+class ProjectRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    title: str = Field(min_length=1, max_length=200)
+
+
+class ApprovalRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    approved: bool
+    reason: str | None = Field(default=None, max_length=1000)
+
+
+def create_app(settings: Settings | None = None) -> FastAPI:
+    resolved = settings or load_settings()
+    tasks: dict[str, asyncio.Task[Any]] = {}
+    monitors: dict[str, asyncio.Task[Any]] = {}
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        try:
+            app.state.container = ApplicationContainer(resolved)
+            app.state.startup_error = None
+        except Exception as exc:
+            app.state.container = None
+            app.state.startup_error = redact_text(f"{type(exc).__name__}: {exc}")
+        yield
+        for task in [*tasks.values(), *monitors.values()]:
+            task.cancel()
+        if tasks or monitors:
+            await asyncio.gather(*[*tasks.values(), *monitors.values()], return_exceptions=True)
+        if app.state.container:
+            await app.state.container.close()
+
+    app = FastAPI(title="AutoResearch API", version=__version__, lifespan=lifespan)
+
+    @app.exception_handler(ValueError)
+    async def value_error(_request: Request, exc: ValueError):
+        return JSONResponse(status_code=400, content={"error": {"code": "invalid_request", "message": redact_text(str(exc))}})
+
+    @app.exception_handler(ProviderError)
+    async def provider_error(_request: Request, exc: ProviderError):
+        return JSONResponse(status_code=502, content={"error": {"code": exc.kind.value, "message": redact_text(str(exc)), "provider": exc.provider or None}})
+
+    def require_auth(authorization: str | None = Header(default=None), x_autoresearch_token: str | None = Header(default=None)) -> None:
+        env_name = os.getenv("AUTORESEARCH_API_AUTH_TOKEN_ENV", "").strip()
+        if not env_name:
+            return
+        expected = os.getenv(env_name, "")
+        presented = x_autoresearch_token or (authorization[7:] if authorization and authorization.lower().startswith("bearer ") else "")
+        if not expected or presented != expected:
+            raise HTTPException(status_code=401, detail={"code": "unauthorized", "message": "Backend authentication failed."})
+
+    def container() -> ApplicationContainer:
+        value = getattr(app.state, "container", None)
+        if value is None:
+            reason = getattr(app.state, "startup_error", None) or "Backend is not ready."
+            raise HTTPException(status_code=503, detail={"code": "backend_unavailable", "message": reason})
+        return value
+
+    def project_or_404(repo, project_id: str):
+        project = repo.get_project(project_id)
+        if not project:
+            raise HTTPException(status_code=404, detail={"code": "project_not_found", "message": f"Project '{project_id}' was not found."})
+        return project
+
+    def run_payload(repo, run_id: str) -> dict[str, Any]:
+        run = repo.get_run(run_id)
+        if not run:
+            raise HTTPException(status_code=404, detail={"code": "run_not_found", "message": f"Run '{run_id}' was not found."})
+        return dataclass_payload(run)
+
+    def emit(repo, run_id: str, event_type: str, payload: dict[str, Any]) -> int:
+        return repo.append_api_event(run_id, event_type, payload)
+
+    async def monitor_run(repo, run_id: str) -> None:
+        last_signature = ""
+        while True:
+            run = repo.get_run(run_id)
+            if not run:
+                return
+            checkpoints = repo.checkpoints(run_id)
+            usage = repo.usage(run_id=run_id)
+            artifacts = repo.artifacts_for_run(run_id)
+            payload = {
+                "run": dataclass_payload(run),
+                "checkpoints": checkpoints,
+                "usage": {"requests": len(usage), "estimated_cost": round(sum(float(item.get("estimated_cost") or 0) for item in usage), 12)},
+                "artifacts": [dataclass_payload(item) for item in artifacts],
+            }
+            signature = json.dumps(payload, sort_keys=True, default=str)
+            if signature != last_signature:
+                emit(repo, run_id, "run.progress", payload)
+                last_signature = signature
+            if run.status in {RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED}:
+                emit(repo, run_id, "run.completed" if run.status is RunStatus.COMPLETED else "run.terminal", {"run": dataclass_payload(run)})
+                return
+            await asyncio.sleep(0.4)
+
+    async def execute_discovery(c: ApplicationContainer, run_id: str, request: DiscoverRequest, project_id: str) -> None:
+        parsed = c.discovery.parser.parse_seed(request.seed_paper)
+        monitor = asyncio.create_task(monitor_run(c.repository, run_id))
+        monitors[run_id] = monitor
+        try:
+            await c.discovery._execute(project_id, run_id, parsed, limit=request.limit, since_year=request.since_year, max_runtime_seconds=request.max_runtime_seconds)
+        except asyncio.CancelledError:
+            c.repository.cancel_run(run_id)
+            emit(c.repository, run_id, "run.cancelled", {"run_id": run_id})
+            raise
+        except Exception as exc:
+            emit(c.repository, run_id, "run.error", {"message": redact_text(f"{type(exc).__name__}: {exc}")})
+        finally:
+            c.repository.set_project_budget(project_id, hard_stop=request.max_cost_usd) if request.max_cost_usd is not None else None
+            if not monitor.done():
+                await asyncio.sleep(0)
+            monitors.pop(run_id, None)
+
+    async def execute_review(c: ApplicationContainer, run_id: str, project_id: str, request: ReviewRequest) -> None:
+        monitor = asyncio.create_task(monitor_run(c.repository, run_id))
+        monitors[run_id] = monitor
+        try:
+            await c.review._execute(run_id, project_id, top_k=request.top_k, hierarchical=request.hierarchical, max_runtime_seconds=request.max_runtime_seconds)
+        except asyncio.CancelledError:
+            c.repository.cancel_run(run_id)
+            emit(c.repository, run_id, "run.cancelled", {"run_id": run_id})
+            raise
+        except Exception as exc:
+            emit(c.repository, run_id, "run.error", {"message": redact_text(f"{type(exc).__name__}: {exc}")})
+        finally:
+            monitors.pop(run_id, None)
+
+    def mutation_key(header: str | None) -> str:
+        return (header or uuid4().hex).strip()
+
+    @app.get("/v1/health", dependencies=[Depends(require_auth)])
+    async def health():
+        c = getattr(app.state, "container", None)
+        return {"status": "ready" if c else "unavailable", "service": "autoresearch-api", "version": __version__, "reason": getattr(app.state, "startup_error", None)}
+
+    @app.get("/v1/capabilities", dependencies=[Depends(require_auth)])
+    async def capabilities():
+        return {"pipelines": [
+            {"key": PipelineKind.DISCOVERY.value, "name": "Study Search", "enabled": True, "reason": None},
+            {"key": PipelineKind.REVIEW.value, "name": "Deep Literature Review", "enabled": True, "reason": None},
+            {"key": PipelineKind.NOVELTY.value, "name": "Novelty Generation", "enabled": False, "reason": "Novelty pipeline is not implemented in the Python backend."},
+            {"key": PipelineKind.EXPERIMENT.value, "name": "Experiment Design and Execution", "enabled": False, "reason": "Experiment pipeline is not implemented in the Python backend."},
+            {"key": PipelineKind.REINVENTION.value, "name": "Result-Conditioned Reinvention", "enabled": False, "reason": "Reinvention pipeline is not implemented in the Python backend."},
+        ]}
+
+    @app.get("/v1/providers/status", dependencies=[Depends(require_auth)])
+    async def provider_status():
+        c = container()
+        entries = []
+        for name in c.router.registry.names():
+            provider = c.router.registry.get(name)
+            config = getattr(provider, "config", None)
+            key_env = getattr(config, "api_key_env", None)
+            entries.append({"name": name, "kind": getattr(config, "kind", None), "base_url": getattr(config, "base_url", None), "configured": bool(os.getenv(key_env, "")) if key_env else False, "capabilities": sorted(str(item.value) for item in getattr(provider, "capabilities", ()))})
+        roles = []
+        for role, assignment in c.router.assignments.items():
+            roles.append({"role": role.value, "provider": assignment.provider, "model": assignment.model, "fallbacks": list(assignment.fallbacks)})
+        return {"providers": entries, "roles": roles}
+
+    @app.get("/v1/usage", dependencies=[Depends(require_auth)])
+    async def usage(project_id: str | None = None, run_id: str | None = None):
+        c = container()
+        records = c.repository.usage(project_id=project_id, run_id=run_id)
+        return {"records": records, "requests": len(records), "estimated_cost": round(sum(float(item.get("estimated_cost") or 0) for item in records), 12), "currency": "USD"}
+
+    @app.get("/v1/projects", dependencies=[Depends(require_auth)])
+    async def projects():
+        c = container()
+        return {"projects": [dataclass_payload(item) for item in c.repository.list_projects()]}
+
+    @app.post("/v1/projects", status_code=201, dependencies=[Depends(require_auth)])
+    async def create_project(payload: ProjectRequest):
+        c = container()
+        return dataclass_payload(c.repository.create_project(payload.title))
+
+    @app.get("/v1/projects/{project_id}", dependencies=[Depends(require_auth)])
+    async def get_project(project_id: str):
+        c = container()
+        project = project_or_404(c.repository, project_id)
+        return {"project": dataclass_payload(project), "seed": dataclass_payload(c.repository.get_seed(project_id)) if c.repository.get_seed(project_id) else None, "papers": [dataclass_payload(item) for item in c.repository.list_papers(project_id)], "artifacts": [dataclass_payload(item) for item in c.repository.artifacts(project_id)], "latest_gap": dataclass_payload(c.repository.latest_gap(project_id)) if c.repository.latest_gap(project_id) else None}
+
+    @app.post("/v1/projects/{project_id}/discover", status_code=202, dependencies=[Depends(require_auth)])
+    async def discover(project_id: str, payload: DiscoverRequest, idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
+        c = container()
+        project_or_404(c.repository, project_id)
+        key = mutation_key(idempotency_key)
+        prior = c.repository.idempotency(key)
+        if prior:
+            return prior["response"]
+        run = c.repository.create_run(project_id, PipelineKind.DISCOVERY, payload.model_dump())
+        if payload.max_cost_usd is not None:
+            c.repository.set_project_budget(project_id, hard_stop=payload.max_cost_usd)
+        response = {"run_id": run.id, "project_id": project_id, "kind": run.kind.value, "status": run.status.value}
+        c.repository.save_idempotency(key, "discover", run.id, response)
+        emit(c.repository, run.id, "run.created", response)
+        task = asyncio.create_task(execute_discovery(c, run.id, payload, project_id))
+        tasks[run.id] = task
+        task.add_done_callback(lambda _task: tasks.pop(run.id, None))
+        return response
+
+    @app.post("/v1/projects/{project_id}/review", status_code=202, dependencies=[Depends(require_auth)])
+    async def review(project_id: str, payload: ReviewRequest, idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
+        c = container()
+        project_or_404(c.repository, project_id)
+        key = mutation_key(idempotency_key)
+        prior = c.repository.idempotency(key)
+        if prior:
+            return prior["response"]
+        run = c.repository.create_run(project_id, PipelineKind.REVIEW, payload.model_dump())
+        if payload.max_cost_usd is not None:
+            c.repository.set_project_budget(project_id, hard_stop=payload.max_cost_usd)
+        response = {"run_id": run.id, "project_id": project_id, "kind": run.kind.value, "status": run.status.value}
+        c.repository.save_idempotency(key, "review", run.id, response)
+        emit(c.repository, run.id, "run.created", response)
+        task = asyncio.create_task(execute_review(c, run.id, project_id, payload))
+        tasks[run.id] = task
+        task.add_done_callback(lambda _task: tasks.pop(run.id, None))
+        return response
+
+    @app.post("/v1/projects/{project_id}/{pipeline}", status_code=409, dependencies=[Depends(require_auth)])
+    async def unavailable_pipeline(project_id: str, pipeline: str):
+        if pipeline in {"invent", "experiment", "reinvent"}:
+            raise HTTPException(status_code=409, detail={"code": "capability_unavailable", "message": f"{pipeline} is not implemented in the Python backend."})
+        raise HTTPException(status_code=404, detail={"code": "not_found", "message": "Unknown pipeline."})
+
+    @app.get("/v1/runs", dependencies=[Depends(require_auth)])
+    async def runs(project_id: str | None = None, status: RunStatus | None = None):
+        c = container()
+        return {"runs": [dataclass_payload(item) for item in c.repository.list_runs(project_id=project_id, status=status)]}
+
+    @app.get("/v1/runs/{run_id}", dependencies=[Depends(require_auth)])
+    async def get_run(run_id: str):
+        c = container()
+        run_payload_value = run_payload(c.repository, run_id)
+        return {"run": run_payload_value, "checkpoints": c.repository.checkpoints(run_id), "artifacts": [dataclass_payload(item) for item in c.repository.artifacts_for_run(run_id)], "usage": c.repository.usage(run_id=run_id)}
+
+    @app.get("/v1/runs/{run_id}/events", dependencies=[Depends(require_auth)])
+    async def run_events(run_id: str, last_event_id: int = Query(default=0, ge=0), last_event_header: str | None = Header(default=None, alias="Last-Event-ID")):
+        c = container()
+        run_payload(c.repository, run_id)
+        after = max(last_event_id, int(last_event_header or 0))
+
+        async def stream() -> AsyncIterator[str]:
+            cursor = after
+            idle = 0
+            while idle < 30:
+                events = c.repository.api_events(run_id, after_id=cursor)
+                if events:
+                    idle = 0
+                    for event in events:
+                        cursor = int(event["id"])
+                        yield f"id: {cursor}\nevent: {event['event_type']}\ndata: {json.dumps(event['payload'], ensure_ascii=False, default=str)}\n\n"
+                    terminal = c.repository.get_run(run_id)
+                    if terminal and terminal.status in {RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED}:
+                        return
+                else:
+                    idle += 1
+                await asyncio.sleep(0.4)
+
+        return StreamingResponse(stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+    @app.get("/v1/runs/{run_id}/artifacts", dependencies=[Depends(require_auth)])
+    async def run_artifacts(run_id: str):
+        c = container()
+        run_payload(c.repository, run_id)
+        return {"artifacts": [dataclass_payload(item) for item in c.repository.artifacts_for_run(run_id)]}
+
+    @app.post("/v1/runs/{run_id}/cancel", dependencies=[Depends(require_auth)])
+    async def cancel_run(run_id: str):
+        c = container()
+        run_payload(c.repository, run_id)
+        task = tasks.get(run_id)
+        if task and not task.done():
+            task.cancel()
+        c.repository.cancel_run(run_id)
+        emit(c.repository, run_id, "run.cancelled", {"run_id": run_id})
+        return {"run_id": run_id, "status": RunStatus.CANCELLED.value}
+
+    @app.post("/v1/runs/{run_id}/approve", dependencies=[Depends(require_auth)])
+    async def approve_run(run_id: str, payload: ApprovalRequest):
+        c = container()
+        run_payload(c.repository, run_id)
+        c.repository.set_approval(run_id, "approved" if payload.approved else "rejected", payload.reason)
+        emit(c.repository, run_id, "run.approval", {"run_id": run_id, "approved": payload.approved, "reason": payload.reason})
+        return {"run_id": run_id, "status": "approved" if payload.approved else "rejected", "reason": payload.reason}
+
+    @app.get("/v1/artifacts/{artifact_id}", dependencies=[Depends(require_auth)])
+    async def artifact(artifact_id: str):
+        c = container()
+        rows = c.repository.rows("SELECT * FROM artifacts WHERE id=?", (artifact_id,))
+        if not rows:
+            raise HTTPException(status_code=404, detail={"code": "artifact_not_found", "message": "Artifact was not found."})
+        path = Path(rows[0]["path"]).resolve()
+        root = c.settings.artifact_root.resolve()
+        if root not in path.parents and path != root:
+            raise HTTPException(status_code=403, detail={"code": "artifact_forbidden", "message": "Artifact path is outside the artifact root."})
+        if not path.exists():
+            raise HTTPException(status_code=404, detail={"code": "artifact_missing", "message": "Artifact file is missing."})
+        return {"artifact": rows[0], "content": path.read_text(encoding="utf-8")}
+
+    return app
+
+
+__version__ = "0.2.0"
+
+
+def main() -> None:
+    import uvicorn
+
+    uvicorn.run("autoresearch.api.app:create_app", factory=True, host=os.getenv("AUTORESEARCH_API_HOST", "127.0.0.1"), port=int(os.getenv("AUTORESEARCH_API_PORT", "8000")))
