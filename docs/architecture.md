@@ -195,8 +195,8 @@ database after verifying its exact path.
 
 The system executes a fully verified, evidence-grounded Orchestrator pattern for novelty and experiments:
 
-- **Novelty Pipeline:** Takes a validated research gap and uses an LLM generator to propose multiple novel candidates. A Prior-Art Checker searches existing literature to discard known methods. A Scientific Critic then scores each candidate on falsifiability, implementation risk, and publication potential. The highest-scoring candidates are grouped into a tiered portfolio (Low Risk, Balanced, High Risk).
-- **Experiment Pipeline:** Automatically transforms a selected novelty candidate into an executable `ExperimentSpec`. An isolated `DurableExperimentExecutor` handles execution in an ephemeral `IsolatedEnvironmentBuilder` to prevent side effects. Results undergo automated statistical analysis before being synthesized into a structured scientific report.
+- **Novelty Pipeline:** Takes a validated research gap and proposes mechanism-level candidates through `ModelRouter`. Known methods cannot be promoted; incremental candidates remain eligible; explicit scientific gates precede score-based ranking. Claim ledgers preserve safe wording, closest evidence and unresolved uncertainty. Portfolio tiers are optional.
+- **Experiment Pipeline:** Transforms a selected candidate into a declarative `ExperimentSpec`. Typed execution actions are resolved by policy to argument arrays; arbitrary model-generated shell text is not executable. Statistical summaries are deterministic and seed-aware. Execution remains conditional until a policy-controlled worker and exact-spec approval are configured.
 
 ## Safety Protocols
 
@@ -205,4 +205,4 @@ To ensure deterministic, isolated, and safe execution, the following protocols a
 - **Provider Abstraction:** The system *never* imports provider SDKs directly. All LLM and embedding access strictly goes through the `ModelRouter`.
 - **Honest Novelty:** The system *never* claims absolute "proven novelty". It explicitly labels successfully vetted methods as "potentially_novel" or "unverified_novelty" based on prior-art checks.
 - **Cost and Environment Isolation:** By default, end-to-end tests use a deterministically mocked `FakeLLMProvider` and do not invoke paid API keys or remote GPUs. This is strictly managed via environment flags (`RUN_LIVE_NOVELTY_TESTS`, `RUN_REMOTE_EXPERIMENT_TESTS`).
-- **Execution Sandboxing:** Executable experiments are constructed but *never* run directly on the host machine. The `DurableExperimentExecutor` and `IsolatedEnvironmentBuilder` encapsulate all test executions to prevent unauthorized host modifications.
+- **Execution isolation:** The current environment builder provides a dedicated workspace and records host capabilities. It is not an OS security sandbox. The capability endpoint reports `workspace-only` isolation and disables local/remote execution when no policy-controlled worker is configured.
