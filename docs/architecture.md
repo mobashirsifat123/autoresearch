@@ -15,10 +15,7 @@ seed PDF/DOI/URL
 ```
 
 The design accepts limits up to 100 and review `top_k` up to 15, but the release
-default is 20/5. Novelty generation, experiment execution, reinvention, remote
-workers, HTTP API, and frontend are explicitly outside this milestone. Their
-directories contain contracts only; no fake production routes or placeholder
-results are present.
+default is 20/5. Reinvention, remote workers, HTTP API, and frontend are explicitly outside this milestone. Their directories contain contracts only; no fake production routes or placeholder results are present.
 
 The mandatory high-level structure is unchanged. Additional internal modules
 (`domain/models.py`, `application/config.py`, `application/factory.py`,
@@ -193,3 +190,19 @@ The project is an independent Git repository and does not mutate
 commit. SQLite migration v1 is creation-only; restoring the pre-migration
 database means restoring its backup or deleting only a newly created milestone
 database after verifying its exact path.
+
+## Novelty and Experiment Pipelines
+
+The system executes a fully verified, evidence-grounded Orchestrator pattern for novelty and experiments:
+
+- **Novelty Pipeline:** Takes a validated research gap and uses an LLM generator to propose multiple novel candidates. A Prior-Art Checker searches existing literature to discard known methods. A Scientific Critic then scores each candidate on falsifiability, implementation risk, and publication potential. The highest-scoring candidates are grouped into a tiered portfolio (Low Risk, Balanced, High Risk).
+- **Experiment Pipeline:** Automatically transforms a selected novelty candidate into an executable `ExperimentSpec`. An isolated `DurableExperimentExecutor` handles execution in an ephemeral `IsolatedEnvironmentBuilder` to prevent side effects. Results undergo automated statistical analysis before being synthesized into a structured scientific report.
+
+## Safety Protocols
+
+To ensure deterministic, isolated, and safe execution, the following protocols are strictly enforced:
+
+- **Provider Abstraction:** The system *never* imports provider SDKs directly. All LLM and embedding access strictly goes through the `ModelRouter`.
+- **Honest Novelty:** The system *never* claims absolute "proven novelty". It explicitly labels successfully vetted methods as "potentially_novel" or "unverified_novelty" based on prior-art checks.
+- **Cost and Environment Isolation:** By default, end-to-end tests use a deterministically mocked `FakeLLMProvider` and do not invoke paid API keys or remote GPUs. This is strictly managed via environment flags (`RUN_LIVE_NOVELTY_TESTS`, `RUN_REMOTE_EXPERIMENT_TESTS`).
+- **Execution Sandboxing:** Executable experiments are constructed but *never* run directly on the host machine. The `DurableExperimentExecutor` and `IsolatedEnvironmentBuilder` encapsulate all test executions to prevent unauthorized host modifications.

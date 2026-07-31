@@ -10,7 +10,7 @@ from autoresearch.providers.factory import build_router
 from autoresearch.storage.repository import ResearchRepository
 
 from .config import Settings
-from .services import DiscoveryService, LiteratureReviewService
+from .services import DiscoveryService, LiteratureReviewService, NoveltyService, ExperimentService
 
 
 class ApplicationContainer:
@@ -23,6 +23,8 @@ class ApplicationContainer:
         self.search_pipeline = StudySearchPipeline(self.repository, self.sources, self.pdf_resolver, settings.download_root)
         self.discovery = DiscoveryService(self.repository, self.router, self.search_pipeline)
         self.review = LiteratureReviewService(self.repository, self.router)
+        self.novelty = NoveltyService(self.repository, self.router, self.search_pipeline)
+        self.experiment = ExperimentService(self.repository, self.router, settings.data_root / "workspace")
 
     async def close(self) -> None:
         await self.search_pipeline.close()

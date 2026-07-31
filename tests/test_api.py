@@ -22,7 +22,7 @@ def test_api_contract_capabilities_and_idempotent_mutation(tmp_path: Path):
     with TestClient(create_app(settings)) as client:
         assert client.get("/v1/health").json()["status"] == "ready"
         capabilities = client.get("/v1/capabilities").json()["pipelines"]
-        assert {item["key"] for item in capabilities if item["enabled"]} == {"study_search", "deep_literature_review"}
+        assert {item["key"] for item in capabilities if item["enabled"]} == {"study_search", "deep_literature_review", "novelty_generation", "experiment_design_execution"}
         assert all(item["reason"] for item in capabilities if not item["enabled"])
 
         project = client.post("/v1/projects", json={"title": "API contract"}).json()
@@ -56,7 +56,7 @@ def test_api_contract_capabilities_and_idempotent_mutation(tmp_path: Path):
         assert "event: run.created" in events
         assert "event: run.progress" in events
         assert "event: run.completed" in events
-        assert client.post(f"/v1/projects/{project_id}/invent", json={}).status_code == 409
+        assert client.post(f"/v1/projects/{project_id}/reinvent", json={}).status_code == 409
 
 
 def test_api_resumes_discovery_with_service_compatible_input(tmp_path: Path):
