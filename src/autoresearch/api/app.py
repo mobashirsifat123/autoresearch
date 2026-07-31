@@ -67,6 +67,12 @@ class ApprovalRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     approved: bool
     reason: str | None = Field(default=None, max_length=1000)
+    specification_checksum: str | None = Field(default=None, min_length=64, max_length=64)
+    approver: str = Field(default="local-user", min_length=1, max_length=200)
+    approved_scope: str = Field(default="local-experiment", max_length=200)
+    approved_target: str = Field(default="local", max_length=100)
+    approved_budget: float = Field(default=3600.0, ge=0, le=86400)
+    expires_at: str | None = None
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -237,14 +243,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/v1/capabilities", dependencies=[Depends(require_auth)])
     async def capabilities():
+        c = container()
         return {"pipelines": [
             {"key": PipelineKind.DISCOVERY.value, "name": "Study Search", "enabled": True, "reason": None},
             {"key": PipelineKind.REVIEW.value, "name": "Deep Literature Review", "enabled": True, "reason": None},
             {"key": PipelineKind.NOVELTY.value, "name": "Novelty Generation", "enabled": True, "reason": None},
             {"key": PipelineKind.EXPERIMENT.value, "name": "Experiment Design", "enabled": True, "reason": None,
-             "execution": {"state": "conditional", "approval_required": True, "local_execution_allowed": False,
-             "remote_execution_allowed": False, "worker_types": [], "isolation_strength": "workspace-only",
-             "reason": "No policy-controlled worker is configured; planning and deterministic analysis remain available."}},
+             "execution": {"state": "approval_gated", "approval_required": True, "local_execution_allowed": bool(getattr(c, "worker", None)),
+             "remote_execution_allowed": False, "worker_types": ["local_typed"] if getattr(c, "worker", None) else [], "isolation_strength": "workspace-only",
+             "network_enforcement": "policy-only", "max_concurrency": 1,
+             "reason": "Local execution is workspace-contained and approval-gated; it is not an OS sandbox."}},
             {"key": PipelineKind.REINVENTION.value, "name": "Result-Conditioned Reinvention", "enabled": False, "reason": "Reinvention pipeline is not implemented in the Python backend."},
         ]}
 
@@ -429,7 +437,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def get_run(run_id: str):
         c = container()
         run_payload_value = run_payload(c.repository, run_id)
-        return {"run": run_payload_value, "checkpoints": c.repository.checkpoints(run_id), "artifacts": [dataclass_payload(item) for item in c.repository.artifacts_for_run(run_id)], "usage": c.repository.usage(run_id=run_id)}
+        try:
+            preview = c.experiment.approval_preview(run_id)
+        except ValueError:
+            preview = None
+        return {"run": run_payload_value, "checkpoints": c.repository.checkpoints(run_id), "artifacts": [dataclass_payload(item) for item in c.repository.artifacts_for_run(run_id)], "usage": c.repository.usage(run_id=run_id), "worker_jobs": c.repository.worker_jobs_for_run(run_id), "state_transitions": c.repository.worker_transitions(run_id), "approval": c.repository.exact_approval(run_id), "approval_preview": preview}
 
     @app.get("/v1/runs/{run_id}/events", dependencies=[Depends(require_auth)])
     async def run_events(run_id: str, last_event_id: int = Query(default=0, ge=0), last_event_header: str | None = Header(default=None, alias="Last-Event-ID")):
@@ -484,6 +496,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         task = tasks.get(run_id)
         if task and not task.done():
             task.cancel()
+        for job in c.repository.worker_jobs_for_run(run_id):
+            if job.get("state") in {"QUEUED", "LEASED", "RUNNING"} and getattr(c, "worker", None):
+                await c.worker.cancel(str(job["id"]))
         c.repository.cancel_run(run_id)
         emit(c.repository, run_id, "run.cancelled", {"run_id": run_id})
         response = {"run_id": run_id, "status": RunStatus.CANCELLED.value}
@@ -498,9 +513,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         prior = c.repository.idempotency(key)
         if prior:
             return prior["response"]
-        c.repository.set_approval(run_id, "approved" if payload.approved else "rejected", payload.reason)
-        emit(c.repository, run_id, "run.approval", {"run_id": run_id, "approved": payload.approved, "reason": payload.reason})
-        response = {"run_id": run_id, "status": "approved" if payload.approved else "rejected", "reason": payload.reason}
+        try:
+            preview = c.experiment.approval_preview(run_id)
+        except ValueError:
+            c.repository.set_approval(run_id, "approved" if payload.approved else "rejected", payload.reason)
+            response = {"run_id": run_id, "status": "approved" if payload.approved else "rejected", "reason": payload.reason}
+            c.repository.save_idempotency(key, "approve", run_id, response)
+            emit(c.repository, run_id, "run.approval", response)
+            return response
+        if payload.specification_checksum and payload.specification_checksum != preview["checksum"]:
+            raise HTTPException(status_code=409, detail={"code": "checksum_mismatch", "message": "Approval checksum does not match the durable experiment specification."})
+        approval = c.repository.save_exact_approval({"id": uuid4().hex, "run_id": run_id, "specification_checksum": str(preview["checksum"]), "approver": payload.approver, "approved_scope": payload.approved_scope, "approved_target": payload.approved_target, "approved_budget": payload.approved_budget, "expires_at": payload.expires_at or "9999-12-31T23:59:59+00:00", "status": "pending", "approved_actions": preview["actions"]})
+        if payload.approved:
+            approval = c.repository.approve_exact(str(approval["id"]), approver=payload.approver) or approval
+        else:
+            c.repository.execute("UPDATE experiment_approvals SET status='rejected' WHERE id=?", (approval["id"],))
+        emit(c.repository, run_id, "approval.granted" if payload.approved else "approval.rejected", {"run_id": run_id, "approval_id": approval["id"], "checksum": preview["checksum"], "approved": payload.approved, "reason": payload.reason})
+        response = {"run_id": run_id, "approval_id": approval["id"], "status": "approved" if payload.approved else "rejected", "checksum": preview["checksum"], "reason": payload.reason}
         c.repository.save_idempotency(key, "approve", run_id, response)
         return response
 

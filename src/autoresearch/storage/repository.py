@@ -49,7 +49,7 @@ from autoresearch.domain.models import (
 )
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 class ResearchRepository:
@@ -95,6 +95,9 @@ class ResearchRepository:
             if current < 5:
                 connection.executescript(_SCHEMA_V5)
                 connection.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(?,?)", (5, utc_now()))
+            if current < 6:
+                connection.executescript(_SCHEMA_V6)
+                connection.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(?,?)", (6, utc_now()))
             latest = int(connection.execute("SELECT COALESCE(MAX(version), 0) FROM schema_migrations").fetchone()[0])
             if latest != SCHEMA_VERSION:
                 raise RuntimeError(f"Unsupported database schema v{latest}; expected v{SCHEMA_VERSION}.")
@@ -522,6 +525,10 @@ class ResearchRepository:
         row = self.row("SELECT * FROM experiment_specs WHERE candidate_id=?", (candidate_id,))
         return _experiment_spec(row) if row else None
 
+    def get_experiment_spec_by_id(self, spec_id: str) -> ExperimentSpec | None:
+        row = self.row("SELECT * FROM experiment_specs WHERE id=?", (spec_id,))
+        return _experiment_spec(row) if row else None
+
     def save_environment_manifest(self, manifest: EnvironmentManifest) -> None:
         self.execute(
             "INSERT INTO environment_manifests(id,project_id,run_id,spec_id,operating_system,python_version,environment_manager,dependency_lock_checksum,cuda_compatibility,gpu_model,gpu_memory,disk_space,dataset_paths_json,sample_counts_json,splits_json,pretrained_checkpoint_identity,reproducibility_flags,provenance_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -584,6 +591,61 @@ class ResearchRepository:
     def get_experiment_report(self, analysis_id: str) -> ExperimentReport | None:
         row = self.row("SELECT * FROM experiment_reports WHERE analysis_id=?", (analysis_id,))
         return _experiment_report(row) if row else None
+
+    def save_worker_job(self, job: dict[str, Any]) -> None:
+        self.execute(
+            "INSERT INTO worker_jobs(id,project_id,run_id,spec_id,worker,lease_id,state,attempt,checksum,actions_json,timeout_seconds,created_at,updated_at,heartbeat_at,lease_expires_at,process_id,process_group_id,last_log_offset,error_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET state=excluded.state,attempt=excluded.attempt,updated_at=excluded.updated_at,heartbeat_at=excluded.heartbeat_at,lease_expires_at=excluded.lease_expires_at,process_id=excluded.process_id,process_group_id=excluded.process_group_id,last_log_offset=excluded.last_log_offset,error_json=excluded.error_json",
+            (job["id"], job["project_id"], job["run_id"], job["spec_id"], job["worker"], job.get("lease_id"), job["state"], job.get("attempt", 0), job["checksum"], _json(job.get("actions", [])), job.get("timeout_seconds", 3600), job.get("created_at", utc_now()), job.get("updated_at", utc_now()), job.get("heartbeat_at"), job.get("lease_expires_at"), job.get("process_id"), job.get("process_group_id"), job.get("last_log_offset", 0), _json(job.get("error")) if job.get("error") else None),
+        )
+
+    def worker_job(self, job_id: str) -> dict[str, Any] | None:
+        row = self.row("SELECT * FROM worker_jobs WHERE id=?", (job_id,))
+        if row:
+            row["actions"] = _loads(row.pop("actions_json"), [])
+            row["error"] = _loads(row.pop("error_json"), None)
+        return row
+
+    def worker_jobs_for_run(self, run_id: str) -> list[dict[str, Any]]:
+        return [self.worker_job(row["id"]) for row in self.rows("SELECT id FROM worker_jobs WHERE run_id=? ORDER BY created_at", (run_id,)) if self.worker_job(row["id"])]
+
+    def append_worker_transition(self, run_id: str, from_state: str | None, to_state: str, *, reason: str = "", worker_id: str | None = None, attempt: int = 0, event_id: str | None = None) -> int:
+        with self._lock, self.connect() as connection:
+            cursor = connection.execute("INSERT INTO experiment_state_transitions(run_id,from_state,to_state,reason,created_at,worker_id,attempt,event_id) VALUES(?,?,?,?,?,?,?,?)", (run_id, from_state, to_state, reason, utc_now(), worker_id, attempt, event_id))
+            return int(cursor.lastrowid)
+
+    def worker_transitions(self, run_id: str) -> list[dict[str, Any]]:
+        return self.rows("SELECT * FROM experiment_state_transitions WHERE run_id=? ORDER BY id", (run_id,))
+
+    def save_exact_approval(self, approval: dict[str, Any]) -> dict[str, Any]:
+        existing = self.row("SELECT * FROM experiment_approvals WHERE run_id=? AND specification_checksum=?", (approval["run_id"], approval["specification_checksum"]))
+        if existing:
+            return existing
+        self.execute("INSERT INTO experiment_approvals(id,run_id,specification_checksum,approver,approved_scope,approved_target,approved_budget,expires_at,created_at,status,revoked_at,approved_actions_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (approval["id"], approval["run_id"], approval["specification_checksum"], approval["approver"], approval["approved_scope"], approval["approved_target"], approval["approved_budget"], approval["expires_at"], approval.get("created_at", utc_now()), approval.get("status", "pending"), approval.get("revoked_at"), _json(approval.get("approved_actions", []))))
+        return self.row("SELECT * FROM experiment_approvals WHERE id=?", (approval["id"],)) or approval
+
+    def exact_approval(self, run_id: str, checksum: str | None = None) -> dict[str, Any] | None:
+        query = "SELECT * FROM experiment_approvals WHERE run_id=?"
+        params: tuple[Any, ...] = (run_id,)
+        if checksum:
+            query += " AND specification_checksum=?"
+            params += (checksum,)
+        row = self.row(query + " ORDER BY created_at DESC LIMIT 1", params)
+        if row:
+            row["approved_actions"] = _loads(row.pop("approved_actions_json"), [])
+        return row
+
+    def approval_by_checksum(self, checksum: str) -> dict[str, Any] | None:
+        row = self.row("SELECT * FROM experiment_approvals WHERE specification_checksum=? ORDER BY created_at DESC LIMIT 1", (checksum,))
+        if row:
+            row["approved_actions"] = _loads(row.pop("approved_actions_json"), [])
+        return row
+
+    def approve_exact(self, approval_id: str, *, approver: str) -> dict[str, Any] | None:
+        self.execute("UPDATE experiment_approvals SET status='approved',approver=? WHERE id=? AND status='pending'", (approver, approval_id))
+        row = self.row("SELECT * FROM experiment_approvals WHERE id=?", (approval_id,))
+        if row:
+            row["approved_actions"] = _loads(row.pop("approved_actions_json"), [])
+        return row
 
 
 def _json(value: Any) -> str:
@@ -1020,4 +1082,36 @@ CREATE TABLE IF NOT EXISTS experiment_state_transitions(
   reason TEXT,
   created_at TEXT NOT NULL
 );
+"""
+
+_SCHEMA_V6 = """
+ALTER TABLE experiment_approvals ADD COLUMN status TEXT NOT NULL DEFAULT 'pending';
+ALTER TABLE experiment_approvals ADD COLUMN revoked_at TEXT;
+ALTER TABLE experiment_approvals ADD COLUMN approved_actions_json TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE experiment_state_transitions ADD COLUMN worker_id TEXT;
+ALTER TABLE experiment_state_transitions ADD COLUMN attempt INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE experiment_state_transitions ADD COLUMN event_id TEXT;
+CREATE TABLE IF NOT EXISTS worker_jobs(
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  run_id TEXT NOT NULL REFERENCES pipeline_runs(id),
+  spec_id TEXT NOT NULL REFERENCES experiment_specs(id),
+  worker TEXT NOT NULL,
+  lease_id TEXT,
+  state TEXT NOT NULL,
+  attempt INTEGER NOT NULL DEFAULT 0,
+  checksum TEXT NOT NULL,
+  actions_json TEXT NOT NULL,
+  timeout_seconds INTEGER NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  heartbeat_at TEXT,
+  lease_expires_at TEXT,
+  process_id INTEGER,
+  process_group_id INTEGER,
+  last_log_offset INTEGER NOT NULL DEFAULT 0,
+  error_json TEXT
+);
+CREATE INDEX IF NOT EXISTS worker_jobs_run_idx ON worker_jobs(run_id,created_at);
+CREATE INDEX IF NOT EXISTS worker_jobs_stale_idx ON worker_jobs(state,lease_expires_at,heartbeat_at);
 """

@@ -36,6 +36,10 @@ class StatisticalAnalyzer:
         # Results may contain per-seed values under ``seeds``. A single value is
         # retained as an observation but is never called significant.
         proposed = result.structured_metrics
+        if result.exit_code != 0:
+            raise ValueError("evaluation_artifact: execution failed before metrics were produced")
+        if not isinstance(proposed, dict) or not proposed or not isinstance(proposed.get("seeds"), list) or not proposed.get("seeds"):
+            raise ValueError("metric_schema_invalid: expected non-empty structured metrics with seed observations")
         baseline = proposed.get("baseline", {}) if isinstance(proposed.get("baseline", {}), dict) else {}
         seed_rows = proposed.get("seeds", []) if isinstance(proposed.get("seeds", []), list) else []
         if seed_rows:

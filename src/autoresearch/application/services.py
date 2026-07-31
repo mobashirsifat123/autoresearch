@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Sequence
 from uuid import uuid4
 
-from autoresearch.domain.models import ArtifactProvenance, ArtifactReference, DownloadStatus, GapClassification, PipelineKind, ResearchGap, RunStatus, SeedPaper, content_checksum, utc_now
+from autoresearch.domain.models import ArtifactProvenance, ArtifactReference, DownloadStatus, GapClassification, PipelineKind, ResearchGap, RunStatus, SeedPaper, ExperimentSpec, content_checksum, utc_now
 from autoresearch.ingestion.chunking import DocumentChunk, chunk_document
 from autoresearch.ingestion.document_parser import DocumentParser, ParsedDocument, ParsedPage
 from autoresearch.ingestion.extraction import SEED_PROMPT_VERSION, SeedAnalysis, SeedAnalyzer
@@ -34,6 +34,8 @@ from autoresearch.experiments.environment import IsolatedEnvironmentBuilder
 from autoresearch.experiments.executor import DurableExperimentExecutor
 from autoresearch.experiments.result_analysis import StatisticalAnalyzer
 from autoresearch.experiments.report_writer import ScientificReportWriter
+from autoresearch.experiments.policy import ActionType, ExecutionAction, specification_checksum
+from autoresearch.workers.local_typed import LocalTypedWorker
 
 SEARCH_PROMPT_VERSION = "search-strategies-v1"
 SEARCH_STRATEGIES_SCHEMA = {
@@ -533,7 +535,7 @@ class NoveltyService:
 
 
 class ExperimentService:
-    def __init__(self, repository: ResearchRepository, router: ModelRouter, workspace_root: Path) -> None:
+    def __init__(self, repository: ResearchRepository, router: ModelRouter, workspace_root: Path, worker: LocalTypedWorker | None = None) -> None:
         self.repository = repository
         self.router = router
         self.pipeline = ExperimentPipeline(
@@ -544,6 +546,34 @@ class ExperimentService:
             analyzer=StatisticalAnalyzer(router),
             report_writer=ScientificReportWriter(router),
         )
+        self.worker = worker
+
+    def action_plan(self, spec: ExperimentSpec) -> tuple[ExecutionAction, ...]:
+        scripts = [item for item in spec.expected_outputs if str(item).endswith(".py")]
+        if scripts:
+            return (ExecutionAction(ActionType.RUN_PYTHON_SCRIPT, str(scripts[0]), ()),)
+        return (ExecutionAction(ActionType.RUN_PYTEST, ".", ()),)
+
+    def approval_preview(self, run_id: str) -> dict[str, object]:
+        run = self.repository.get_run(run_id)
+        if not run:
+            raise ValueError(f"Experiment run {run_id} not found")
+        spec = self.repository.row("SELECT * FROM experiment_specs WHERE run_id=? ORDER BY rowid DESC LIMIT 1", (run_id,))
+        if not spec:
+            raise ValueError("approval_required: plan the experiment before approving execution")
+        from autoresearch.storage.repository import _experiment_spec
+        typed_spec = _experiment_spec(spec)
+        actions = self.action_plan(typed_spec)
+        checksum = specification_checksum(typed_spec, actions, typed_spec.target_worker)
+        return {"run_id": run_id, "spec_id": typed_spec.id, "candidate_id": typed_spec.candidate_id, "checksum": checksum, "worker": typed_spec.target_worker, "actions": [{"kind": action.kind.value, "target": action.target, "arguments": list(action.arguments)} for action in actions], "budget": 0.0, "expires_at": None}
+
+    def approval_preview_for_candidate(self, candidate_id: str) -> dict[str, object]:
+        spec = self.repository.get_experiment_spec(candidate_id)
+        if not spec:
+            raise ValueError("approval_required: plan the experiment before approving execution")
+        actions = self.action_plan(spec)
+        checksum = specification_checksum(spec, actions, spec.target_worker)
+        return {"run_id": spec.run_id, "spec_id": spec.id, "candidate_id": candidate_id, "checksum": checksum, "worker": spec.target_worker, "actions": [{"kind": action.kind.value, "target": action.target, "arguments": list(action.arguments)} for action in actions], "budget": 3600.0, "expires_at": None}
 
     async def execute_candidate(self, candidate_id: str, *, run_id: str | None = None, mode: str = "plan") -> str:
         candidate_row = self.repository.row("SELECT * FROM novelty_candidates WHERE id=?", (candidate_id,))
@@ -561,15 +591,28 @@ class ExperimentService:
             # mock candidate to use this run_id for tracking
             from dataclasses import replace
             run_candidate = replace(candidate, run_id=run.id)
-            if mode == "execute":
-                raise RuntimeError("worker_unavailable: no policy-controlled execution worker is configured")
-            spec = await self.pipeline.planner.plan(run_candidate)
-            self.repository.save_experiment_spec(spec)
+            spec = self.repository.get_experiment_spec(candidate_id) if mode == "execute" else None
+            if spec is None:
+                spec = await self.pipeline.planner.plan(run_candidate)
+                self.repository.save_experiment_spec(spec)
             if mode in {"inspect", "validate"}:
                 manifest = await self.pipeline.environment_builder.prepare(spec)
                 self.repository.save_environment_manifest(manifest)
             if mode == "report":
                 raise ValueError("insufficient_evidence: no completed statistical analysis exists for this candidate")
+            if mode == "execute":
+                if not self.worker:
+                    raise RuntimeError("worker_unavailable: no policy-controlled execution worker is configured")
+                preview = self.approval_preview_for_candidate(candidate_id)
+                approval = self.repository.approval_by_checksum(str(preview["checksum"]))
+                if not approval or approval.get("status") != "approved":
+                    raise PermissionError("approval_required: exact experiment approval is required before execution")
+                from datetime import datetime, timezone
+                if approval.get("expires_at") and datetime.fromisoformat(str(approval["expires_at"])) < datetime.now(timezone.utc):
+                    raise PermissionError("approval_expired: experiment approval has expired")
+                result = await self.worker.run(spec, self.action_plan(spec), approved_checksum=str(preview["checksum"]), timeout_seconds=int(approval.get("approved_budget") or 3600))
+                if result.get("state") != "COMPLETED":
+                    raise RuntimeError("validation_failed: worker did not complete the approved action plan")
             if owns_run:
                 self.repository.finish_run(run.id)
             return spec.id
