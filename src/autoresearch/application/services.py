@@ -545,7 +545,7 @@ class ExperimentService:
             report_writer=ScientificReportWriter(router),
         )
 
-    async def execute_candidate(self, candidate_id: str, *, run_id: str | None = None) -> str:
+    async def execute_candidate(self, candidate_id: str, *, run_id: str | None = None, mode: str = "plan") -> str:
         candidate_row = self.repository.row("SELECT * FROM novelty_candidates WHERE id=?", (candidate_id,))
         if not candidate_row:
             raise ValueError(f"Candidate {candidate_id} not found.")
@@ -561,10 +561,18 @@ class ExperimentService:
             # mock candidate to use this run_id for tracking
             from dataclasses import replace
             run_candidate = replace(candidate, run_id=run.id)
-            report = await self.pipeline.execute_candidate(run_candidate)
+            if mode == "execute":
+                raise RuntimeError("worker_unavailable: no policy-controlled execution worker is configured")
+            spec = await self.pipeline.planner.plan(run_candidate)
+            self.repository.save_experiment_spec(spec)
+            if mode in {"inspect", "validate"}:
+                manifest = await self.pipeline.environment_builder.prepare(spec)
+                self.repository.save_environment_manifest(manifest)
+            if mode == "report":
+                raise ValueError("insufficient_evidence: no completed statistical analysis exists for this candidate")
             if owns_run:
                 self.repository.finish_run(run.id)
-            return report.id
+            return spec.id
         except Exception as exc:
             if owns_run:
                 self.repository.finish_run(run.id, error=f"{type(exc).__name__}: {exc}")

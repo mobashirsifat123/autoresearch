@@ -97,9 +97,9 @@ async def test_experiment_pipeline(tmp_path):
     from autoresearch.application.services import ExperimentService
     service = ExperimentService(repo, router, workspace)
     
-    report_id = await service.execute_candidate("cand1")
+    spec_id = await service.execute_candidate("cand1", mode="plan")
     
-    assert report_id is not None
-    report = repo.row("SELECT * FROM experiment_reports WHERE id=?", (report_id,))
-    assert report is not None
-    assert report["decision"] == "supported"
+    assert spec_id is not None
+    spec = repo.row("SELECT * FROM experiment_specs WHERE id=?", (spec_id,))
+    assert spec is not None
+    assert repo.row("SELECT * FROM execution_jobs LIMIT 1") is None

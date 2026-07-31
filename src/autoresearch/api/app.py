@@ -213,7 +213,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         monitor = asyncio.create_task(monitor_run(c.repository, run_id))
         monitors[run_id] = monitor
         try:
-            await c.experiment.execute_candidate(request.candidate_id, run_id=run_id)
+            await c.experiment.execute_candidate(request.candidate_id, run_id=run_id, mode=request.mode)
             c.repository.finish_run(run_id)
         except asyncio.CancelledError:
             c.repository.cancel_run(run_id)
