@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 
 from autoresearch.api.app import create_app
 from autoresearch.application.config import Settings
+from autoresearch.domain.models import PipelineKind
 
 
 def test_api_contract_capabilities_and_idempotent_mutation(tmp_path: Path):
@@ -26,6 +27,16 @@ def test_api_contract_capabilities_and_idempotent_mutation(tmp_path: Path):
 
         project = client.post("/v1/projects", json={"title": "API contract"}).json()
         project_id = project["id"]
+        same_project = client.post("/v1/projects", headers={"Idempotency-Key": "project-contract-key"}, json={"title": "same project"}).json()
+        same_project_retry = client.post("/v1/projects", headers={"Idempotency-Key": "project-contract-key"}, json={"title": "different title on retry"}).json()
+        assert same_project["id"] == same_project_retry["id"]
+        async def fake_discovery(project_id: str, run_id: str, parsed, *, limit: int, since_year: int | None, max_runtime_seconds: float | None):
+            repository = client.app.state.container.repository
+            repository.begin_checkpoint(run_id, "fake")
+            repository.complete_checkpoint(run_id, "fake", payload={"records": limit})
+            repository.finish_run(run_id)
+
+        client.app.state.container.discovery._execute = fake_discovery
         headers = {"Idempotency-Key": "discover-contract-key"}
         first = client.post(
             f"/v1/projects/{project_id}/discover",
@@ -41,7 +52,36 @@ def test_api_contract_capabilities_and_idempotent_mutation(tmp_path: Path):
         assert first.json()["run_id"] == second.json()["run_id"]
         run_id = first.json()["run_id"]
         assert client.get(f"/v1/runs/{run_id}").status_code == 200
+        events = client.get(f"/v1/runs/{run_id}/events").text
+        assert "event: run.created" in events
+        assert "event: run.progress" in events
+        assert "event: run.completed" in events
         assert client.post(f"/v1/projects/{project_id}/invent", json={}).status_code == 409
+
+
+def test_api_resumes_discovery_with_service_compatible_input(tmp_path: Path):
+    config = Path(__file__).parents[1] / "docs" / "live_config.example.toml"
+    settings = Settings(tmp_path, tmp_path / "api.sqlite3", tmp_path / "artifacts", tmp_path / "downloads", config, ("crossref",))
+    with TestClient(create_app(settings)) as client:
+        repository = client.app.state.container.repository
+        project = repository.create_project("Resume contract")
+        run = repository.create_run(
+            project.id,
+            PipelineKind.DISCOVERY,
+            {"seed_input": "10.48550/arXiv.2005.11401", "limit": 20, "since_year": None, "max_cost_usd": None, "max_runtime_seconds": None},
+        )
+        repository.finish_run(run.id, error="simulated interruption")
+
+        async def fake_resume(run_id: str):
+            assert repository.get_run(run_id).input_data["seed_input"] == "10.48550/arXiv.2005.11401"
+            repository.finish_run(run_id)
+
+        client.app.state.container.discovery.resume = fake_resume
+        response = client.post(f"/v1/runs/{run.id}/resume", headers={"Idempotency-Key": "resume-contract-key"})
+        retry = client.post(f"/v1/runs/{run.id}/resume", headers={"Idempotency-Key": "resume-contract-key"})
+        assert response.status_code == 202
+        assert response.json()["run_id"] == retry.json()["run_id"] == run.id
+        assert "event: run.resumed" in client.get(f"/v1/runs/{run.id}/events").text
 
 
 def test_api_authentication_and_secret_free_provider_status(tmp_path: Path, monkeypatch):

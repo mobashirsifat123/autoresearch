@@ -11,6 +11,7 @@ from autoresearch.providers.config import ModelAssignment, ProviderConfig, rejec
 from autoresearch.providers.errors import ErrorKind, ProviderError
 from autoresearch.providers.llm import AnthropicProvider, GeminiProvider, OpenAICompatibleProvider
 from autoresearch.providers.registry import ProviderRegistry
+from autoresearch.providers.redaction import redact_text
 from autoresearch.providers.router import ModelRouter
 from autoresearch.providers.testing import FakeEmbeddingProvider, FakeLLMProvider
 from autoresearch.storage import ResearchRepository
@@ -117,6 +118,25 @@ async def test_openai_compatible_adapter_contract(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_openai_compatible_adapter_retries_rate_limit(monkeypatch):
+    monkeypatch.setenv("TEST_PROVIDER_KEY", "not-a-real-secret")
+    calls = 0
+
+    def handler(request: httpx.Request):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(429, headers={"retry-after": "0"}, json={"error": {"message": "slow down"}})
+        return httpx.Response(200, json={"id": "req-2", "model": "external-model", "choices": [{"message": {"content": '{"ok":true}'}}], "usage": {"prompt_tokens": 1, "completion_tokens": 1}})
+
+    config = ProviderConfig("external", "openai_compatible", "https://provider.example/v1", "TEST_PROVIDER_KEY", frozenset({Capability.TEXT, Capability.STRUCTURED_OUTPUT}), max_retries=1)
+    provider = OpenAICompatibleProvider(config, transport=httpx.MockTransport(handler))
+    result = await provider.complete(model="external-model", messages=[{"role": "user", "content": "hello"}], response_format={"type": "json_schema", "json_schema": {"name": "answer", "schema": {"type": "object"}}})
+    assert calls == 2 and json.loads(result.text) == {"ok": True}
+    await provider.close()
+
+
+@pytest.mark.asyncio
 async def test_anthropic_adapter_forces_strict_structured_tool(monkeypatch):
     monkeypatch.setenv("TEST_ANTHROPIC_KEY", "not-a-real-secret")
 
@@ -156,3 +176,11 @@ async def test_gemini_adapter_sends_json_schema(monkeypatch):
 def test_configuration_rejects_inline_secrets():
     with pytest.raises(ValueError, match="Secret values"):
         reject_secret_fields({"api_key": "never-store-this"}, location="providers.test")
+
+
+def test_redaction_removes_url_credentials_and_sensitive_query_values():
+    value = "https://alice:password@example.test/v1?token=secret-value&safe=yes"
+    redacted = redact_text(value)
+    assert "password" not in redacted
+    assert "secret-value" not in redacted
+    assert redacted == "https://[REDACTED]example.test/v1?token=[REDACTED]&safe=yes"
