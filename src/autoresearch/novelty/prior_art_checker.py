@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import json
+import re
 from uuid import uuid4
 
 from autoresearch.domain.models import (
@@ -39,18 +39,30 @@ class EvidenceBackedPriorArtChecker:
         self.search_pipeline = search_pipeline
 
     async def check(self, candidate: NoveltyCandidate) -> PriorArtAssessment:
-        # Step 1: Perform semantic search across known literature to find potential overlap
-        # In a real implementation, we would extract a query and call self.search_pipeline
-        # For now, we simulate finding the most relevant downloaded papers
-        
-        # Here we mock retrieving closest papers - we'll assume the search pipeline gives us relevant matches.
-        closest_paper_ids: list[str] = []
-        abstracts_context = "No direct overlap found in local corpus."
+        # Search the project's verified evidence corpus. Ranking is deterministic
+        # lexical retrieval; the model compares mechanisms only after provenance
+        # records have been selected. Page/section references are never invented.
+        repository = getattr(self.search_pipeline, "repository", None)
+        terms = set(re.findall(r"[a-z0-9]{3,}", f"{candidate.method} {candidate.causal_mechanism} {candidate.difference_from_existing}".lower()))
+        ranked: list[tuple[int, dict]] = []
+        if repository is not None:
+            for claim in repository.rows(
+                "SELECT e.*,p.title,p.year,p.venue FROM evidence_claims e JOIN papers p ON p.id=e.paper_id WHERE e.project_id=?",
+                (candidate.project_id,),
+            ):
+                evidence_terms = set(re.findall(r"[a-z0-9]{3,}", f"{claim['statement']} {claim['excerpt']} {claim.get('section') or ''}".lower()))
+                ranked.append((len(terms & evidence_terms), claim))
+        selected = [claim for score, claim in sorted(ranked, key=lambda item: (-item[0], item[1]["id"])) if score > 0][:12]
+        closest_paper_ids = list(dict.fromkeys(claim["paper_id"] for claim in selected))
+        evidence_context = "\n".join(
+            f"[{claim['paper_id']}] {claim['title']} ({claim.get('year') or 'n.d.'}), section={claim.get('section') or 'unknown'}, page={claim.get('page') or 'unknown'}: {claim['excerpt']}"
+            for claim in selected
+        ) or "No matching verified evidence was retrieved from the project corpus. Retrieval coverage is incomplete."
         
         # Step 2: Query the LLM to assess overlap
         messages = [
-            {"role": "system", "content": "You are a stringent peer-reviewer. Analyze the proposed novelty candidate against the provided prior art abstracts. Determine if the proposed mechanism is already known or if it represents a genuine contribution."},
-            {"role": "user", "content": f"Proposed Method: {candidate.method}\nMechanism: {candidate.causal_mechanism}\nDifference from existing: {candidate.difference_from_existing}\n\nPrior Art Abstracts:\n{abstracts_context}"}
+            {"role": "system", "content": "You are a stringent prior-art analyst. Compare mechanisms only against the supplied verified excerpts. Preserve ambiguity and counter-evidence. Never claim exhaustive novelty."},
+            {"role": "user", "content": f"Proposed Method: {candidate.method}\nMechanism: {candidate.causal_mechanism}\nDifference from existing: {candidate.difference_from_existing}\n\nPrior Art Abstracts and Section Evidence:\n{evidence_context}"}
         ]
         
         payload = await self.router.structured_output(

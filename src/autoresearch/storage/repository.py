@@ -38,6 +38,7 @@ from autoresearch.domain.models import (
     NoveltyCritique,
     CandidateRevision,
     NoveltyPortfolio,
+    NoveltyClaimLedger,
     ExperimentSpec,
     EnvironmentManifest,
     ValidationReport,
@@ -48,7 +49,7 @@ from autoresearch.domain.models import (
 )
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 class ResearchRepository:
@@ -91,6 +92,9 @@ class ResearchRepository:
             if current < 4:
                 connection.executescript(_SCHEMA_V4)
                 connection.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(?,?)", (4, utc_now()))
+            if current < 5:
+                connection.executescript(_SCHEMA_V5)
+                connection.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(?,?)", (5, utc_now()))
             latest = int(connection.execute("SELECT COALESCE(MAX(version), 0) FROM schema_migrations").fetchone()[0])
             if latest != SCHEMA_VERSION:
                 raise RuntimeError(f"Unsupported database schema v{latest}; expected v{SCHEMA_VERSION}.")
@@ -479,20 +483,39 @@ class ResearchRepository:
         return [_candidate_revision(row) for row in self.rows("SELECT * FROM candidate_revisions WHERE original_candidate_id=? ORDER BY revision_count", (original_candidate_id,))]
 
     def save_novelty_portfolio(self, portfolio: NoveltyPortfolio) -> None:
-        self.execute(
-            "INSERT INTO novelty_portfolios(id,project_id,run_id,low_risk_candidate_id,balanced_candidate_id,high_risk_candidate_id,selection_reasons_json,provenance_json) VALUES(?,?,?,?,?,?,?,?)",
-            (portfolio.id, portfolio.project_id, portfolio.run_id, portfolio.low_risk_candidate_id, portfolio.balanced_candidate_id, portfolio.high_risk_candidate_id, _json(portfolio.selection_reasons), _json_provenance(portfolio.provenance))
-        )
+        self.execute("INSERT OR REPLACE INTO novelty_portfolio_records(id,project_id,run_id,selection_reasons_json,provenance_json) VALUES(?,?,?,?,?)",
+            (portfolio.id, portfolio.project_id, portfolio.run_id, _json(portfolio.selection_reasons), _json_provenance(portfolio.provenance)))
+        for tier, candidate_id in (("low_risk", portfolio.low_risk_candidate_id), ("balanced", portfolio.balanced_candidate_id), ("high_risk", portfolio.high_risk_candidate_id)):
+            if candidate_id:
+                self.execute("INSERT OR REPLACE INTO novelty_portfolio_members(portfolio_id,tier,candidate_id) VALUES(?,?,?)", (portfolio.id, tier, candidate_id))
+        if portfolio.low_risk_candidate_id and portfolio.balanced_candidate_id and portfolio.high_risk_candidate_id:
+            self.execute(
+                "INSERT OR REPLACE INTO novelty_portfolios(id,project_id,run_id,low_risk_candidate_id,balanced_candidate_id,high_risk_candidate_id,selection_reasons_json,provenance_json) VALUES(?,?,?,?,?,?,?,?)",
+                (portfolio.id, portfolio.project_id, portfolio.run_id, portfolio.low_risk_candidate_id, portfolio.balanced_candidate_id, portfolio.high_risk_candidate_id, _json(portfolio.selection_reasons), _json_provenance(portfolio.provenance))
+            )
 
     def get_novelty_portfolio(self, run_id: str) -> NoveltyPortfolio | None:
+        record = self.row("SELECT * FROM novelty_portfolio_records WHERE run_id=?", (run_id,))
+        if record:
+            members = {row["tier"]: row["candidate_id"] for row in self.rows("SELECT tier,candidate_id FROM novelty_portfolio_members WHERE portfolio_id=?", (record["id"],))}
+            return NoveltyPortfolio(record["id"], record["project_id"], record["run_id"], members.get("low_risk"), members.get("balanced"), members.get("high_risk"), _loads(record["selection_reasons_json"], {}), _provenance(record["provenance_json"]))
         row = self.row("SELECT * FROM novelty_portfolios WHERE run_id=?", (run_id,))
         return _novelty_portfolio(row) if row else None
+
+    def save_novelty_claim_ledger(self, ledger: NoveltyClaimLedger) -> None:
+        self.execute(
+            "INSERT OR REPLACE INTO novelty_claim_ledgers(id,project_id,run_id,candidate_id,contribution_claim,closest_methods_json,overlap_status,supporting_evidence_json,unresolved_uncertainty,safe_wording,prohibited_wording_json,review_status,provenance_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (ledger.id, ledger.project_id, ledger.run_id, ledger.candidate_id, ledger.contribution_claim, _json(ledger.closest_methods), ledger.overlap_status.value, _json(ledger.supporting_evidence), ledger.unresolved_uncertainty, ledger.safe_wording, _json(ledger.prohibited_wording), ledger.review_status, _json_provenance(ledger.provenance)),
+        )
+
+    def novelty_claim_ledgers(self, run_id: str) -> list[dict[str, Any]]:
+        return self.rows("SELECT * FROM novelty_claim_ledgers WHERE run_id=? ORDER BY candidate_id", (run_id,))
 
     # Experiment methods
     def save_experiment_spec(self, spec: ExperimentSpec) -> None:
         self.execute(
-            "INSERT INTO experiment_specs(id,project_id,run_id,candidate_id,hypothesis,causal_mechanism,falsification_condition,repository,baseline_commit,dataset_identity,dataset_checksum,split_definition,baseline_configuration,proposed_change,independent_variables_json,controlled_variables_json,metrics_json,random_seeds_json,ablations_json,robustness_tests_json,statistical_plan,compute_budget,stopping_conditions_json,expected_outputs_json,artifact_contract,provenance_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (spec.id, spec.project_id, spec.run_id, spec.candidate_id, spec.hypothesis, spec.causal_mechanism, spec.falsification_condition, spec.repository, spec.baseline_commit, spec.dataset_identity, spec.dataset_checksum, spec.split_definition, spec.baseline_configuration, spec.proposed_change, _json(spec.independent_variables), _json(spec.controlled_variables), _json(spec.metrics), _json(spec.random_seeds), _json(spec.ablations), _json(spec.robustness_tests), spec.statistical_plan, spec.compute_budget, _json(spec.stopping_conditions), _json(spec.expected_outputs), spec.artifact_contract, _json_provenance(spec.provenance))
+            "INSERT INTO experiment_specs(id,project_id,run_id,candidate_id,hypothesis,causal_mechanism,falsification_condition,repository,baseline_commit,dataset_identity,dataset_checksum,split_definition,baseline_configuration,proposed_change,independent_variables_json,controlled_variables_json,metrics_json,random_seeds_json,ablations_json,robustness_tests_json,statistical_plan,compute_budget,stopping_conditions_json,expected_outputs_json,artifact_contract,provenance_json,metric_direction_json,minimum_meaningful_effect_json,required_seed_count,network_policy,target_worker,approval_required) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (spec.id, spec.project_id, spec.run_id, spec.candidate_id, spec.hypothesis, spec.causal_mechanism, spec.falsification_condition, spec.repository, spec.baseline_commit, spec.dataset_identity, spec.dataset_checksum, spec.split_definition, spec.baseline_configuration, spec.proposed_change, _json(spec.independent_variables), _json(spec.controlled_variables), _json(spec.metrics), _json(spec.random_seeds), _json(spec.ablations), _json(spec.robustness_tests), spec.statistical_plan, spec.compute_budget, _json(spec.stopping_conditions), _json(spec.expected_outputs), spec.artifact_contract, _json_provenance(spec.provenance), _json(spec.metric_direction), _json(spec.minimum_meaningful_effect), spec.required_seed_count, spec.network_policy, spec.target_worker, int(spec.approval_required))
         )
 
     def get_experiment_spec(self, candidate_id: str) -> ExperimentSpec | None:
@@ -626,7 +649,7 @@ def _novelty_portfolio(row: dict[str, Any]) -> NoveltyPortfolio:
     return NoveltyPortfolio(row["id"], row["project_id"], row["run_id"], row["low_risk_candidate_id"], row["balanced_candidate_id"], row["high_risk_candidate_id"], _loads(row["selection_reasons_json"], {}), _provenance(row["provenance_json"]))
 
 def _experiment_spec(row: dict[str, Any]) -> ExperimentSpec:
-    return ExperimentSpec(row["id"], row["project_id"], row["run_id"], row["candidate_id"], row["hypothesis"], row["causal_mechanism"], row["falsification_condition"], row["repository"], row["baseline_commit"], row["dataset_identity"], row["dataset_checksum"], row["split_definition"], row["baseline_configuration"], row["proposed_change"], tuple(_loads(row["independent_variables_json"], [])), tuple(_loads(row["controlled_variables_json"], [])), tuple(_loads(row["metrics_json"], [])), tuple(_loads(row["random_seeds_json"], [])), tuple(_loads(row["ablations_json"], [])), tuple(_loads(row["robustness_tests_json"], [])), row["statistical_plan"], row["compute_budget"], tuple(_loads(row["stopping_conditions_json"], [])), tuple(_loads(row["expected_outputs_json"], [])), row["artifact_contract"], _provenance(row["provenance_json"]))
+    return ExperimentSpec(row["id"], row["project_id"], row["run_id"], row["candidate_id"], row["hypothesis"], row["causal_mechanism"], row["falsification_condition"], row["repository"], row["baseline_commit"], row["dataset_identity"], row["dataset_checksum"], row["split_definition"], row["baseline_configuration"], row["proposed_change"], tuple(_loads(row["independent_variables_json"], [])), tuple(_loads(row["controlled_variables_json"], [])), tuple(_loads(row["metrics_json"], [])), tuple(_loads(row["random_seeds_json"], [])), tuple(_loads(row["ablations_json"], [])), tuple(_loads(row["robustness_tests_json"], [])), row["statistical_plan"], row["compute_budget"], tuple(_loads(row["stopping_conditions_json"], [])), tuple(_loads(row["expected_outputs_json"], [])), row["artifact_contract"], _provenance(row["provenance_json"]), _loads(row.get("metric_direction_json"), {}), _loads(row.get("minimum_meaningful_effect_json"), {}), int(row.get("required_seed_count", 1)), row.get("network_policy", "disabled"), row.get("target_worker", "local"), bool(row.get("approval_required", 1)))
 
 def _environment_manifest(row: dict[str, Any]) -> EnvironmentManifest:
     return EnvironmentManifest(row["id"], row["project_id"], row["run_id"], row["spec_id"], row["operating_system"], row["python_version"], row["environment_manager"], row["dependency_lock_checksum"], row["cuda_compatibility"], row["gpu_model"], row["gpu_memory"], row["disk_space"], tuple(_loads(row["dataset_paths_json"], [])), _loads(row["sample_counts_json"], {}), tuple(_loads(row["splits_json"], [])), row["pretrained_checkpoint_identity"], row["reproducibility_flags"], _provenance(row["provenance_json"]))
@@ -935,6 +958,66 @@ CREATE TABLE IF NOT EXISTS api_project_idempotency(
   key TEXT PRIMARY KEY,
   project_id TEXT NOT NULL REFERENCES projects(id),
   response_json TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+"""
+
+_SCHEMA_V5 = """
+ALTER TABLE experiment_specs ADD COLUMN metric_direction_json TEXT NOT NULL DEFAULT '{}';
+ALTER TABLE experiment_specs ADD COLUMN minimum_meaningful_effect_json TEXT NOT NULL DEFAULT '{}';
+ALTER TABLE experiment_specs ADD COLUMN required_seed_count INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE experiment_specs ADD COLUMN network_policy TEXT NOT NULL DEFAULT 'disabled';
+ALTER TABLE experiment_specs ADD COLUMN target_worker TEXT NOT NULL DEFAULT 'local';
+ALTER TABLE experiment_specs ADD COLUMN approval_required INTEGER NOT NULL DEFAULT 1;
+CREATE TABLE IF NOT EXISTS novelty_claim_ledgers(
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  run_id TEXT NOT NULL REFERENCES pipeline_runs(id),
+  candidate_id TEXT NOT NULL REFERENCES novelty_candidates(id),
+  contribution_claim TEXT NOT NULL,
+  closest_methods_json TEXT NOT NULL,
+  overlap_status TEXT NOT NULL,
+  supporting_evidence_json TEXT NOT NULL,
+  unresolved_uncertainty TEXT NOT NULL,
+  safe_wording TEXT NOT NULL,
+  prohibited_wording_json TEXT NOT NULL,
+  review_status TEXT NOT NULL,
+  provenance_json TEXT NOT NULL,
+  UNIQUE(candidate_id)
+);
+CREATE TABLE IF NOT EXISTS novelty_portfolio_records(
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  run_id TEXT NOT NULL REFERENCES pipeline_runs(id),
+  selection_reasons_json TEXT NOT NULL,
+  provenance_json TEXT NOT NULL,
+  UNIQUE(run_id)
+);
+CREATE TABLE IF NOT EXISTS novelty_portfolio_members(
+  portfolio_id TEXT NOT NULL REFERENCES novelty_portfolio_records(id),
+  tier TEXT NOT NULL,
+  candidate_id TEXT NOT NULL REFERENCES novelty_candidates(id),
+  PRIMARY KEY(portfolio_id,tier),
+  UNIQUE(portfolio_id,candidate_id)
+);
+CREATE TABLE IF NOT EXISTS experiment_approvals(
+  id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL REFERENCES pipeline_runs(id),
+  specification_checksum TEXT NOT NULL,
+  approver TEXT NOT NULL,
+  approved_scope TEXT NOT NULL,
+  approved_target TEXT NOT NULL,
+  approved_budget REAL NOT NULL,
+  expires_at TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE(run_id,specification_checksum)
+);
+CREATE TABLE IF NOT EXISTS experiment_state_transitions(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id TEXT NOT NULL REFERENCES pipeline_runs(id),
+  from_state TEXT,
+  to_state TEXT NOT NULL,
+  reason TEXT,
   created_at TEXT NOT NULL
 );
 """

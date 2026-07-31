@@ -390,6 +390,9 @@ class NoveltyCritique:
     objections: tuple[str, ...]
     failure_scenarios: tuple[str, ...]
     provenance: ArtifactProvenance
+    rubric: Mapping[str, str] = field(default_factory=dict)
+    evidence: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    confidence: float = 0.0
 
     def __post_init__(self) -> None:
         values = (
@@ -420,10 +423,27 @@ class NoveltyPortfolio:
     id: str
     project_id: str
     run_id: str
-    low_risk_candidate_id: str
-    balanced_candidate_id: str
-    high_risk_candidate_id: str
+    low_risk_candidate_id: str | None
+    balanced_candidate_id: str | None
+    high_risk_candidate_id: str | None
     selection_reasons: Mapping[str, str]
+    provenance: ArtifactProvenance
+
+
+@dataclass(frozen=True)
+class NoveltyClaimLedger:
+    id: str
+    project_id: str
+    run_id: str
+    candidate_id: str
+    contribution_claim: str
+    closest_methods: tuple[str, ...]
+    overlap_status: PriorArtStatus
+    supporting_evidence: tuple[str, ...]
+    unresolved_uncertainty: str
+    safe_wording: str
+    prohibited_wording: tuple[str, ...]
+    review_status: str
     provenance: ArtifactProvenance
 
 
@@ -455,6 +475,12 @@ class ExperimentSpec:
     expected_outputs: tuple[str, ...]
     artifact_contract: str
     provenance: ArtifactProvenance
+    metric_direction: Mapping[str, str] = field(default_factory=dict)
+    minimum_meaningful_effect: Mapping[str, float] = field(default_factory=dict)
+    required_seed_count: int = 1
+    network_policy: str = "disabled"
+    target_worker: str = "local"
+    approval_required: bool = True
 
 
 @dataclass(frozen=True)

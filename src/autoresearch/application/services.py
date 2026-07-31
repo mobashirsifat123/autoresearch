@@ -505,8 +505,8 @@ class NoveltyService:
             selector=PortfolioSelector(repository),
         )
 
-    async def generate_portfolio(self, project_id: str) -> str:
-        gap = self.repository.row("SELECT * FROM research_gaps WHERE project_id=? ORDER BY confidence DESC LIMIT 1", (project_id,))
+    async def generate_portfolio(self, project_id: str, *, gap_id: str | None = None, run_id: str | None = None) -> str:
+        gap = self.repository.row("SELECT * FROM research_gaps WHERE project_id=? AND (? IS NULL OR id=?) ORDER BY confidence DESC LIMIT 1", (project_id, gap_id, gap_id))
         if not gap:
             raise ValueError(f"No research gap found for project {project_id}.")
         
@@ -515,15 +515,20 @@ class NoveltyService:
         # or simply adapt it:
         gap_obj = ResearchGap(gap["id"], gap["project_id"], gap["run_id"], gap["statement"], tuple(json.loads(gap["supporting_paper_ids_json"])), tuple(json.loads(gap["supporting_claim_ids_json"])), gap["why_unsolved"], gap["missing_experiment"], gap["falsification_test"], float(gap["confidence"]), tuple(json.loads(gap["counter_evidence_claim_ids_json"])), GapClassification(gap["classification"]), ArtifactProvenance(**json.loads(gap["provenance_json"])))
         
-        run = self.repository.create_run(project_id, PipelineKind.NOVELTY, {"gap_id": gap_obj.id})
+        run = self.repository.get_run(run_id) if run_id else self.repository.create_run(project_id, PipelineKind.NOVELTY, {"gap_id": gap_obj.id})
+        if not run:
+            raise ValueError(f"Novelty run {run_id} not found.")
+        owns_run = run_id is None
         try:
             # We mock the run_id inside gap so provenance links to this run.
             run_gap = ResearchGap(gap_obj.id, project_id, run.id, gap_obj.statement, gap_obj.supporting_paper_ids, gap_obj.supporting_claim_ids, gap_obj.why_unsolved, gap_obj.missing_experiment, gap_obj.falsification_test, gap_obj.confidence, gap_obj.counter_evidence_claim_ids, gap_obj.classification, gap_obj.provenance)
             portfolio = await self.pipeline.generate_portfolio(run_gap)
-            self.repository.finish_run(run.id)
+            if owns_run:
+                self.repository.finish_run(run.id)
             return portfolio.id
         except Exception as exc:
-            self.repository.finish_run(run.id, error=f"{type(exc).__name__}: {exc}")
+            if owns_run:
+                self.repository.finish_run(run.id, error=f"{type(exc).__name__}: {exc}")
             raise
 
 
@@ -540,7 +545,7 @@ class ExperimentService:
             report_writer=ScientificReportWriter(router),
         )
 
-    async def execute_candidate(self, candidate_id: str) -> str:
+    async def execute_candidate(self, candidate_id: str, *, run_id: str | None = None) -> str:
         candidate_row = self.repository.row("SELECT * FROM novelty_candidates WHERE id=?", (candidate_id,))
         if not candidate_row:
             raise ValueError(f"Candidate {candidate_id} not found.")
@@ -548,14 +553,19 @@ class ExperimentService:
         from autoresearch.storage.repository import _novelty_candidate
         candidate = _novelty_candidate(candidate_row)
         
-        run = self.repository.create_run(candidate.project_id, PipelineKind.EXPERIMENT, {"candidate_id": candidate_id})
+        run = self.repository.get_run(run_id) if run_id else self.repository.create_run(candidate.project_id, PipelineKind.EXPERIMENT, {"candidate_id": candidate_id})
+        if not run:
+            raise ValueError(f"Experiment run {run_id} not found.")
+        owns_run = run_id is None
         try:
             # mock candidate to use this run_id for tracking
             from dataclasses import replace
             run_candidate = replace(candidate, run_id=run.id)
             report = await self.pipeline.execute_candidate(run_candidate)
-            self.repository.finish_run(run.id)
+            if owns_run:
+                self.repository.finish_run(run.id)
             return report.id
         except Exception as exc:
-            self.repository.finish_run(run.id, error=f"{type(exc).__name__}: {exc}")
+            if owns_run:
+                self.repository.finish_run(run.id, error=f"{type(exc).__name__}: {exc}")
             raise

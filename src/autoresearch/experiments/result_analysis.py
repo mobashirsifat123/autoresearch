@@ -1,86 +1,66 @@
-"""Statistical analysis aggregating experiment results."""
+"""Deterministic, seed-aware experiment analysis.
 
+LLMs may explain the resulting record, but never calculate it.
+"""
 from __future__ import annotations
 
-import json
+import math
+from statistics import mean, stdev
 from uuid import uuid4
 
-from autoresearch.domain.models import (
-    ArtifactProvenance,
-    ExecutionResult,
-    ExperimentSpec,
-    StatisticalAnalysis,
-)
-from autoresearch.providers.capabilities import ModelRole
-from autoresearch.providers.router import ModelRouter
+from autoresearch.domain.models import ArtifactProvenance, ExecutionResult, ExperimentSpec, StatisticalAnalysis
 
-ANALYSIS_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "failure_case_analysis": {"type": "string"},
-        "hypothesis_support_assessment": {"type": "string"},
-    },
-    "required": ["failure_case_analysis", "hypothesis_support_assessment"],
-    "additionalProperties": False,
-}
 
-PROMPT_VERSION = "result-analyzer-v1"
+def paired_effects(baseline: list[float], proposed: list[float]) -> dict[str, float | int | str]:
+    """Return reproducible paired summary; insufficient samples stay explicit."""
+    if len(baseline) != len(proposed):
+        raise ValueError("Paired analysis requires equal seed counts")
+    if not baseline:
+        return {"sample_count": 0, "mean_difference": 0.0, "effect_size": 0.0, "status": "INSUFFICIENT_EVIDENCE"}
+    differences = [b - a for a, b in zip(baseline, proposed)]
+    avg = mean(differences)
+    deviation = stdev(differences) if len(differences) > 1 else 0.0
+    return {
+        "sample_count": len(differences),
+        "mean_difference": avg,
+        "effect_size": avg / deviation if deviation else 0.0,
+        "status": "INSUFFICIENT_EVIDENCE" if len(differences) < 2 else "ESTIMATE",
+    }
 
 
 class StatisticalAnalyzer:
-    def __init__(self, router: ModelRouter) -> None:
+    def __init__(self, router=None) -> None:
         self.router = router
 
     async def analyze(self, spec: ExperimentSpec, result: ExecutionResult) -> StatisticalAnalysis:
-        # Step 1: Parse deterministic metrics from the ExecutionResult
-        # In a real system, we'd aggregate across multiple seeds.
-        baseline_metrics = {"accuracy": 0.80, "loss": 0.15}
-        proposed_metrics = result.structured_metrics
-        
-        # Calculate effect sizes (mocked for milestone 1)
-        effect_size = {"accuracy": proposed_metrics.get("accuracy", 0) - baseline_metrics.get("accuracy", 0)}
-        
-        # Step 2: Use LLM for scientific interpretation
-        messages = [
-            {"role": "system", "content": "You are a lead statistician. Analyze the metrics from an experiment. Assess whether the hypothesis is supported, contradicted, or if the results are inconclusive. Provide a failure case analysis if applicable."},
-            {"role": "user", "content": f"Hypothesis: {spec.hypothesis}\n\nBaseline Metrics: {baseline_metrics}\nProposed Metrics: {proposed_metrics}\nEffect Size: {effect_size}\n\nAssess the results."}
-        ]
-        
-        payload = await self.router.structured_output(
-            ModelRole.RESEARCH_REASONING,
-            messages=messages,
-            schema={"name": "statistical_analysis", "schema": ANALYSIS_SCHEMA},
-            project_id=spec.project_id,
-            run_id=spec.run_id,
-            operation="result_analysis",
-        )
-        
-        provider, model = self.router.identity(ModelRole.RESEARCH_REASONING)
-        provenance = ArtifactProvenance.create(
-            project_id=spec.project_id,
-            run_id=spec.run_id,
-            source_evidence=[result.id],
-            provider=provider,
-            model=model,
-            prompt_version=PROMPT_VERSION,
-            content=payload,
-        )
-        
+        # Results may contain per-seed values under ``seeds``. A single value is
+        # retained as an observation but is never called significant.
+        proposed = result.structured_metrics
+        baseline = proposed.get("baseline", {}) if isinstance(proposed.get("baseline", {}), dict) else {}
+        seed_rows = proposed.get("seeds", []) if isinstance(proposed.get("seeds", []), list) else []
+        if seed_rows:
+            seed_level = tuple(row for row in seed_rows if isinstance(row, dict))
+        else:
+            seed_level = (proposed,)
+        metrics = set(baseline) | {k for k in proposed if isinstance(proposed.get(k), (int, float))}
+        effects: dict[str, float] = {}
+        intervals: dict[str, tuple[float, float]] = {}
+        status = "INSUFFICIENT_EVIDENCE"
+        for metric in sorted(metrics):
+            before = [float(row["baseline"][metric]) for row in seed_level if isinstance(row.get("baseline"), dict) and metric in row["baseline"]]
+            after = [float(row[metric]) for row in seed_level if metric in row and isinstance(row[metric], (int, float))]
+            if before and len(before) == len(after):
+                summary = paired_effects(before, after)
+                effects[metric] = float(summary["mean_difference"])
+                intervals[metric] = (effects[metric], effects[metric]) if len(after) < 2 else (effects[metric] - 1.96 * abs(effects[metric]) / math.sqrt(len(after)), effects[metric] + 1.96 * abs(effects[metric]) / math.sqrt(len(after)))
+                if len(after) >= 2:
+                    status = "ESTIMATE"
         return StatisticalAnalysis(
-            id=uuid4().hex,
-            project_id=spec.project_id,
-            run_id=spec.run_id,
-            spec_id=spec.id,
-            baseline_metrics=baseline_metrics,
-            proposed_metrics=proposed_metrics,
-            effect_size=effect_size,
-            confidence_intervals={"accuracy": (effect_size["accuracy"] - 0.01, effect_size["accuracy"] + 0.01)},
-            seed_level_results=(proposed_metrics,),
-            ablation_contributions={},
-            parameter_count_diff=1000,
-            flops_latency_diff=0.05,
-            training_inference_cost=10.0,
-            failure_case_analysis=payload.get("failure_case_analysis", ""),
-            hypothesis_support_assessment=payload.get("hypothesis_support_assessment", ""),
-            provenance=provenance,
+            id=uuid4().hex, project_id=spec.project_id, run_id=spec.run_id, spec_id=spec.id,
+            baseline_metrics=baseline, proposed_metrics=proposed, effect_size=effects,
+            confidence_intervals=intervals, seed_level_results=seed_level,
+            ablation_contributions={}, parameter_count_diff=0, flops_latency_diff=None,
+            training_inference_cost=0.0, failure_case_analysis="",
+            hypothesis_support_assessment=status,
+            provenance=ArtifactProvenance.create(project_id=spec.project_id, run_id=spec.run_id, source_evidence=[result.id], provider="deterministic", model="statistics", prompt_version="stats-v2", content={"status": status}),
         )

@@ -37,6 +37,11 @@ SPEC_SCHEMA = {
         "stopping_conditions": {"type": "array", "items": {"type": "string"}},
         "expected_outputs": {"type": "array", "items": {"type": "string"}},
         "artifact_contract": {"type": "string"},
+        "metric_direction": {"type": "object", "additionalProperties": {"type": "string", "enum": ["maximize", "minimize"]}},
+        "minimum_meaningful_effect": {"type": "object", "additionalProperties": {"type": "number"}},
+        "required_seed_count": {"type": "integer", "minimum": 1},
+        "network_policy": {"type": "string", "enum": ["disabled", "allowlisted"]},
+        "target_worker": {"type": "string"},
     },
     "required": [
         "hypothesis", "causal_mechanism", "falsification_condition",
@@ -110,4 +115,10 @@ class ExperimentSpecGenerator:
             expected_outputs=tuple(payload.get("expected_outputs", [])),
             artifact_contract=payload.get("artifact_contract", ""),
             provenance=provenance,
+            metric_direction=payload.get("metric_direction", {}),
+            minimum_meaningful_effect=payload.get("minimum_meaningful_effect", {}),
+            required_seed_count=int(payload.get("required_seed_count", max(1, len(payload.get("random_seeds", []))))),
+            network_policy=payload.get("network_policy", "disabled"),
+            target_worker=payload.get("target_worker", "local"),
+            approval_required=True,
         )

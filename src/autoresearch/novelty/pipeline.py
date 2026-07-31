@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import logging
 
-from autoresearch.domain.models import ResearchGap, NoveltyPortfolio
+from uuid import uuid4
+
+from autoresearch.domain.models import ArtifactProvenance, NoveltyClaimLedger, ResearchGap, NoveltyPortfolio
 from autoresearch.novelty.candidate_generator import LLMCandidateGenerator
 from autoresearch.novelty.novelty_critic import ScientificCritic
 from autoresearch.novelty.prior_art_checker import EvidenceBackedPriorArtChecker
@@ -47,24 +49,60 @@ class NoveltyPipeline:
             assessment = await self.prior_art_checker.check(candidate)
             self.repository.save_prior_art_assessment(assessment)
             
-            # Simple rejection for known method
-            if assessment.overlap_status.value in ("known_method", "incremental"):
+            # Confirmed known methods remain useful as baselines but cannot be
+            # promoted as novelty candidates. Incremental work remains eligible.
+            if assessment.overlap_status.value == "known_method":
                 logger.info(f"Candidate {candidate.id} rejected due to overlap: {assessment.overlap_status}")
                 continue
 
             critique = await self.critic.evaluate(candidate)
             self.repository.save_novelty_critique(critique)
+
+            if assessment.overlap_status.value == "partial_overlap":
+                original = candidate
+                revised, revision = await self.generator.revise(original, assessment, critique, revision_count=1)
+                self.repository.save_novelty_candidate(revised)
+                self.repository.save_candidate_revision(revision)
+                reassessment = await self.prior_art_checker.check(revised)
+                self.repository.save_prior_art_assessment(reassessment)
+                candidate = revised
+                assessment = reassessment
+                critique = await self.critic.evaluate(revised)
+                self.repository.save_novelty_critique(critique)
             
-            # We could do revision loops here, but for milestone 1 we'll stick to a straight-through approach.
-            if critique.novelty_score < 0.4:
-                logger.info(f"Candidate {candidate.id} rejected by critic (novelty: {critique.novelty_score})")
+            hard_gates = (
+                bool(candidate.difference_from_existing.strip()),
+                bool(candidate.falsification_condition.strip()),
+                bool(candidate.minimum_validating_experiment.strip()),
+                assessment.overlap_status.value not in ("unsupported", "expert_review_required"),
+                critique.falsifiability_score > 0,
+                critique.experimental_discriminability_score > 0,
+                critique.feasibility_score > 0,
+            )
+            if not all(hard_gates):
+                logger.info("Candidate %s did not pass scientific gates", candidate.id)
                 continue
                 
             valid_candidates.append(candidate)
             critiques.append(critique)
+            safe_wording = "Appears distinct under the current retrieved evidence; requires expert verification."
+            ledger = NoveltyClaimLedger(
+                id=uuid4().hex, project_id=candidate.project_id, run_id=candidate.run_id,
+                candidate_id=candidate.id, contribution_claim=candidate.difference_from_existing,
+                closest_methods=assessment.closest_paper_ids, overlap_status=assessment.overlap_status,
+                supporting_evidence=assessment.supporting_excerpts,
+                unresolved_uncertainty=assessment.unresolved_overlap,
+                safe_wording=safe_wording,
+                prohibited_wording=("proven novel", "definitively novel", "first-ever"),
+                review_status="expert_review_required" if assessment.overlap_status.value == "expert_review_required" else "retrieval_assessed",
+                provenance=ArtifactProvenance.create(project_id=candidate.project_id, run_id=candidate.run_id,
+                    source_evidence=[assessment.id, critique.id], provider="deterministic", model="claim-policy",
+                    prompt_version="claim-ledger-v1", content={"safe_wording": safe_wording, "status": assessment.overlap_status.value}),
+            )
+            self.repository.save_novelty_claim_ledger(ledger)
 
-        if len(valid_candidates) < 3:
-            raise RuntimeError("Novelty pipeline failed to produce at least 3 valid candidates.")
+        if not valid_candidates:
+            raise RuntimeError("Novelty pipeline produced no candidate that passed the scientific gates.")
 
         # 3. Portfolio Selection
         portfolio = self.selector.select(gap.project_id, gap.run_id, valid_candidates, critiques)

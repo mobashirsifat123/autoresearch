@@ -10,6 +10,9 @@ from autoresearch.domain.models import (
     CandidateStatus,
     NoveltyCandidate,
     ResearchGap,
+    CandidateRevision,
+    NoveltyCritique,
+    PriorArtAssessment,
 )
 from autoresearch.providers.capabilities import ModelRole
 from autoresearch.providers.router import ModelRouter
@@ -107,3 +110,31 @@ class LLMCandidateGenerator:
             candidates.append(candidate)
             
         return tuple(candidates)
+
+    async def revise(self, candidate: NoveltyCandidate, assessment: PriorArtAssessment, critique: NoveltyCritique, revision_count: int = 1) -> tuple[NoveltyCandidate, CandidateRevision]:
+        if revision_count not in (1, 2):
+            raise ValueError("Candidate revision is bounded to two rounds")
+        payload = await self.router.structured_output(
+            ModelRole.RESEARCH_REASONING,
+            messages=[
+                {"role": "system", "content": "Revise the candidate to address documented overlap and critic objections. Narrow claims when needed. Do not claim novelty. Return the complete candidate schema."},
+                {"role": "user", "content": f"Method: {candidate.method}\nOverlap: {assessment.mechanism_comparison}\nUncertainty: {assessment.unresolved_overlap}\nObjections: {critique.objections}\nRevision round: {revision_count}"},
+            ],
+            schema={"name": "candidate_revision", "schema": CANDIDATE_SCHEMA},
+            project_id=candidate.project_id, run_id=candidate.run_id, operation="candidate_revision",
+        )
+        provider, model = self.router.identity(ModelRole.RESEARCH_REASONING)
+        provenance = ArtifactProvenance.create(project_id=candidate.project_id, run_id=candidate.run_id,
+            source_evidence=[candidate.id, assessment.id, critique.id], provider=provider, model=model,
+            prompt_version="candidate-revision-v1", content=payload)
+        revised = NoveltyCandidate(
+            uuid4().hex, candidate.project_id, candidate.run_id, candidate.gap_id,
+            payload.get("strategy", candidate.strategy), payload.get("method", ""), payload.get("causal_mechanism", ""),
+            payload.get("target_limitation", ""), payload.get("difference_from_existing", ""), payload.get("expected_effect", ""),
+            payload.get("falsification_condition", ""), payload.get("minimum_validating_experiment", ""),
+            tuple(payload.get("required_ablations", [])), payload.get("implementation_complexity", ""), payload.get("expected_compute", ""),
+            tuple(payload.get("risks_and_objections", [])), CandidateStatus.GENERATED, provenance,
+        )
+        revision = CandidateRevision(uuid4().hex, candidate.project_id, candidate.run_id, candidate.id, revised.id,
+            critique.id, revision_count, assessment.mechanism_comparison or "Revised to reduce documented overlap.", provenance)
+        return revised, revision

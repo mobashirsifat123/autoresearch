@@ -9,7 +9,7 @@ import time
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Literal
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
@@ -53,6 +53,7 @@ class NoveltyRequest(BaseModel):
 class ExperimentRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     candidate_id: str = Field(min_length=1)
+    mode: Literal["plan", "validate", "execute", "inspect", "report"] = "plan"
     max_cost_usd: float | None = Field(default=None, ge=0)
     max_runtime_seconds: float | None = Field(default=None, gt=0)
 
@@ -194,7 +195,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         monitor = asyncio.create_task(monitor_run(c.repository, run_id))
         monitors[run_id] = monitor
         try:
-            await c.novelty.generate_portfolio(project_id, gap_id=request.gap_id)
+            await c.novelty.generate_portfolio(project_id, gap_id=request.gap_id, run_id=run_id)
             c.repository.finish_run(run_id)
         except asyncio.CancelledError:
             c.repository.cancel_run(run_id)
@@ -212,7 +213,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         monitor = asyncio.create_task(monitor_run(c.repository, run_id))
         monitors[run_id] = monitor
         try:
-            await c.experiment.execute_candidate(request.candidate_id)
+            await c.experiment.execute_candidate(request.candidate_id, run_id=run_id)
             c.repository.finish_run(run_id)
         except asyncio.CancelledError:
             c.repository.cancel_run(run_id)
@@ -240,7 +241,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             {"key": PipelineKind.DISCOVERY.value, "name": "Study Search", "enabled": True, "reason": None},
             {"key": PipelineKind.REVIEW.value, "name": "Deep Literature Review", "enabled": True, "reason": None},
             {"key": PipelineKind.NOVELTY.value, "name": "Novelty Generation", "enabled": True, "reason": None},
-            {"key": PipelineKind.EXPERIMENT.value, "name": "Experiment Design and Execution", "enabled": True, "reason": None},
+            {"key": PipelineKind.EXPERIMENT.value, "name": "Experiment Design", "enabled": True, "reason": None,
+             "execution": {"state": "conditional", "approval_required": True, "local_execution_allowed": False,
+             "remote_execution_allowed": False, "worker_types": [], "isolation_strength": "workspace-only",
+             "reason": "No policy-controlled worker is configured; planning and deterministic analysis remain available."}},
             {"key": PipelineKind.REINVENTION.value, "name": "Result-Conditioned Reinvention", "enabled": False, "reason": "Reinvention pipeline is not implemented in the Python backend."},
         ]}
 
