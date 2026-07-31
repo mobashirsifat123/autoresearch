@@ -186,10 +186,11 @@ async def test_complete_first_milestone_without_paid_api_keys(tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir(exist_ok=True)
     experiment_service = ExperimentService(repository, router, workspace)
-    report_id = await experiment_service.execute_candidate(portfolio["low_risk_candidate_id"])
-    assert report_id is not None
-    report = repository.row("SELECT * FROM experiment_reports WHERE id=?", (report_id,))
-    assert report["decision"] == "supported"
+    spec_id = await experiment_service.execute_candidate(portfolio["low_risk_candidate_id"], mode="plan")
+    assert spec_id is not None
+    spec = repository.row("SELECT * FROM experiment_specs WHERE id=?", (spec_id,))
+    assert spec["approval_required"] == 1
+    assert repository.row("SELECT * FROM execution_jobs LIMIT 1") is None
 
     await pipeline.close(); await router.close()
 
