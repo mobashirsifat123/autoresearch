@@ -4,10 +4,11 @@ import json
 import re
 from pathlib import Path
 
+import os
 import pytest
 from pypdf import PdfWriter
 
-from autoresearch.application.services import DiscoveryService, LiteratureReviewService
+from autoresearch.application.services import DiscoveryService, LiteratureReviewService, NoveltyService, ExperimentService
 from autoresearch.domain.models import DownloadStatus, GapClassification, content_checksum
 from autoresearch.papers.metadata_sources import MetadataPaper, SourceSearchResult
 from autoresearch.papers.pdf_resolver import DownloadedPdf, PdfResolution
@@ -78,6 +79,39 @@ def _responder(messages):
         claim_ids = re.findall(r'"claim_id":\s*"([a-f0-9]{32})"', prompt)
         paper_ids = list(dict.fromkeys(re.findall(r'"paper_id":\s*"([a-f0-9]{24})"', prompt)))
         return {"gap_statement": "Adaptive fusion lacks matched cross-domain validation.", "supporting_paper_ids": paper_ids[:2], "supporting_claim_ids": claim_ids[:2], "why_existing_work_does_not_solve_it": "The highest-priority studies evaluate only one dataset.", "missing_experiment": "A parameter-matched evaluation across three held-out domains.", "falsification_test": "Reject the gap if existing matched multi-domain evidence shows consistent gains across three domains.", "confidence": 0.88, "counter_evidence_claim_ids": claim_ids[2:3]}
+    if "Research Gap:" in prompt or "limitation root cause elimination" in prompt or "candidate-gen-v1" in prompt:
+        return {
+            "strategy": "limitation root cause elimination", "method": "New Method", "causal_mechanism": "Cause",
+            "target_limitation": "Limitation", "difference_from_existing": "Diff", "expected_effect": "Effect",
+            "falsification_condition": "Falsification", "minimum_validating_experiment": "Experiment",
+            "required_ablations": [], "implementation_complexity": "Low", "expected_compute": "Low", "risks_and_objections": []
+        }
+    if "Prior Art Abstracts" in prompt or "prior-art-v1" in prompt:
+        return {"overlap_status": "potentially_novel", "mechanism_comparison": "Comparison", "supporting_excerpts": [], "unresolved_overlap": "None"}
+    if "Method:" in prompt or "novelty-critic-v1" in prompt:
+        return {
+            "novelty_score": 0.9, "significance_score": 0.9, "causal_plausibility_score": 0.9, "falsifiability_score": 0.9,
+            "experimental_discriminability_score": 0.9, "feasibility_score": 0.9, "implementation_risk_score": 0.1,
+            "expected_information_gain_score": 0.9, "compute_efficiency_score": 0.9, "publication_potential_score": 0.9,
+            "objections": [], "failure_scenarios": []
+        }
+    if "Candidate Method:" in prompt or "experiment-planner-v1" in prompt:
+        return {
+            "hypothesis": "H1", "causal_mechanism": "C1", "falsification_condition": "F1", "repository": "repo",
+            "baseline_commit": "main", "dataset_identity": "data", "dataset_checksum": "checksum", "split_definition": "split",
+            "baseline_configuration": "base", "proposed_change": "change", "independent_variables": [], "controlled_variables": [],
+            "metrics": [], "random_seeds": [42], "ablations": [], "robustness_tests": [], "statistical_plan": "plan",
+            "compute_budget": "budget", "stopping_conditions": [], "expected_outputs": [], "artifact_contract": "contract"
+        }
+    if "Baseline Metrics:" in prompt or "result-analyzer-v1" in prompt:
+        return {"failure_case_analysis": "None", "hypothesis_support_assessment": "Supported"}
+    if "Assessment:" in prompt or "report-writer-v1" in prompt:
+        return {
+            "literature_motivation": "Motiv", "research_gap": "Gap", "implementation_diff": "Diff", "uncertainty": "Uncert",
+            "ablations": "Ablations", "robustness_tests": "Robust", "limitations": "Limit", "reproducibility_instructions": "Repro",
+            "decision": "supported", "decision_evidence": "Evidence"
+        }
+        
     raise AssertionError(f"Unexpected provider prompt: {prompt[:120]}")
 
 
@@ -100,7 +134,7 @@ def _seed_pdf(path: Path) -> None:
         writer.write(handle)
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_complete_first_milestone_without_paid_api_keys(tmp_path):
     repository = ResearchRepository(tmp_path / "autoresearch.sqlite3", tmp_path / "artifacts")
     router = _router(repository)
@@ -140,4 +174,21 @@ async def test_complete_first_milestone_without_paid_api_keys(tmp_path):
     assert repository.integrity_check() == "ok"
     assert repository.row("SELECT COUNT(*) AS n FROM provider_usage")["n"] >= 24
     assert repository.review_failures(review.run_id) == []
+    
+    if os.environ.get("RUN_LIVE_NOVELTY_TESTS") == "1":
+        novelty_service = NoveltyService(repository, router, pipeline)
+        portfolio_id = await novelty_service.generate_portfolio(discovery.project_id)
+        assert portfolio_id is not None
+        portfolio = repository.row("SELECT * FROM novelty_portfolios WHERE id=?", (portfolio_id,))
+        assert portfolio["low_risk_candidate_id"]
+        
+        if os.environ.get("RUN_REMOTE_EXPERIMENT_TESTS") == "1":
+            workspace = tmp_path / "workspace"
+            workspace.mkdir(exist_ok=True)
+            experiment_service = ExperimentService(repository, router, workspace)
+            report_id = await experiment_service.execute_candidate(portfolio["low_risk_candidate_id"])
+            assert report_id is not None
+            report = repository.row("SELECT * FROM experiment_reports WHERE id=?", (report_id,))
+            assert report["decision"] == "supported"
+
     await pipeline.close(); await router.close()

@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Sequence
 from uuid import uuid4
 
-from autoresearch.domain.models import ArtifactProvenance, ArtifactReference, DownloadStatus, PipelineKind, ResearchGap, SeedPaper, content_checksum, utc_now
+from autoresearch.domain.models import ArtifactProvenance, ArtifactReference, DownloadStatus, PipelineKind, ResearchGap, SeedPaper, content_checksum, utc_now, GapClassification
 from autoresearch.ingestion.chunking import DocumentChunk, chunk_document
 from autoresearch.ingestion.document_parser import DocumentParser, ParsedDocument, ParsedPage
 from autoresearch.ingestion.extraction import SEED_PROMPT_VERSION, SeedAnalysis, SeedAnalyzer
@@ -21,6 +21,17 @@ from autoresearch.review.gap_analysis import GapAnalyzer
 from autoresearch.review.similarity import ReviewRanker
 from autoresearch.review.synthesis import ReviewSynthesisWriter
 from autoresearch.storage.repository import ResearchRepository
+from autoresearch.novelty.pipeline import NoveltyPipeline
+from autoresearch.novelty.candidate_generator import LLMCandidateGenerator
+from autoresearch.novelty.prior_art_checker import EvidenceBackedPriorArtChecker
+from autoresearch.novelty.novelty_critic import ScientificCritic
+from autoresearch.novelty.selection import PortfolioSelector
+from autoresearch.experiments.pipeline import ExperimentPipeline
+from autoresearch.experiments.planner import ExperimentSpecGenerator
+from autoresearch.experiments.environment import IsolatedEnvironmentBuilder
+from autoresearch.experiments.executor import DurableExperimentExecutor
+from autoresearch.experiments.result_analysis import StatisticalAnalyzer
+from autoresearch.experiments.report_writer import ScientificReportWriter
 
 SEARCH_PROMPT_VERSION = "search-strategies-v1"
 SEARCH_STRATEGIES_SCHEMA = {
@@ -242,3 +253,72 @@ class LiteratureReviewService:
             except Exception:
                 chunks = ()
         return await self.extractor.extract(paper, run_id=run_id, chunks=chunks, fallback_text=paper.abstract)
+
+
+class NoveltyService:
+    def __init__(self, repository: ResearchRepository, router: ModelRouter, search_pipeline: StudySearchPipeline) -> None:
+        self.repository = repository
+        self.router = router
+        self.pipeline = NoveltyPipeline(
+            repository=repository,
+            generator=LLMCandidateGenerator(router),
+            prior_art_checker=EvidenceBackedPriorArtChecker(router, search_pipeline),
+            critic=ScientificCritic(router),
+            selector=PortfolioSelector(repository),
+        )
+
+    async def generate_portfolio(self, project_id: str) -> str:
+        gap = self.repository.row("SELECT * FROM research_gaps WHERE project_id=? ORDER BY confidence DESC LIMIT 1", (project_id,))
+        if not gap:
+            raise ValueError(f"No research gap found for project {project_id}.")
+        
+        # We need the full object, since gap is a dict right now (returned from row).
+        # We can construct it, but easier to use a repository method if one existed, 
+        # or simply adapt it:
+        gap_obj = ResearchGap(gap["id"], gap["project_id"], gap["run_id"], gap["statement"], tuple(json.loads(gap["supporting_paper_ids_json"])), tuple(json.loads(gap["supporting_claim_ids_json"])), gap["why_unsolved"], gap["missing_experiment"], gap["falsification_test"], float(gap["confidence"]), tuple(json.loads(gap["counter_evidence_claim_ids_json"])), GapClassification(gap["classification"]), ArtifactProvenance(**json.loads(gap["provenance_json"])))
+        
+        run = self.repository.create_run(project_id, PipelineKind.NOVELTY, {"gap_id": gap_obj.id})
+        try:
+            # We mock the run_id inside gap so provenance links to this run.
+            run_gap = ResearchGap(gap_obj.id, project_id, run.id, gap_obj.statement, gap_obj.supporting_paper_ids, gap_obj.supporting_claim_ids, gap_obj.why_unsolved, gap_obj.missing_experiment, gap_obj.falsification_test, gap_obj.confidence, gap_obj.counter_evidence_claim_ids, gap_obj.classification, gap_obj.provenance)
+            portfolio = await self.pipeline.generate_portfolio(run_gap)
+            self.repository.finish_run(run.id)
+            return portfolio.id
+        except Exception as exc:
+            self.repository.finish_run(run.id, error=f"{type(exc).__name__}: {exc}")
+            raise
+
+
+class ExperimentService:
+    def __init__(self, repository: ResearchRepository, router: ModelRouter, workspace_root: Path) -> None:
+        self.repository = repository
+        self.router = router
+        self.pipeline = ExperimentPipeline(
+            repository=repository,
+            planner=ExperimentSpecGenerator(router),
+            environment_builder=IsolatedEnvironmentBuilder(workspace_root),
+            executor=DurableExperimentExecutor(repository, None),
+            analyzer=StatisticalAnalyzer(router),
+            report_writer=ScientificReportWriter(router),
+        )
+
+    async def execute_candidate(self, candidate_id: str) -> str:
+        candidate_row = self.repository.row("SELECT * FROM novelty_candidates WHERE id=?", (candidate_id,))
+        if not candidate_row:
+            raise ValueError(f"Candidate {candidate_id} not found.")
+        
+        from autoresearch.storage.repository import _novelty_candidate
+        candidate = _novelty_candidate(candidate_row)
+        
+        run = self.repository.create_run(candidate.project_id, PipelineKind.EXPERIMENT, {"candidate_id": candidate_id})
+        try:
+            # mock candidate to use this run_id for tracking
+            from dataclasses import replace
+            run_candidate = replace(candidate, run_id=run.id)
+            report = await self.pipeline.execute_candidate(run_candidate)
+            self.repository.finish_run(run.id)
+            return report.id
+        except Exception as exc:
+            self.repository.finish_run(run.id, error=f"{type(exc).__name__}: {exc}")
+            raise
+
