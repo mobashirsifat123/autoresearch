@@ -374,23 +374,43 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return {"artifacts": [dataclass_payload(item) for item in c.repository.artifacts_for_run(run_id)]}
 
     @app.post("/v1/runs/{run_id}/cancel", dependencies=[Depends(require_auth)])
-    async def cancel_run(run_id: str):
+    async def cancel_run(run_id: str, idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
         c = container()
-        run_payload(c.repository, run_id)
+        run = c.repository.get_run(run_id)
+        if not run:
+            raise HTTPException(status_code=404, detail={"code": "run_not_found", "message": f"Run '{run_id}' was not found."})
+        key = mutation_key(idempotency_key)
+        prior = c.repository.idempotency(key)
+        if prior:
+            return prior["response"]
+        if run.status is RunStatus.CANCELLED:
+            response = {"run_id": run_id, "status": RunStatus.CANCELLED.value}
+            c.repository.save_idempotency(key, "cancel", run_id, response)
+            return response
+        if run.status in {RunStatus.COMPLETED, RunStatus.FAILED}:
+            raise HTTPException(status_code=409, detail={"code": "run_not_cancellable", "message": f"Run '{run_id}' is already {run.status.value}."})
         task = tasks.get(run_id)
         if task and not task.done():
             task.cancel()
         c.repository.cancel_run(run_id)
         emit(c.repository, run_id, "run.cancelled", {"run_id": run_id})
-        return {"run_id": run_id, "status": RunStatus.CANCELLED.value}
+        response = {"run_id": run_id, "status": RunStatus.CANCELLED.value}
+        c.repository.save_idempotency(key, "cancel", run_id, response)
+        return response
 
     @app.post("/v1/runs/{run_id}/approve", dependencies=[Depends(require_auth)])
-    async def approve_run(run_id: str, payload: ApprovalRequest):
+    async def approve_run(run_id: str, payload: ApprovalRequest, idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
         c = container()
         run_payload(c.repository, run_id)
+        key = mutation_key(idempotency_key)
+        prior = c.repository.idempotency(key)
+        if prior:
+            return prior["response"]
         c.repository.set_approval(run_id, "approved" if payload.approved else "rejected", payload.reason)
         emit(c.repository, run_id, "run.approval", {"run_id": run_id, "approved": payload.approved, "reason": payload.reason})
-        return {"run_id": run_id, "status": "approved" if payload.approved else "rejected", "reason": payload.reason}
+        response = {"run_id": run_id, "status": "approved" if payload.approved else "rejected", "reason": payload.reason}
+        c.repository.save_idempotency(key, "approve", run_id, response)
+        return response
 
     @app.get("/v1/artifacts/{artifact_id}", dependencies=[Depends(require_auth)])
     async def artifact(artifact_id: str, offset: int = Query(default=0, ge=0), limit: int = Query(default=65536, ge=1, le=200000)):

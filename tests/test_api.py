@@ -96,3 +96,24 @@ def test_api_authentication_and_secret_free_provider_status(tmp_path: Path, monk
         body = response.json()
         assert all("api_key" not in str(item).lower() for item in body["providers"])
         assert all("secret-token" not in str(item) for item in body["providers"])
+
+
+def test_cancel_and_approval_mutations_are_idempotent(tmp_path: Path):
+    config = Path(__file__).parents[1] / "docs" / "live_config.example.toml"
+    settings = Settings(tmp_path, tmp_path / "api.sqlite3", tmp_path / "artifacts", tmp_path / "downloads", config, ("crossref",))
+    with TestClient(create_app(settings)) as client:
+        repository = client.app.state.container.repository
+        project = repository.create_project("Mutation contract")
+        run = repository.create_run(project.id, PipelineKind.REVIEW, {"top_k": 5})
+        headers = {"Idempotency-Key": "cancel-once"}
+        first = client.post(f"/v1/runs/{run.id}/cancel", headers=headers)
+        second = client.post(f"/v1/runs/{run.id}/cancel", headers=headers)
+        assert first.json() == second.json() == {"run_id": run.id, "status": "cancelled"}
+        assert len([item for item in repository.api_events(run.id) if item["event_type"] == "run.cancelled"]) == 1
+
+        approval_headers = {"Idempotency-Key": "approval-once"}
+        approved = client.post(f"/v1/runs/{run.id}/approve", headers=approval_headers, json={"approved": True, "reason": "reviewed"})
+        approved_retry = client.post(f"/v1/runs/{run.id}/approve", headers=approval_headers, json={"approved": False, "reason": "changed retry"})
+        assert approved.json() == approved_retry.json()
+        assert repository.approval(run.id)["status"] == "approved"
+        assert len([item for item in repository.api_events(run.id) if item["event_type"] == "run.approval"]) == 1
