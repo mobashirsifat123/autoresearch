@@ -8,6 +8,7 @@ from autoresearch.papers.search_pipeline import StudySearchPipeline
 from autoresearch.providers.budget import ProviderBudgetGuard
 from autoresearch.providers.factory import build_router
 from autoresearch.storage.repository import ResearchRepository
+from autoresearch.workers.local_typed import LocalTypedWorker
 
 from .config import Settings
 from .services import DiscoveryService, LiteratureReviewService, NoveltyService, ExperimentService
@@ -24,7 +25,8 @@ class ApplicationContainer:
         self.discovery = DiscoveryService(self.repository, self.router, self.search_pipeline)
         self.review = LiteratureReviewService(self.repository, self.router)
         self.novelty = NoveltyService(self.repository, self.router, self.search_pipeline)
-        self.experiment = ExperimentService(self.repository, self.router, settings.data_root / "workspace")
+        self.worker = LocalTypedWorker(self.repository, settings.data_root / "workspace")
+        self.experiment = ExperimentService(self.repository, self.router, settings.data_root / "workspace", worker=self.worker)
 
     async def close(self) -> None:
         await self.search_pipeline.close()
