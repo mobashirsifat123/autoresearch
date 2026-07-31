@@ -16,7 +16,7 @@ The local worker is composed into the API application and uses the workspace at 
 
 ```bash
 cd /Users/mobashirsifat/autoresearch-cli
-npx --yes bun@1.3.14 run --cwd packages/autoresearch-cli start
+npx --yes bun@1.3.14 run --cwd packages/autoresearch-cli dev
 ```
 
 ## Approval lifecycle
