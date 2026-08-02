@@ -25,8 +25,9 @@ own later security and capability gates.
 - The TypeScript/OpenTUI package remains a client. It receives no provider key
   and continues using generated OpenAPI contracts.
 - A small Python product launcher owns daemon startup and process lifecycle.
-  It invokes the packaged TUI executable when available, otherwise a configured
-  development client command. It does not embed research logic.
+  It invokes only the packaged TUI executable (or an explicitly configured
+  installed binary); it does not cold-start a development client or embed
+  research logic.
 - Product, API, CLI, database, and worker protocol versions are explicit.
   Compatibility is negotiated through `/v1/health` before the TUI starts.
 - Release artifacts are checksum-verified locally. Signing and publishing stay

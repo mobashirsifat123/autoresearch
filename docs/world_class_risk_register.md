@@ -10,3 +10,5 @@
 | R-006 | Cold development TUI startup uses `npx` and is slow. | Mitigated in Phase 1 | Package a standalone Bun TUI and prefer it from the launcher. |
 | R-007 | Local artifact/database paths can contain private research data. | Controlled | Diagnostics redact secrets and omit file contents by default; backups remain local. |
 | R-008 | Existing FastAPI test client emits a Starlette/httpx deprecation warning. | Open | Test suite passes; dependency upgrade is tracked separately from release work. |
+| R-009 | ResearchBench v0.1 has no adjudicated claim-level labels for evidence precision/recall or novelty false-positive rates. | Open | Preserve these metrics as null; add licensed labeled fixtures and human review before setting quantitative quality thresholds. |
+| R-010 | The v0.1.0-alpha.1 artifact was built and installer-smoked only on macOS ARM64. | Open | Build and validate macOS x64, Linux x64/ARM64, and Windows x64 on their native CI runners before broad release. |
