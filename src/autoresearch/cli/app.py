@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 from dataclasses import asdict
@@ -45,6 +46,27 @@ def _paths() -> ProductPaths:
 
 def _product_config(paths: ProductPaths | None = None) -> ProductConfig:
     return ProductConfig.load(paths or _paths())
+
+
+def _claude_session_state(paths: ProductPaths, repository_root: Path) -> Path:
+    """Return a local, secret-free state file shared by Claude Code skills."""
+    digest = hashlib.sha256(str(repository_root.resolve()).encode("utf-8")).hexdigest()[:20]
+    return paths.state_dir / "claude-code-sessions" / f"{digest}.json"
+
+
+def _read_claude_sessions(path: Path) -> dict[str, str]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return {str(key): str(item) for key, item in value.items() if isinstance(key, str) and isinstance(item, str)}
+
+
+def _write_claude_sessions(path: Path, sessions: dict[str, str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(sessions, sort_keys=True), encoding="utf-8")
+    temporary.replace(path)
 
 
 def _release_output(value: Any, *, json_output: bool = True) -> None:
@@ -213,6 +235,62 @@ def run(
     else:
         answer = next((str(item.get("content", "")) for item in reversed(snapshot.get("messages", [])) if item.get("role") == "assistant"), "No assistant response was recorded.")
         typer.echo(answer)
+
+
+@app.command("agent")
+def agent(
+    mode: str = typer.Option(..., "--mode", help="One of review, novelty, or experiment."),
+    prompt: str | None = typer.Option(None, "--prompt", help="Research request for the selected durable pipeline."),
+    wait: bool = typer.Option(False, "--wait", help="Stream the session events until the current turn reaches a terminal state."),
+) -> None:
+    """Start or continue a Claude Code-facing research mode without exposing provider keys."""
+    mode_aliases = {"review": "literature_review", "novelty": "novelty_generation", "experiment": "experiment"}
+    normalized = mode_aliases.get(mode.strip().lower())
+    if not normalized:
+        raise typer.BadParameter("mode must be one of: review, novelty, experiment.")
+    if not prompt and not wait:
+        raise typer.BadParameter("Provide --prompt, or use --wait only with an already-started turn.")
+
+    paths, config = _paths(), _product_config()
+    repository_root = Path.cwd().resolve()
+    start_daemon(config, paths, repository_root=repository_root)
+    state_file = _claude_session_state(paths, repository_root)
+    sessions = _read_claude_sessions(state_file)
+    session_id = sessions.get(normalized)
+    session_payload: dict[str, Any] | None = None
+    if session_id:
+        try:
+            session_payload = api_request(config, f"/v1/agent/sessions/{session_id}", timeout=5.0)
+        except RuntimeError:
+            session_id = None
+    if not session_id:
+        created = api_request(
+            config,
+            "/v1/agent/sessions",
+            method="POST",
+            payload={
+                "project_title": repository_root.name or "AutoResearch workspace",
+                "active_repository": str(repository_root),
+                "working_directory": str(repository_root),
+                "token_budget": 32_000,
+                "cost_budget": config.cost_budget_usd,
+            },
+            timeout=10.0,
+        )
+        session_id = str(created["session"]["id"])
+        sessions[normalized] = session_id
+        _write_claude_sessions(state_file, sessions)
+
+    api_request(config, f"/v1/agent/sessions/{session_id}/mode", method="POST", payload={"mode": normalized, "auto_routing": True}, timeout=5.0)
+    response: dict[str, Any] = {"mode": normalized, "session_id": session_id, "started": False, "provider_keys_exposed": False}
+    if prompt:
+        overrides = {"literature_review": "@review", "novelty_generation": "@invent", "experiment": "@experiment"}
+        turn = api_request(config, f"/v1/agent/sessions/{session_id}/turns", method="POST", payload={"message": f"{overrides[normalized]} {prompt}", "capability_override": None, "token_budget": None, "cost_budget": config.cost_budget_usd, "time_budget_seconds": 600}, timeout=10.0)
+        response.update({"started": True, "turn_id": turn["turn_id"], "status": turn["status"], "background": not wait})
+    if wait:
+        response["events"] = list(stream_sse(config, f"/v1/agent/sessions/{session_id}/events?last_event_id=0", timeout=600.0))
+        response["session"] = api_request(config, f"/v1/agent/sessions/{session_id}", timeout=10.0)
+    _release_output(response)
 
 
 @app.command()
