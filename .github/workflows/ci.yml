@@ -21,5 +21,7 @@ jobs:
         run: python -m pytest -q
       - name: Compile and dependency checks
         run: python -m compileall -q src && python -m pip check
+      - name: Offline ResearchBench release gate
+        run: python scripts/run_researchbench.py --strict --skip-cli --output /tmp/researchbench.json
       - name: Backend release packaging smoke test
         run: python scripts/build_release.py --skip-tui --output /tmp/autoresearch-release
