@@ -22,6 +22,7 @@ from autoresearch.agent.models import SessionMode, TurnStatus
 from autoresearch.domain.models import PipelineKind, RunStatus, dataclass_payload
 from autoresearch.providers.errors import ProviderError
 from autoresearch.providers.redaction import redact_text
+from autoresearch.versioning import API_VERSION, DATABASE_SCHEMA_VERSION, PRODUCT_VERSION, WORKER_PROTOCOL_VERSION
 
 from . import __version__
 from ..application.config import Settings, load_settings
@@ -129,7 +130,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if app.state.container:
             await app.state.container.close()
 
-    app = FastAPI(title="AutoResearch API", version=__version__, lifespan=lifespan)
+    app = FastAPI(title="AutoResearch API", version=API_VERSION, lifespan=lifespan)
 
     @app.exception_handler(ValueError)
     async def value_error(_request: Request, exc: ValueError):
@@ -272,7 +273,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/v1/health", dependencies=[Depends(require_auth)])
     async def health():
         c = getattr(app.state, "container", None)
-        return {"status": "ready" if c else "unavailable", "service": "autoresearch-api", "version": __version__, "reason": getattr(app.state, "startup_error", None)}
+        return {"status": "ready" if c else "unavailable", "service": "autoresearch-api", "version": API_VERSION, "api_version": API_VERSION, "product_version": PRODUCT_VERSION, "database_schema_version": DATABASE_SCHEMA_VERSION, "worker_protocol_version": WORKER_PROTOCOL_VERSION, "reason": getattr(app.state, "startup_error", None)}
 
     @app.get("/v1/capabilities", dependencies=[Depends(require_auth)])
     async def capabilities():
@@ -758,7 +759,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     return app
 
 
-__version__ = "0.2.0"
+__version__ = API_VERSION
 
 
 def main() -> None:

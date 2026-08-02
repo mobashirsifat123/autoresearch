@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,9 +16,203 @@ from autoresearch.application.config import load_settings
 from autoresearch.application.factory import ApplicationContainer
 from autoresearch.application.audit import write_audit
 from autoresearch.domain.models import PipelineKind
-from autoresearch.providers.redaction import redact_text
+from autoresearch.providers.redaction import redact, redact_text
+from autoresearch.release import (
+    ProductConfig,
+    ProductPaths,
+    activate_staged,
+    api_request,
+    create_diagnostics,
+    daemon_environment,
+    doctor as run_doctor,
+    launch_tui,
+    remove_installation,
+    stage_update,
+    start_daemon,
+    stream_sse,
+    verify_release_artifact,
+    write_config,
+    rollback_update,
+)
+from autoresearch.versioning import API_VERSION, CLI_VERSION, DATABASE_SCHEMA_VERSION, PRODUCT_VERSION, WORKER_PROTOCOL_VERSION
 
-app = typer.Typer(name="autoresearch", help="Evidence-first research discovery and review.", no_args_is_help=True)
+app = typer.Typer(name="autoresearch", help="AutoResearch local-first coding and scientific workflows.", no_args_is_help=False)
+
+
+def _paths() -> ProductPaths:
+    return ProductPaths.current()
+
+
+def _product_config(paths: ProductPaths | None = None) -> ProductConfig:
+    return ProductConfig.load(paths or _paths())
+
+
+def _release_output(value: Any, *, json_output: bool = True) -> None:
+    if json_output:
+        typer.echo(json.dumps(redact(value), indent=2, default=str))
+    else:
+        for item in value:
+            typer.echo(f"{item['status']:7} {item['name']}: {item['detail']}" + (f"\n         {item['remedy']}" if item.get("remedy") else ""))
+
+
+@app.callback(invoke_without_command=True)
+def root(ctx: typer.Context) -> None:
+    """Launch the packaged AutoResearch terminal application."""
+    if ctx.invoked_subcommand is None:
+        paths = _paths()
+        try:
+            exit_code = launch_tui(_product_config(paths), paths, repository_root=Path.cwd())
+        except Exception as exc:
+            typer.echo(json.dumps({"error": redact_text(str(exc)), "next": "Run `autoresearch doctor` for actionable checks."}, indent=2), err=True)
+            raise typer.Exit(1) from exc
+        raise typer.Exit(exit_code)
+
+
+@app.command()
+def version() -> None:
+    """Show product and protocol versions."""
+    _release_output({"product_version": PRODUCT_VERSION, "cli_version": CLI_VERSION, "api_version": API_VERSION, "database_schema_version": DATABASE_SCHEMA_VERSION, "worker_protocol_version": WORKER_PROTOCOL_VERSION})
+
+
+@app.command()
+def setup(
+    backend_url: str | None = typer.Option(None, help="Local backend URL without embedded credentials."),
+    daemon_port: int | None = typer.Option(None, min=1024, max=65535),
+    provider_config: Path | None = typer.Option(None, help="Secret-free provider TOML path."),
+    allowed_root: list[Path] = typer.Option([], "--allowed-root", help="Allowed repository root; repeat as needed."),
+    tui_executable: Path | None = typer.Option(None, help="Installed packaged TUI binary."),
+    auth_token_env: str | None = typer.Option(None, help="Existing backend-auth token environment-variable name."),
+    cost_budget_usd: float | None = typer.Option(None, min=0),
+    telemetry: bool | None = typer.Option(None, "--telemetry/--no-telemetry"),
+) -> None:
+    """Create safe local configuration and product directories; never stores provider keys."""
+    paths = _paths()
+    paths.create()
+    if provider_config and not provider_config.expanduser().is_file():
+        raise typer.BadParameter("provider_config must be an existing secret-free TOML file.")
+    updates: dict[str, Any] = {
+        "backend_url": backend_url,
+        "daemon_port": daemon_port,
+        "provider_config": str(provider_config.expanduser()) if provider_config else None,
+        "allowed_repository_roots": tuple(str(path.expanduser().resolve()) for path in allowed_root) if allowed_root else None,
+        "tui_executable": str(tui_executable.expanduser()) if tui_executable else None,
+        "authentication_token_environment_variable": auth_token_env,
+        "cost_budget_usd": cost_budget_usd,
+        "telemetry_enabled": telemetry,
+    }
+    file = write_config(paths, _product_config(paths).with_updates(**updates))
+    _release_output({"config": str(file), "data_dir": str(paths.data_dir), "state_dir": str(paths.state_dir), "cache_dir": str(paths.cache_dir), "provider_keys_stored": False})
+
+
+@app.command()
+def login(
+    auth_token_env: str | None = typer.Option(None, help="Existing environment variable containing a backend-auth token."),
+    provider_config: Path | None = typer.Option(None, help="Secret-free provider TOML path."),
+) -> None:
+    """Record only credential references; actual provider keys remain in the backend environment."""
+    if not auth_token_env and not provider_config:
+        raise typer.BadParameter("Specify --auth-token-env and/or --provider-config; never pass raw credentials.")
+    setup(auth_token_env=auth_token_env, provider_config=provider_config)
+
+
+@app.command()
+def doctor(check_provider: bool = typer.Option(False, "--check-provider"), json_output: bool = typer.Option(False, "--json")) -> None:
+    """Diagnose local installation, daemon, configuration, and safe capability prerequisites."""
+    checks = run_doctor(_product_config(), _paths(), check_provider=check_provider)
+    _release_output(checks, json_output=json_output)
+    if any(item["status"] == "FAIL" for item in checks):
+        raise typer.Exit(1)
+
+
+@app.command()
+def serve() -> None:
+    """Run the local backend daemon in the foreground."""
+    import uvicorn
+    paths, config = _paths(), _product_config()
+    os.environ.update(daemon_environment(config, paths, repository_root=Path.cwd()))
+    uvicorn.run("autoresearch.api.app:create_app", factory=True, host=config.daemon_host, port=config.daemon_port, log_level="warning")
+
+
+@app.command()
+def status(json_output: bool = typer.Option(False, "--json")) -> None:
+    """Show local daemon and API compatibility status."""
+    paths, config = _paths(), _product_config()
+    try:
+        health, started = start_daemon(config, paths, repository_root=Path.cwd())
+        payload: dict[str, Any] = {"daemon": "started" if started else "already_running", "health": health}
+    except RuntimeError as exc:
+        payload = {"daemon": "unavailable", "error": redact_text(str(exc))}
+    if json_output:
+        _release_output(payload)
+    else:
+        _release_output([{"status": "FAIL" if payload["daemon"] == "unavailable" else "PASS", "name": "daemon", "detail": str(payload), "remedy": "Run `autoresearch doctor`." if payload["daemon"] == "unavailable" else ""}], json_output=False)
+    if payload["daemon"] == "unavailable":
+        raise typer.Exit(1)
+
+
+@app.command()
+def diagnostics(output: Path = typer.Option(Path("autoresearch-diagnostics.zip"), "--output")) -> None:
+    """Write a privacy-safe diagnostic archive without research file contents."""
+    archive = create_diagnostics(_product_config(), _paths(), output)
+    _release_output({"diagnostic_archive": str(archive), "includes_file_contents": False, "includes_provider_keys": False})
+
+
+@app.command()
+def update(source: Path = typer.Option(..., help="Local release artifact directory containing manifest.json."), activate: bool = typer.Option(False, "--activate", help="Activate the verified TUI and retain the previous binary for rollback.")) -> None:
+    """Verify checksums, stage a release, and optionally activate its host TUI."""
+    manifest = verify_release_artifact(source)
+    staged = stage_update(source, _paths())
+    payload: dict[str, Any] = {"staged_release": str(staged), "product_version": manifest.get("product_version"), "signed": bool(manifest.get("signature")), "activation": "staged"}
+    if activate:
+        target, previous = activate_staged(staged, _paths())
+        write_config(_paths(), _product_config().with_updates(tui_executable=str(target)))
+        payload.update({"activation": "active", "tui_executable": str(target), "previous_release": str(previous) if previous else None, "health_check": "backend compatibility remains checked by launcher startup"})
+    _release_output(payload)
+
+
+@app.command()
+def rollback() -> None:
+    """Restore the most recent retained TUI release after an unsuccessful update."""
+    target = rollback_update(_paths())
+    write_config(_paths(), _product_config().with_updates(tui_executable=str(target / ("autoresearch-tui.exe" if os.name == "nt" else "autoresearch-tui"))))
+    _release_output({"rollback": "completed", "tui_executable": str(target)})
+
+
+@app.command()
+def uninstall(yes: bool = typer.Option(False, "--yes"), purge_data: bool = typer.Option(False, "--purge-data")) -> None:
+    """Remove known product files; data removal requires explicit `--purge-data`."""
+    paths = _paths()
+    if not yes:
+        _release_output({"would_remove": str(paths.install_dir), "would_purge_data": purge_data, "next": "Repeat with --yes to uninstall."})
+        return
+    _release_output({"removed": [str(path) for path in remove_installation(paths, purge_data=purge_data)], "purged_data": purge_data})
+
+
+@app.command()
+def run(
+    prompt: str = typer.Option(..., "--prompt", help="Prompt for one durable agent turn."),
+    json_output: bool = typer.Option(False, "--json"),
+    jsonl: bool = typer.Option(False, "--jsonl"),
+    timeout_seconds: float = typer.Option(120.0, min=1, max=600),
+) -> None:
+    """Run one durable headless turn and emit plain text, JSON, or JSONL events."""
+    if json_output and jsonl:
+        raise typer.BadParameter("Use either --json or --jsonl, not both.")
+    paths, config = _paths(), _product_config()
+    start_daemon(config, paths, repository_root=Path.cwd())
+    session = api_request(config, "/v1/agent/sessions", method="POST", payload={"project_title": Path.cwd().name or "AutoResearch workspace", "active_repository": str(Path.cwd()), "working_directory": str(Path.cwd()), "token_budget": 32_000, "cost_budget": config.cost_budget_usd}, timeout=timeout_seconds)
+    session_id = str(session["session"]["id"])
+    turn = api_request(config, f"/v1/agent/sessions/{session_id}/turns", method="POST", payload={"message": prompt, "capability_override": None, "token_budget": None, "cost_budget": config.cost_budget_usd, "time_budget_seconds": timeout_seconds}, timeout=timeout_seconds)
+    events = list(stream_sse(config, f"/v1/agent/sessions/{session_id}/events?last_event_id=0", timeout=timeout_seconds))
+    snapshot = api_request(config, f"/v1/agent/sessions/{session_id}", timeout=timeout_seconds)
+    if jsonl:
+        for event in events:
+            typer.echo(json.dumps(event, default=str))
+    elif json_output:
+        _release_output({"session_id": session_id, "turn": turn, "events": events, "session": snapshot})
+    else:
+        answer = next((str(item.get("content", "")) for item in reversed(snapshot.get("messages", [])) if item.get("role") == "assistant"), "No assistant response was recorded.")
+        typer.echo(answer)
 
 
 @app.command()

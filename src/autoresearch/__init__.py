@@ -1,3 +1,5 @@
 """Provider-first AutoResearch pipelines."""
 
-__version__ = "0.1.0"
+from .versioning import PRODUCT_VERSION
+
+__version__ = PRODUCT_VERSION
