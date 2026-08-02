@@ -19,6 +19,7 @@ async def with_retry(
     base_delay: float = 0.25,
     max_delay: float = 8.0,
     jitter: Callable[[], float] = random.random,
+    on_retry: Callable[[int, ProviderError], None] | None = None,
 ) -> T:
     last: ProviderError | None = None
     for attempt in range(max(1, attempts)):
@@ -28,6 +29,8 @@ async def with_retry(
             last = exc
             if not exc.retryable or attempt == attempts - 1:
                 raise
+            if on_retry:
+                on_retry(attempt, exc)
             delay = exc.retry_after if exc.retry_after is not None else min(max_delay, base_delay * (2**attempt))
             await asyncio.sleep(max(0.0, delay) + min(0.25, jitter() * base_delay))
     assert last is not None

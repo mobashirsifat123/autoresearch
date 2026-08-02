@@ -49,7 +49,7 @@ from autoresearch.domain.models import (
 )
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 
 class ResearchRepository:
@@ -98,6 +98,9 @@ class ResearchRepository:
             if current < 6:
                 connection.executescript(_SCHEMA_V6)
                 connection.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(?,?)", (6, utc_now()))
+            if current < 7:
+                connection.executescript(_SCHEMA_V7)
+                connection.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(?,?)", (7, utc_now()))
             latest = int(connection.execute("SELECT COALESCE(MAX(version), 0) FROM schema_migrations").fetchone()[0])
             if latest != SCHEMA_VERSION:
                 raise RuntimeError(f"Unsupported database schema v{latest}; expected v{SCHEMA_VERSION}.")
@@ -364,7 +367,7 @@ class ResearchRepository:
         return [ArtifactReference(row["id"], row["project_id"], row["run_id"], row["artifact_type"], row["path"], tuple(_loads(row["source_evidence_json"], [])), row["provider"], row["model"], row["prompt_version"], row["checksum"], row["created_at"]) for row in rows]
 
     def record_provider_usage(self, usage: ProviderUsage) -> None:
-        self.execute("INSERT INTO provider_usage(id,project_id,run_id,operation,role,provider,model,prompt_tokens,completion_tokens,estimated_cost,currency,request_id,latency_ms,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (usage.id, usage.project_id, usage.run_id, usage.operation, usage.role, usage.provider, usage.model, usage.prompt_tokens, usage.completion_tokens, usage.estimated_cost, usage.currency, usage.request_id, usage.latency_ms, usage.created_at))
+        self.execute("INSERT INTO provider_usage(id,project_id,run_id,operation,role,provider,model,prompt_tokens,completion_tokens,estimated_cost,currency,request_id,latency_ms,session_id,prompt_version,retry_count,structured_output_status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (usage.id, usage.project_id, usage.run_id, usage.operation, usage.role, usage.provider, usage.model, usage.prompt_tokens, usage.completion_tokens, usage.estimated_cost, usage.currency, usage.request_id, usage.latency_ms, usage.session_id, usage.prompt_version, usage.retry_count, usage.structured_output_status, usage.created_at))
 
     def provider_spend(self, project_id: str) -> float:
         row = self.row("SELECT COALESCE(SUM(estimated_cost),0) AS total FROM provider_usage WHERE project_id=?", (project_id,))
@@ -1114,4 +1117,135 @@ CREATE TABLE IF NOT EXISTS worker_jobs(
 );
 CREATE INDEX IF NOT EXISTS worker_jobs_run_idx ON worker_jobs(run_id,created_at);
 CREATE INDEX IF NOT EXISTS worker_jobs_stale_idx ON worker_jobs(state,lease_expires_at,heartbeat_at);
+"""
+
+_SCHEMA_V7 = """
+ALTER TABLE provider_usage ADD COLUMN session_id TEXT;
+ALTER TABLE provider_usage ADD COLUMN prompt_version TEXT NOT NULL DEFAULT '';
+ALTER TABLE provider_usage ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE provider_usage ADD COLUMN structured_output_status TEXT;
+CREATE INDEX IF NOT EXISTS provider_usage_session_idx ON provider_usage(session_id,created_at);
+
+CREATE TABLE IF NOT EXISTS agent_sessions(
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  active_repository TEXT NOT NULL,
+  working_directory TEXT NOT NULL,
+  selected_mode TEXT NOT NULL DEFAULT 'default',
+  auto_routing INTEGER NOT NULL DEFAULT 0,
+  provider_role TEXT NOT NULL DEFAULT 'chat',
+  token_budget INTEGER NOT NULL DEFAULT 32000,
+  cost_budget REAL,
+  active_run_id TEXT REFERENCES pipeline_runs(id),
+  cancellation_requested INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS agent_sessions_project_idx ON agent_sessions(project_id,updated_at);
+CREATE INDEX IF NOT EXISTS agent_sessions_repository_idx ON agent_sessions(active_repository,updated_at);
+
+CREATE TABLE IF NOT EXISTS agent_messages(
+  id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL REFERENCES agent_sessions(id),
+  turn_id TEXT,
+  role TEXT NOT NULL,
+  content TEXT NOT NULL,
+  metadata_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS agent_messages_session_idx ON agent_messages(session_id,created_at,id);
+
+CREATE TABLE IF NOT EXISTS agent_turns(
+  id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL REFERENCES agent_sessions(id),
+  input_message_id TEXT NOT NULL REFERENCES agent_messages(id),
+  status TEXT NOT NULL,
+  override_mode TEXT,
+  routing_json TEXT,
+  max_tool_iterations INTEGER NOT NULL,
+  max_model_calls INTEGER NOT NULL,
+  time_budget_seconds REAL NOT NULL,
+  token_budget INTEGER NOT NULL,
+  cost_budget REAL,
+  model_calls INTEGER NOT NULL DEFAULT 0,
+  tool_iterations INTEGER NOT NULL DEFAULT 0,
+  input_tokens INTEGER NOT NULL DEFAULT 0,
+  output_tokens INTEGER NOT NULL DEFAULT 0,
+  estimated_cost REAL NOT NULL DEFAULT 0,
+  error TEXT,
+  created_at TEXT NOT NULL,
+  completed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS agent_turns_session_idx ON agent_turns(session_id,created_at);
+CREATE INDEX IF NOT EXISTS agent_turns_status_idx ON agent_turns(status,created_at);
+
+CREATE TABLE IF NOT EXISTS agent_tool_calls(
+  id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL REFERENCES agent_sessions(id),
+  turn_id TEXT NOT NULL REFERENCES agent_turns(id),
+  tool_id TEXT NOT NULL,
+  arguments_json TEXT NOT NULL,
+  status TEXT NOT NULL,
+  permission_id TEXT,
+  observation_json TEXT,
+  error TEXT,
+  created_at TEXT NOT NULL,
+  completed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS agent_tool_calls_turn_idx ON agent_tool_calls(turn_id,created_at);
+
+CREATE TABLE IF NOT EXISTS agent_permissions(
+  id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL REFERENCES agent_sessions(id),
+  turn_id TEXT REFERENCES agent_turns(id),
+  tool_id TEXT NOT NULL,
+  scope TEXT NOT NULL,
+  repository TEXT NOT NULL,
+  action TEXT NOT NULL,
+  decision TEXT NOT NULL,
+  request_json TEXT NOT NULL,
+  expires_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS agent_permissions_lookup_idx ON agent_permissions(session_id,tool_id,scope,decision,expires_at);
+
+CREATE TABLE IF NOT EXISTS agent_artifact_refs(
+  session_id TEXT NOT NULL REFERENCES agent_sessions(id),
+  artifact_id TEXT NOT NULL REFERENCES artifacts(id),
+  turn_id TEXT REFERENCES agent_turns(id),
+  created_at TEXT NOT NULL,
+  PRIMARY KEY(session_id,artifact_id)
+);
+
+CREATE TABLE IF NOT EXISTS agent_events(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id TEXT NOT NULL REFERENCES agent_sessions(id),
+  event_type TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS agent_events_session_idx ON agent_events(session_id,id);
+
+CREATE TABLE IF NOT EXISTS agent_capability_suggestions(
+  id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL REFERENCES agent_sessions(id),
+  turn_id TEXT NOT NULL REFERENCES agent_turns(id),
+  capability_id TEXT NOT NULL,
+  message TEXT NOT NULL,
+  routing_json TEXT NOT NULL,
+  status TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  decided_at TEXT
+);
+CREATE INDEX IF NOT EXISTS agent_suggestions_session_idx ON agent_capability_suggestions(session_id,status,created_at);
+
+CREATE TABLE IF NOT EXISTS agent_idempotency(
+  key TEXT PRIMARY KEY,
+  operation TEXT NOT NULL,
+  session_id TEXT REFERENCES agent_sessions(id),
+  turn_id TEXT,
+  response_json TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
 """

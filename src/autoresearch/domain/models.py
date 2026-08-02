@@ -288,6 +288,10 @@ class ProviderUsage:
     currency: str | None
     request_id: str | None
     latency_ms: float | None
+    session_id: str | None = None
+    prompt_version: str = ""
+    retry_count: int = 0
+    structured_output_status: str | None = None
     created_at: str = field(default_factory=utc_now)
 
 

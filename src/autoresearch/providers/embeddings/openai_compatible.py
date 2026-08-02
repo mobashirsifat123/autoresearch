@@ -43,6 +43,7 @@ class ExternalEmbeddingProvider:
         vectors: list[tuple[float, ...]] = []
         token_total = 0
         request_id: str | None = None
+        retry_total = 0
         for start in range(0, len(texts), self.config.embedding_batch_size):
             batch = list(texts[start:start + self.config.embedding_batch_size])
             async def operation() -> tuple[dict[str, Any], httpx.Headers]:
@@ -57,7 +58,10 @@ class ExternalEmbeddingProvider:
                 if response.is_error:
                     raise ProviderError(f"Embedding provider returned HTTP {response.status_code}.", kind_for_status(response.status_code), self.name, response.status_code)
                 return response.json(), response.headers
-            payload, headers = await with_retry(operation, attempts=self.config.max_retries + 1)
+            def record_retry(_attempt: int, _error: ProviderError) -> None:
+                nonlocal retry_total
+                retry_total += 1
+            payload, headers = await with_retry(operation, attempts=self.config.max_retries + 1, on_retry=record_retry)
             rows = sorted(payload.get("data") or [], key=lambda item: int(item.get("index", 0)))
             if len(rows) != len(batch):
                 raise ProviderError("Embedding response count does not match input count.", ErrorKind.SCHEMA, self.name)
@@ -70,7 +74,7 @@ class ExternalEmbeddingProvider:
             request_id = headers.get("x-request-id") or request_id
         cost, currency = estimate_cost(token_total, 0, self.config.pricing)
         self.model_name = model
-        return EmbeddingResult(tuple(vectors), model, token_total, request_id, cost, currency)
+        return EmbeddingResult(tuple(vectors), model, token_total, request_id, cost, currency, retry_total)
 
     async def health_check(self) -> HealthResult:
         try:

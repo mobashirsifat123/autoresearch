@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextvars import ContextVar
 import os
 import time
 from typing import Any
@@ -42,6 +43,7 @@ class HTTPProviderBase:
         self._limiter = AsyncRateLimiter(config.requests_per_second)
         timeout = httpx.Timeout(config.total_timeout, connect=config.connect_timeout, read=config.read_timeout)
         self.client = httpx.AsyncClient(base_url=config.base_url.rstrip("/"), timeout=timeout, transport=transport)
+        self._retry_count: ContextVar[int] = ContextVar(f"autoresearch_retry_count_{config.name}", default=0)
 
     def api_key(self) -> str:
         value = os.getenv(self.config.api_key_env, "")
@@ -75,13 +77,19 @@ class HTTPProviderBase:
                 raise ProviderError("Provider returned an unexpected JSON value.", ErrorKind.SCHEMA, self.name)
             return payload, response.headers
 
-        return await with_retry(operation, attempts=self.config.max_retries + 1)
+        retry_count = 0
+        def record_retry(_attempt: int, _error: ProviderError) -> None:
+            nonlocal retry_count
+            retry_count += 1
+        result = await with_retry(operation, attempts=self.config.max_retries + 1, on_retry=record_retry)
+        self._retry_count.set(retry_count)
+        return result
 
     def completion_result(self, *, text: str, model: str, usage: dict[str, Any], request_id: str | None, raw: dict[str, Any]) -> CompletionResult:
         prompt = _int_or_none(usage.get("prompt_tokens") or usage.get("input_tokens"))
         completion = _int_or_none(usage.get("completion_tokens") or usage.get("output_tokens"))
         cost, currency = estimate_cost(prompt, completion, self.config.pricing)
-        return CompletionResult(text, model, prompt, completion, request_id, cost, currency, raw)
+        return CompletionResult(text, model, prompt, completion, request_id, cost, currency, {**raw, "retry_count": self._retry_count.get()})
 
     async def health_check(self) -> HealthResult:
         started = time.perf_counter()

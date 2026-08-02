@@ -38,7 +38,7 @@ class ModelRouter:
             raise ProviderError(f"No provider is assigned to role '{resolved.value}'.", ErrorKind.UNSUPPORTED)
         return self.assignments[resolved]
 
-    async def complete(self, role: ModelRole | str, *, messages: list[dict[str, Any]], temperature: float = 0.2, max_tokens: int | None = None, project_id: str | None = None, run_id: str | None = None, operation: str = "completion", response_format: dict[str, Any] | None = None, tools: list[dict[str, Any]] | None = None) -> CompletionResult:
+    async def complete(self, role: ModelRole | str, *, messages: list[dict[str, Any]], temperature: float = 0.2, max_tokens: int | None = None, project_id: str | None = None, run_id: str | None = None, session_id: str | None = None, prompt_version: str = "", operation: str = "completion", response_format: dict[str, Any] | None = None, tools: list[dict[str, Any]] | None = None, structured_output_status: str | None = None) -> CompletionResult:
         assignment = self.assignment(role)
         if project_id and self.budget_guard:
             self.budget_guard.require_allowed(project_id)
@@ -54,13 +54,13 @@ class ModelRouter:
                 if not exc.fallback_allowed or index == len(targets) - 1:
                     raise
                 continue
-            self._record_usage(project_id, run_id, operation, ModelRole(role), provider_name, model, result.prompt_tokens, result.completion_tokens, result.estimated_cost, result.currency, result.request_id, (time.perf_counter() - started) * 1000)
+            self._record_usage(project_id, run_id, session_id, prompt_version, operation, ModelRole(role), provider_name, model, result.prompt_tokens, result.completion_tokens, result.estimated_cost, result.currency, result.request_id, (time.perf_counter() - started) * 1000, index + int(result.raw.get("retry_count") or 0), structured_output_status if response_format else None)
             return result
         assert previous is not None
         raise previous
 
     async def structured_output(self, role: ModelRole | str, *, messages: list[dict[str, Any]], schema: dict[str, Any], max_tokens: int | None = None, project_id: str | None = None, run_id: str | None = None, operation: str = "structured_output") -> dict[str, Any]:
-        result = await self.complete(role, messages=messages, max_tokens=max_tokens, project_id=project_id, run_id=run_id, operation=operation, response_format={"type": "json_schema", "json_schema": schema})
+        result = await self.complete(role, messages=messages, max_tokens=max_tokens, project_id=project_id, run_id=run_id, operation=operation, prompt_version="structured-output-v1", response_format={"type": "json_schema", "json_schema": schema}, structured_output_status="requested")
         try:
             value = json.loads(result.text)
         except json.JSONDecodeError as exc:
@@ -69,12 +69,12 @@ class ModelRouter:
             raise ProviderError("Structured provider output must be a JSON object.", ErrorKind.SCHEMA, request_id=result.request_id)
         return value
 
-    async def tool_call(self, role: ModelRole | str, *, messages: list[dict[str, Any]], tools: list[dict[str, Any]], project_id: str | None = None, run_id: str | None = None, operation: str = "tool_call") -> ToolCallResult:
-        result = await self.complete(role, messages=messages, tools=tools, project_id=project_id, run_id=run_id, operation=operation)
+    async def tool_call(self, role: ModelRole | str, *, messages: list[dict[str, Any]], tools: list[dict[str, Any]], project_id: str | None = None, run_id: str | None = None, session_id: str | None = None, operation: str = "tool_call") -> ToolCallResult:
+        result = await self.complete(role, messages=messages, project_id=project_id, run_id=run_id, session_id=session_id, prompt_version="agent-tools-v1", tools=tools, operation=operation)
         raw_calls = result.raw.get("tool_calls") or []
         return ToolCallResult(tuple(raw_calls), result)
 
-    async def embed(self, texts: Sequence[str], *, project_id: str | None = None, run_id: str | None = None, operation: str = "embeddings") -> EmbeddingResult:
+    async def embed(self, texts: Sequence[str], *, project_id: str | None = None, run_id: str | None = None, session_id: str | None = None, operation: str = "embeddings") -> EmbeddingResult:
         assignment = self.assignment(ModelRole.EMBEDDINGS)
         if project_id and self.budget_guard:
             self.budget_guard.require_allowed(project_id)
@@ -90,7 +90,7 @@ class ModelRouter:
                 if not exc.fallback_allowed or index == len(targets) - 1:
                     raise
                 continue
-            self._record_usage(project_id, run_id, operation, ModelRole.EMBEDDINGS, provider_name, model, result.input_tokens, None, result.estimated_cost, result.currency, result.request_id, (time.perf_counter() - started) * 1000)
+            self._record_usage(project_id, run_id, session_id, "embeddings-v1", operation, ModelRole.EMBEDDINGS, provider_name, model, result.input_tokens, None, result.estimated_cost, result.currency, result.request_id, (time.perf_counter() - started) * 1000, index + int(getattr(result, "retry_count", 0)), None)
             return result
         assert previous is not None
         raise previous
@@ -108,10 +108,10 @@ class ModelRouter:
         assignment = self.assignment(role)
         return assignment.provider, assignment.model
 
-    def _record_usage(self, project_id: str | None, run_id: str | None, operation: str, role: ModelRole, provider: str, model: str, prompt_tokens: int | None, completion_tokens: int | None, estimated_cost: float | None, currency: str | None, request_id: str | None, latency_ms: float) -> None:
+    def _record_usage(self, project_id: str | None, run_id: str | None, session_id: str | None, prompt_version: str, operation: str, role: ModelRole, provider: str, model: str, prompt_tokens: int | None, completion_tokens: int | None, estimated_cost: float | None, currency: str | None, request_id: str | None, latency_ms: float, retry_count: int, structured_output_status: str | None) -> None:
         if not self.usage_sink:
             return
-        self.usage_sink(ProviderUsage(uuid4().hex, project_id, run_id, operation, role.value, provider, model, prompt_tokens, completion_tokens, estimated_cost, currency, request_id, round(latency_ms, 3)))
+        self.usage_sink(ProviderUsage(uuid4().hex, project_id, run_id, operation, role.value, provider, model, prompt_tokens, completion_tokens, estimated_cost, currency, request_id, round(latency_ms, 3), session_id, prompt_version, retry_count, structured_output_status))
 
     async def close(self) -> None:
         await self.registry.close()

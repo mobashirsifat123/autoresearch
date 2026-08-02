@@ -39,9 +39,12 @@ async def test_router_records_structured_and_embedding_usage(tmp_path):
     vectors = await router.embed(["alpha", "beta"], project_id=project.id)
     assert result == {"value": "ok"}
     assert len(vectors.vectors) == 2
-    rows = repository.rows("SELECT role,provider,estimated_cost FROM provider_usage ORDER BY created_at")
+    rows = repository.rows("SELECT role,provider,estimated_cost,structured_output_status,prompt_version FROM provider_usage ORDER BY created_at")
     assert {row["role"] for row in rows} == {"literature_extraction", "embeddings"}
     assert all(row["provider"] in {"fake", "vectors"} for row in rows)
+    structured = next(row for row in rows if row["role"] == "literature_extraction")
+    assert structured["structured_output_status"] == "requested"
+    assert structured["prompt_version"] == "structured-output-v1"
 
 
 def test_registry_rejects_missing_capabilities():
@@ -63,6 +66,25 @@ def test_research_reasoning_assignment_requires_structured_output():
             registry,
             {ModelRole.RESEARCH_REASONING: ModelAssignment(ModelRole.RESEARCH_REASONING, "reasoner", "model")},
         )
+
+
+def test_agent_history_redacts_secrets(tmp_path):
+    repository = ResearchRepository(tmp_path / "research.sqlite3", tmp_path / "artifacts")
+    project = repository.create_project("Redaction test")
+    from autoresearch.agent.store import AgentStore
+
+    store = AgentStore(repository)
+    session = store.create_session(project.id, str(tmp_path), str(tmp_path))
+    turn = store.create_turn(session.id, "token=super-secret-value", override_mode=None, max_tool_iterations=1, max_model_calls=1, time_budget_seconds=10, token_budget=100, cost_budget=None)
+    store.append_message(session.id, "assistant", "authorization: Bearer super-secret-value", turn_id=turn.id)
+    store.append_event(session.id, "agent.test", {"url": "https://user:pass@example.test/x", "token": "super-secret-value"})
+    store.create_tool_call(session.id, turn.id, "read_file", {"path": "notes.txt", "api_key": "super-secret-value"})
+
+    raw = repository.rows("SELECT content,metadata_json FROM agent_messages")
+    raw_events = repository.rows("SELECT payload_json FROM agent_events")
+    raw_calls = repository.rows("SELECT arguments_json FROM agent_tool_calls")
+    assert all("super-secret-value" not in str(row) for row in (*raw, *raw_events, *raw_calls))
+    assert "[REDACTED]" in raw[0]["content"]
 
 
 @pytest.mark.asyncio

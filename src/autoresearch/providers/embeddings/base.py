@@ -18,6 +18,7 @@ class EmbeddingResult:
     request_id: str | None = None
     estimated_cost: float | None = None
     currency: str | None = None
+    retry_count: int = 0
 
 
 class EmbeddingProvider(Protocol):

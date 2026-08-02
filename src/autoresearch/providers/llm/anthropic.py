@@ -36,7 +36,7 @@ class AnthropicProvider(HTTPProviderBase):
             }]
             body["tool_choice"] = {"type": "tool", "name": structured_tool_name, "disable_parallel_tool_use": True}
         elif tools:
-            body["tools"] = tools
+            body["tools"] = [_anthropic_tool(tool) for tool in tools]
         payload, headers = await self.request_json("POST", "/v1/messages", headers=self.headers(), json_body=body)
         blocks = payload.get("content") or []
         if structured_tool_name:
@@ -56,3 +56,8 @@ class AnthropicProvider(HTTPProviderBase):
             result = await self.complete(model=model, messages=messages, temperature=temperature, max_tokens=max_tokens)
             yield result.text
         return iterator()
+
+
+def _anthropic_tool(tool: dict[str, Any]) -> dict[str, Any]:
+    function = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+    return {"name": function.get("name"), "description": function.get("description") or "", "input_schema": function.get("parameters") or {"type": "object"}}

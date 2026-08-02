@@ -18,6 +18,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from autoresearch.application.factory import ApplicationContainer
 from autoresearch.application.services import DiscoveryOutcome, ReviewOutcome
+from autoresearch.agent.models import SessionMode, TurnStatus
 from autoresearch.domain.models import PipelineKind, RunStatus, dataclass_payload
 from autoresearch.providers.errors import ProviderError
 from autoresearch.providers.redaction import redact_text
@@ -75,10 +76,42 @@ class ApprovalRequest(BaseModel):
     expires_at: str | None = None
 
 
+class AgentSessionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    project_id: str | None = None
+    project_title: str = Field(default="AutoResearch workspace", min_length=1, max_length=200)
+    active_repository: str | None = None
+    working_directory: str | None = None
+    token_budget: int = Field(default=32_000, ge=256, le=200_000)
+    cost_budget: float | None = Field(default=None, ge=0)
+
+
+class AgentTurnRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    message: str = Field(min_length=1, max_length=100_000)
+    capability_override: str | None = None
+    token_budget: int | None = Field(default=None, ge=256, le=200_000)
+    cost_budget: float | None = Field(default=None, ge=0)
+    time_budget_seconds: float = Field(default=120.0, gt=0, le=600)
+
+
+class AgentModeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    mode: str | None = None
+    auto_routing: bool | None = None
+
+
+class AgentDecisionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    approved: bool
+    expires_at: str | None = None
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     resolved = settings or load_settings()
     tasks: dict[str, asyncio.Task[Any]] = {}
     monitors: dict[str, asyncio.Task[Any]] = {}
+    agent_tasks: dict[str, asyncio.Task[Any]] = {}
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -89,10 +122,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             app.state.container = None
             app.state.startup_error = redact_text(f"{type(exc).__name__}: {exc}")
         yield
-        for task in [*tasks.values(), *monitors.values()]:
+        for task in [*tasks.values(), *monitors.values(), *agent_tasks.values()]:
             task.cancel()
-        if tasks or monitors:
-            await asyncio.gather(*[*tasks.values(), *monitors.values()], return_exceptions=True)
+        if tasks or monitors or agent_tasks:
+            await asyncio.gather(*[*tasks.values(), *monitors.values(), *agent_tasks.values()], return_exceptions=True)
         if app.state.container:
             await app.state.container.close()
 
@@ -244,7 +277,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/v1/capabilities", dependencies=[Depends(require_auth)])
     async def capabilities():
         c = container()
-        return {"pipelines": [
+        pipelines = [
             {"key": PipelineKind.DISCOVERY.value, "name": "Study Search", "enabled": True, "reason": None},
             {"key": PipelineKind.REVIEW.value, "name": "Deep Literature Review", "enabled": True, "reason": None},
             {"key": PipelineKind.NOVELTY.value, "name": "Novelty Generation", "enabled": True, "reason": None},
@@ -254,7 +287,161 @@ def create_app(settings: Settings | None = None) -> FastAPI:
              "network_enforcement": "policy-only", "max_concurrency": 1,
              "reason": "Local execution is workspace-contained and approval-gated; it is not an OS sandbox."}},
             {"key": PipelineKind.REINVENTION.value, "name": "Result-Conditioned Reinvention", "enabled": False, "reason": "Reinvention pipeline is not implemented in the Python backend."},
-        ]}
+        ]
+        return {"pipelines": pipelines, "capabilities": c.agent.capabilities.payload(), "tools": [{"id": item.id, "description": item.description, "permission": item.permission, "mutating": item.mutating, "schema": item.schema} for item in c.agent.tools.definitions()]}
+
+    @app.get("/v1/agent/sessions", dependencies=[Depends(require_auth)])
+    async def agent_sessions(project_id: str | None = None, active_repository: str | None = None):
+        c = container()
+        return {"sessions": [dataclass_payload(item) for item in c.agent.store.list_sessions(project_id=project_id, repository=active_repository)]}
+
+    @app.post("/v1/agent/sessions", status_code=201, dependencies=[Depends(require_auth)])
+    async def create_agent_session(payload: AgentSessionRequest, idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
+        c = container()
+        key = mutation_key(idempotency_key)
+        prior = c.repository.row("SELECT response_json FROM agent_idempotency WHERE key=?", (key,)) if idempotency_key else None
+        if prior:
+            return json.loads(prior["response_json"])
+        project_id = payload.project_id
+        if project_id:
+            project_or_404(c.repository, project_id)
+        else:
+            repository_path = Path(payload.active_repository or Path.cwd()).expanduser().resolve()
+            project_id = c.repository.create_project(payload.project_title or repository_path.name).id
+        session = c.agent.create_session(project_id, active_repository=payload.active_repository, working_directory=payload.working_directory, token_budget=payload.token_budget, cost_budget=payload.cost_budget)
+        response = c.agent.session_payload(session.id)
+        if idempotency_key:
+            c.agent.store.save_idempotency(key, "agent_session", session.id, None, response)
+        c.agent.store.append_event(session.id, "session.created", {"session_id": session.id, "project_id": project_id, "mode": session.selected_mode.value, "auto_routing": session.auto_routing})
+        return response
+
+    @app.get("/v1/agent/sessions/{session_id}", dependencies=[Depends(require_auth)])
+    async def get_agent_session(session_id: str):
+        c = container()
+        c.agent.store.require_session(session_id)
+        return c.agent.session_payload(session_id)
+
+    @app.post("/v1/agent/sessions/{session_id}/turns", status_code=202, dependencies=[Depends(require_auth)])
+    async def agent_turn(session_id: str, payload: AgentTurnRequest, idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
+        c = container()
+        c.agent.store.require_session(session_id)
+        key = mutation_key(idempotency_key)
+        prior = c.agent.store.idempotency(key) if idempotency_key else None
+        if prior:
+            return prior["response"]
+        turn = c.agent.start_turn(session_id, payload.message, capability_override=payload.capability_override, token_budget=payload.token_budget, cost_budget=payload.cost_budget, time_budget_seconds=payload.time_budget_seconds)
+        response = {"session_id": session_id, "turn_id": turn.id, "status": turn.status.value}
+        if idempotency_key:
+            c.agent.store.save_idempotency(key, "agent_turn", session_id, turn.id, response)
+        task = asyncio.create_task(c.agent.execute_turn(turn.id))
+        agent_tasks[turn.id] = task
+        task.add_done_callback(lambda _task: agent_tasks.pop(turn.id, None))
+        return response
+
+    @app.get("/v1/agent/sessions/{session_id}/events", dependencies=[Depends(require_auth)])
+    async def agent_events(session_id: str, last_event_id: int = Query(default=0, ge=0), last_event_header: str | None = Header(default=None, alias="Last-Event-ID")):
+        c = container()
+        c.agent.store.require_session(session_id)
+        try:
+            header_cursor = int(last_event_header or 0)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail={"code": "invalid_event_cursor", "message": "Last-Event-ID must be a non-negative integer."}) from exc
+        if header_cursor < 0:
+            raise HTTPException(status_code=400, detail={"code": "invalid_event_cursor", "message": "Last-Event-ID must be a non-negative integer."})
+        after = max(last_event_id, header_cursor)
+
+        async def stream_agent() -> AsyncIterator[str]:
+            cursor = after
+            idle = 0
+            while idle < 30:
+                events = c.agent.store.events(session_id, after_id=cursor)
+                if events:
+                    idle = 0
+                    for event in events:
+                        cursor = int(event["id"])
+                        yield f"id: {cursor}\nevent: {event['event_type']}\ndata: {json.dumps(event['payload'], ensure_ascii=False, default=str)}\n\n"
+                        if event["event_type"] in {"agent.turn_completed", "agent.turn_failed", "agent.turn_canceled"}:
+                            return
+                else:
+                    idle += 1
+                await asyncio.sleep(0.4)
+
+        return StreamingResponse(stream_agent(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+    @app.post("/v1/agent/sessions/{session_id}/mode", dependencies=[Depends(require_auth)])
+    async def agent_mode(session_id: str, payload: AgentModeRequest, idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
+        c = container()
+        c.agent.store.require_session(session_id)
+        key = mutation_key(idempotency_key)
+        prior = c.agent.store.idempotency(key) if idempotency_key else None
+        if prior:
+            return prior["response"]
+        mode = SessionMode(payload.mode or "default")
+        updated = c.agent.store.update_session(session_id, selected_mode=mode, auto_routing=payload.auto_routing)
+        c.agent.store.append_event(session_id, "capability.selected", {"session_id": session_id, "mode": updated.selected_mode.value, "auto_routing": updated.auto_routing})
+        response = {"session": dataclass_payload(updated)}
+        if idempotency_key:
+            c.agent.store.save_idempotency(key, "agent_mode", session_id, None, response)
+        return response
+
+    @app.post("/v1/agent/sessions/{session_id}/cancel", dependencies=[Depends(require_auth)])
+    async def cancel_agent_session(session_id: str, idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
+        c = container()
+        c.agent.store.require_session(session_id)
+        key = mutation_key(idempotency_key)
+        prior = c.agent.store.idempotency(key) if idempotency_key else None
+        if prior:
+            return prior["response"]
+        c.agent.cancel(session_id)
+        for turn_id, task in list(agent_tasks.items()):
+            turn = c.agent.store.turn(turn_id)
+            if turn and turn.session_id == session_id and not task.done():
+                task.cancel()
+        c.agent.store.append_event(session_id, "agent.turn_canceled", {"session_id": session_id})
+        response = {"session_id": session_id, "status": "cancel_requested"}
+        if idempotency_key:
+            c.agent.store.save_idempotency(key, "agent_cancel", session_id, None, response)
+        return response
+
+    @app.post("/v1/agent/suggestions/{suggestion_id}", dependencies=[Depends(require_auth)])
+    async def agent_suggestion(suggestion_id: str, payload: AgentDecisionRequest, idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
+        c = container()
+        suggestion = c.agent.store.suggestion(suggestion_id)
+        if not suggestion:
+            raise HTTPException(status_code=404, detail={"code": "suggestion_not_found", "message": "Capability suggestion was not found."})
+        key = mutation_key(idempotency_key)
+        prior = c.agent.store.idempotency(key) if idempotency_key else None
+        if prior:
+            return prior["response"]
+        turn = await c.agent.approve_suggestion(suggestion_id, approved=payload.approved)
+        if turn:
+            task = asyncio.create_task(c.agent.execute_turn(turn.id))
+            agent_tasks[turn.id] = task
+            task.add_done_callback(lambda _task: agent_tasks.pop(turn.id, None))
+        response = {"suggestion": c.agent.store.suggestion(suggestion_id), "turn_id": turn.id if turn else None}
+        if idempotency_key:
+            c.agent.store.save_idempotency(key, "agent_suggestion", str(suggestion["session_id"]), turn.id if turn else None, response)
+        return response
+
+    @app.post("/v1/agent/permissions/{permission_id}", dependencies=[Depends(require_auth)])
+    async def agent_permission(permission_id: str, payload: AgentDecisionRequest, idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
+        c = container()
+        permission = c.agent.store.permission(permission_id)
+        if not permission:
+            raise HTTPException(status_code=404, detail={"code": "permission_not_found", "message": "Permission request was not found."})
+        key = mutation_key(idempotency_key)
+        prior = c.agent.store.idempotency(key) if idempotency_key else None
+        if prior:
+            return prior["response"]
+        turn = await c.agent.decide_permission(permission_id, approved=payload.approved, expires_at=payload.expires_at)
+        if turn and turn.status is TurnStatus.RUNNING:
+            task = asyncio.create_task(c.agent.continue_after_permission(turn.id))
+            agent_tasks[turn.id] = task
+            task.add_done_callback(lambda _task: agent_tasks.pop(turn.id, None))
+        response = {"permission": c.agent.store.permission(permission_id), "turn_id": turn.id if turn else None}
+        if idempotency_key:
+            c.agent.store.save_idempotency(key, "agent_permission", str(permission["session_id"]), turn.id if turn else None, response)
+        return response
 
     @app.get("/v1/providers/status", dependencies=[Depends(require_auth)])
     async def provider_status():
@@ -422,6 +609,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         task.add_done_callback(lambda _task: tasks.pop(run.id, None))
         return response
 
+    @app.post("/v1/projects/{project_id}/reinvent", status_code=409, dependencies=[Depends(require_auth)])
+    async def reinvent(project_id: str):
+        c = container()
+        project_or_404(c.repository, project_id)
+        raise HTTPException(status_code=409, detail={"code": "capability_unavailable", "message": "reinvent: Result-Conditioned Reinvention is not implemented in the Python backend."})
+
     @app.post("/v1/projects/{project_id}/{pipeline}", status_code=409, dependencies=[Depends(require_auth)])
     async def unavailable_pipeline(project_id: str, pipeline: str):
         if pipeline in {"reinvent"}:
@@ -447,20 +640,29 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def run_events(run_id: str, last_event_id: int = Query(default=0, ge=0), last_event_header: str | None = Header(default=None, alias="Last-Event-ID")):
         c = container()
         run_payload(c.repository, run_id)
-        after = max(last_event_id, int(last_event_header or 0))
+        try:
+            header_cursor = int(last_event_header or 0)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail={"code": "invalid_event_cursor", "message": "Last-Event-ID must be a non-negative integer."}) from exc
+        if header_cursor < 0:
+            raise HTTPException(status_code=400, detail={"code": "invalid_event_cursor", "message": "Last-Event-ID must be a non-negative integer."})
+        after = max(last_event_id, header_cursor)
+        page_size = 200
 
         async def stream() -> AsyncIterator[str]:
             cursor = after
             idle = 0
             while idle < 30:
-                events = c.repository.api_events(run_id, after_id=cursor)
+                events = c.repository.api_events(run_id, after_id=cursor, limit=page_size)
                 if events:
                     idle = 0
                     for event in events:
                         cursor = int(event["id"])
                         yield f"id: {cursor}\nevent: {event['event_type']}\ndata: {json.dumps(event['payload'], ensure_ascii=False, default=str)}\n\n"
+                    if len(events) == page_size:
+                        continue
                     terminal = c.repository.get_run(run_id)
-                    if terminal and terminal.status in {RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED}:
+                    if terminal and terminal.status in {RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED} and len(events) < page_size:
                         return
                 else:
                     idle += 1

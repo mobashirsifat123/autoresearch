@@ -15,6 +15,7 @@ class Settings:
     download_root: Path
     provider_config: Path
     search_sources: tuple[str, ...]
+    agent_roots: tuple[Path, ...] = ()
 
 
 def load_settings() -> Settings:
@@ -28,4 +29,5 @@ def load_settings() -> Settings:
         download_root=Path(os.getenv("AUTORESEARCH_DOWNLOAD_ROOT", str(data_root / "downloads"))).expanduser().resolve(),
         provider_config=config,
         search_sources=sources,
+        agent_roots=tuple(Path(item).expanduser().resolve() for item in os.getenv("AUTORESEARCH_AGENT_ROOTS", str(Path.cwd())).split(os.pathsep) if item.strip()),
     )

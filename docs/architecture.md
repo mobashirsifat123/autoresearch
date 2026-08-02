@@ -15,7 +15,10 @@ seed PDF/DOI/URL
 ```
 
 The design accepts limits up to 100 and review `top_k` up to 15, but the release
-default is 20/5. Reinvention, remote workers, HTTP API, and frontend are explicitly outside this milestone. Their directories contain contracts only; no fake production routes or placeholder results are present.
+default is 20/5. Result-conditioned Reinvention and remote GPU workers remain
+disabled. The optional conversational agent and terminal client are thin
+controllers over the Python services; they do not move research decisions into
+TypeScript.
 
 The mandatory high-level structure is unchanged. Additional internal modules
 (`domain/models.py`, `application/config.py`, `application/factory.py`,
@@ -27,7 +30,9 @@ directories.
 
 ```mermaid
 flowchart TD
-  CLI["autoresearch CLI"] --> APP["Durable application services"]
+  CLI["AutoResearch TUI"] --> API["FastAPI /v1"]
+  API --> AGENT["Durable AgentRuntime"]
+  AGENT --> APP["Durable application services"]
   APP --> ROUTER["ModelRouter"]
   ROUTER --> LLM["External LLM provider"]
   ROUTER --> EMB["External embedding provider"]

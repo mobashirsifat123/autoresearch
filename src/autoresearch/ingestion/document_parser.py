@@ -57,4 +57,6 @@ class DocumentParser:
             doi_match = re.search(r"10\.\d{4,9}/[^?#\s]+", text, flags=re.I)
             normalized = normalize_doi(doi_match.group(0)) if doi_match else None
             return ParsedDocument("url", text, text, (), content_checksum(text), doi=normalized, url=text)
-        raise ValueError("Seed input must be an existing PDF path, DOI, or HTTPS URL.")
+        if text and len(text) <= 2_000:
+            return ParsedDocument("topic", text, text, (ParsedPage(1, text),), content_checksum(text))
+        raise ValueError("Seed input must be a research topic, existing PDF path, DOI, or HTTPS URL.")

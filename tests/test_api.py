@@ -56,7 +56,10 @@ def test_api_contract_capabilities_and_idempotent_mutation(tmp_path: Path):
         assert "event: run.created" in events
         assert "event: run.progress" in events
         assert "event: run.completed" in events
-        assert client.post(f"/v1/projects/{project_id}/reinvent", json={}).status_code == 409
+        reinvent = client.post(f"/v1/projects/{project_id}/reinvent", json={})
+        assert reinvent.status_code == 409
+        assert reinvent.json()["detail"]["code"] == "capability_unavailable"
+        assert "not implemented" in reinvent.json()["detail"]["message"]
 
 
 def test_api_resumes_discovery_with_service_compatible_input(tmp_path: Path):
@@ -96,6 +99,62 @@ def test_api_authentication_and_secret_free_provider_status(tmp_path: Path, monk
         body = response.json()
         assert all("api_key" not in str(item).lower() for item in body["providers"])
         assert all("secret-token" not in str(item) for item in body["providers"])
+
+
+def test_api_keeps_empty_provider_installation_usable(tmp_path: Path):
+    settings = Settings(
+        data_root=tmp_path,
+        database_path=tmp_path / "api.sqlite3",
+        artifact_root=tmp_path / "artifacts",
+        download_root=tmp_path / "downloads",
+        provider_config=tmp_path / "missing-provider-config.toml",
+        search_sources=("crossref",),
+        agent_roots=(tmp_path,),
+    )
+    with TestClient(create_app(settings)) as client:
+        assert client.get("/v1/health").json()["status"] == "ready"
+        assert client.get("/v1/providers/status").json() == {"providers": [], "roles": []}
+        project = client.post("/v1/projects", json={"title": "No provider yet"}).json()
+        session = client.post("/v1/agent/sessions", json={"project_id": project["id"], "active_repository": str(tmp_path), "working_directory": str(tmp_path)}).json()
+        assert session["session"]["id"]
+        turn = client.post(f"/v1/agent/sessions/{session['session']['id']}/turns", json={"message": "Explain this repository."})
+        assert turn.status_code == 202
+        import time
+        for _ in range(20):
+            status = client.get(f"/v1/agent/sessions/{session['session']['id']}").json()["turns"][-1]["status"]
+            if status in {"completed", "failed"}:
+                break
+            time.sleep(0.02)
+        payload = client.get(f"/v1/agent/sessions/{session['session']['id']}").json()
+        assert payload["turns"][-1]["status"] == "completed"
+        assert "No chat" in payload["messages"][-1]["content"]
+
+
+def test_run_sse_rejects_malformed_last_event_id(tmp_path: Path):
+    config = Path(__file__).parents[1] / "docs" / "live_config.example.toml"
+    settings = Settings(tmp_path, tmp_path / "api.sqlite3", tmp_path / "artifacts", tmp_path / "downloads", config, ("crossref",))
+    with TestClient(create_app(settings)) as client:
+        repository = client.app.state.container.repository
+        project = repository.create_project("SSE cursor")
+        run = repository.create_run(project.id, PipelineKind.REVIEW, {"top_k": 5})
+        response = client.get(f"/v1/runs/{run.id}/events", headers={"Last-Event-ID": "not-a-cursor"})
+        assert response.status_code == 400
+        assert response.json()["detail"]["code"] == "invalid_event_cursor"
+
+
+def test_run_sse_drains_large_completed_event_history(tmp_path: Path):
+    config = Path(__file__).parents[1] / "docs" / "live_config.example.toml"
+    settings = Settings(tmp_path, tmp_path / "api.sqlite3", tmp_path / "artifacts", tmp_path / "downloads", config, ("crossref",))
+    with TestClient(create_app(settings)) as client:
+        repository = client.app.state.container.repository
+        project = repository.create_project("Large event history")
+        run = repository.create_run(project.id, PipelineKind.REVIEW, {"top_k": 15})
+        for index in range(450):
+            repository.append_api_event(run.id, "run.progress", {"index": index})
+        repository.finish_run(run.id)
+        response = client.get(f"/v1/runs/{run.id}/events")
+        assert response.status_code == 200
+        assert response.text.count("event: run.progress") == 450
 
 
 def test_cancel_and_approval_mutations_are_idempotent(tmp_path: Path):

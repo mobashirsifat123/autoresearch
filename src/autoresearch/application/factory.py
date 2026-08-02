@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from autoresearch.papers.metadata_sources import ArxivSource, CrossrefSource, MetadataSource, OpenAlexSource, OpenReviewSource, SemanticScholarSource
 from autoresearch.papers.pdf_resolver import LegalPdfResolver
 from autoresearch.papers.search_pipeline import StudySearchPipeline
+from autoresearch.agent.runtime import AgentRuntime
 from autoresearch.providers.budget import ProviderBudgetGuard
 from autoresearch.providers.factory import build_router
 from autoresearch.storage.repository import ResearchRepository
@@ -27,6 +30,7 @@ class ApplicationContainer:
         self.novelty = NoveltyService(self.repository, self.router, self.search_pipeline)
         self.worker = LocalTypedWorker(self.repository, settings.data_root / "workspace")
         self.experiment = ExperimentService(self.repository, self.router, settings.data_root / "workspace", worker=self.worker)
+        self.agent = AgentRuntime(self, allowed_roots=settings.agent_roots or (Path.cwd(),))
 
     async def close(self) -> None:
         await self.search_pipeline.close()

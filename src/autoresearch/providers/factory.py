@@ -93,5 +93,10 @@ def build_assignments(document: dict[str, Any]) -> dict[ModelRole, ModelAssignme
 
 
 def build_router(path: Path, *, usage_sink: UsageSink | None = None, budget_guard: ProviderBudgetGuard | None = None) -> ModelRouter:
+    # A missing provider document is a valid local empty state. Keep the API,
+    # projects, sessions, tools, and durable inspection usable; model-backed
+    # operations will report an explicit unavailable capability when invoked.
+    if not path.exists():
+        return ModelRouter(ProviderRegistry(), {}, usage_sink=usage_sink, budget_guard=budget_guard)
     document = load_provider_document(path)
     return ModelRouter(build_registry(document), build_assignments(document), usage_sink=usage_sink, budget_guard=budget_guard)
