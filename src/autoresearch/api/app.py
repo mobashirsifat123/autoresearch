@@ -21,6 +21,8 @@ from autoresearch.application.services import DiscoveryOutcome, ReviewOutcome
 from autoresearch.agent.models import SessionMode, TurnStatus
 from autoresearch.domain.models import PipelineKind, RunStatus, dataclass_payload
 from autoresearch.providers.errors import ProviderError
+from autoresearch.providers.capabilities import ModelRole
+from autoresearch.providers.config import ModelAssignment
 from autoresearch.providers.redaction import redact_text
 from autoresearch.versioning import API_VERSION, DATABASE_SCHEMA_VERSION, PRODUCT_VERSION, WORKER_PROTOCOL_VERSION
 
@@ -63,6 +65,13 @@ class ExperimentRequest(BaseModel):
 class ProjectRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     title: str = Field(min_length=1, max_length=200)
+
+
+class ProviderSelectionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    role: ModelRole
+    provider: str = Field(min_length=1, max_length=100)
+    model: str = Field(min_length=1, max_length=300)
 
 
 class ApprovalRequest(BaseModel):
@@ -457,6 +466,28 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         for role, assignment in c.router.assignments.items():
             roles.append({"role": role.value, "provider": assignment.provider, "model": assignment.model, "fallbacks": list(assignment.fallbacks)})
         return {"providers": entries, "roles": roles}
+
+    @app.post("/v1/providers/select", dependencies=[Depends(require_auth)])
+    async def select_provider(payload: ProviderSelectionRequest, idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
+        c = container()
+        key = mutation_key(idempotency_key)
+        prior = c.repository.idempotency(key) if idempotency_key else None
+        if prior:
+            return prior["response"]
+        try:
+            provider = c.router.registry.get(payload.provider)
+            current = c.router.assignments.get(payload.role)
+            assignment = ModelAssignment(payload.role, payload.provider, payload.model, current.fallbacks if current else ())
+            c.router.registry.validate_assignment(assignment)
+            c.router.assignments[payload.role] = assignment
+            if payload.role is ModelRole.EMBEDDINGS:
+                c.router.registry.get_embeddings(payload.provider).model_name = payload.model
+        except (KeyError, ValueError, ProviderError) as exc:
+            raise HTTPException(status_code=422, detail={"code": "invalid_provider_selection", "message": redact_text(str(exc))}) from exc
+        response = {"selected": {"role": payload.role.value, "provider": payload.provider, "model": payload.model}, "durable": False}
+        if idempotency_key:
+            c.repository.save_idempotency(key, "provider_selection", "provider-selection", response)
+        return response
 
     @app.get("/v1/usage", dependencies=[Depends(require_auth)])
     async def usage(project_id: str | None = None, run_id: str | None = None):
