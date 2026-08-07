@@ -9,10 +9,13 @@ from .models import AgentIntent, RoutingDecision, SessionMode
 
 OVERRIDES = {
     "@discover": SessionMode.STUDY_SEARCH,
+    "@import": SessionMode.STUDY_SEARCH,
     "@review": SessionMode.LITERATURE_REVIEW,
     "@invent": SessionMode.NOVELTY,
     "@experiment": SessionMode.EXPERIMENT,
 }
+
+LOCAL_IMPORT_OVERRIDE = {"@import"}
 
 
 class AgentIntentRouter:
@@ -43,6 +46,11 @@ class AgentIntentRouter:
         return OVERRIDES.get(first)
 
     def _selected(self, mode: SessionMode, message: str) -> RoutingDecision:
+        # Detect local import intent (catalog path provided)
+        first = message.strip().split(maxsplit=1)[0].lower() if message.strip() else ""
+        if first == "@import" and re.search(r"(?:paper_catalog|\.json)", message, re.I):
+            return RoutingDecision(AgentIntent.STUDY_SEARCH, "local_import", 1.0, "Explicit local catalog import.", ("catalog_path",), False, True)
+
         mapping = {
             SessionMode.STUDY_SEARCH: (AgentIntent.STUDY_SEARCH, "study_search", ("seed_paper_or_query",), False),
             SessionMode.LITERATURE_REVIEW: (AgentIntent.LITERATURE_REVIEW, "literature_review", ("paper_set",), False),

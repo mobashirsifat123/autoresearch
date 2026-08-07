@@ -49,7 +49,7 @@ from autoresearch.domain.models import (
 )
 
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 
 class ResearchRepository:
@@ -101,6 +101,9 @@ class ResearchRepository:
             if current < 7:
                 connection.executescript(_SCHEMA_V7)
                 connection.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(?,?)", (7, utc_now()))
+            if current < 8:
+                connection.executescript(_SCHEMA_V8)
+                connection.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(?,?)", (8, utc_now()))
             latest = int(connection.execute("SELECT COALESCE(MAX(version), 0) FROM schema_migrations").fetchone()[0])
             if latest != SCHEMA_VERSION:
                 raise RuntimeError(f"Unsupported database schema v{latest}; expected v{SCHEMA_VERSION}.")
@@ -115,6 +118,21 @@ class ResearchRepository:
     def get_project(self, project_id: str) -> Project | None:
         row = self.row("SELECT * FROM projects WHERE id=?", (project_id,))
         return Project(**row) if row else None
+
+    def link_project(self, source_project_id: str, target_project_id: str) -> None:
+        """Link papers from a source project into a target project (for cross-project references)."""
+        with self._lock, self.connect() as connection:
+            connection.execute(
+                "INSERT OR IGNORE INTO project_links(source_project_id, target_project_id, created_at) VALUES(?,?,?)",
+                (source_project_id, target_project_id, utc_now()),
+            )
+            connection.execute(
+                """INSERT OR IGNORE INTO papers
+                   (id,project_id,run_id,title,abstract,authors_json,year,publication_date,doi,arxiv_id,url,source_names_json,open_access_pdf_url,is_open_access,citation_count,venue,checksum,created_at)
+                   SELECT id,?,run_id,title,abstract,authors_json,year,publication_date,doi,arxiv_id,url,source_names_json,open_access_pdf_url,is_open_access,citation_count,venue,checksum,created_at
+                   FROM papers WHERE project_id=?""",
+                (target_project_id, source_project_id),
+            )
 
     def list_projects(self) -> list[Project]:
         return [Project(**row) for row in self.rows("SELECT * FROM projects ORDER BY created_at DESC")]
@@ -261,6 +279,25 @@ class ResearchRepository:
                  citation_count=MAX(papers.citation_count,excluded.citation_count),venue=COALESCE(NULLIF(excluded.venue,''),papers.venue),checksum=excluded.checksum""",
             (paper.id, paper.project_id, paper.run_id, paper.title, paper.abstract, _json(paper.authors), paper.year, paper.publication_date, paper.doi, paper.arxiv_id, paper.url, _json(paper.source_names), paper.open_access_pdf_url, int(paper.is_open_access), paper.citation_count, paper.venue, paper.checksum, paper.created_at),
         )
+
+    def import_papers_batch(self, papers: list[PaperRecord]) -> int:
+        """Import a batch of papers from a local catalog, skipping duplicates."""
+        if not papers:
+            return 0
+        with self._lock, self.connect() as connection:
+            count = 0
+            for paper in papers:
+                existing = connection.execute("SELECT 1 FROM papers WHERE id=?", (paper.id,)).fetchone()
+                if existing:
+                    continue
+                connection.execute(
+                    """INSERT INTO papers
+                       (id,project_id,run_id,title,abstract,authors_json,year,publication_date,doi,arxiv_id,url,source_names_json,open_access_pdf_url,is_open_access,citation_count,venue,checksum,created_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (paper.id, paper.project_id, paper.run_id, paper.title, paper.abstract, _json(paper.authors), paper.year, paper.publication_date, paper.doi, paper.arxiv_id, paper.url, _json(paper.source_names), paper.open_access_pdf_url, int(paper.is_open_access), paper.citation_count, paper.venue, paper.checksum, paper.created_at),
+                )
+                count += 1
+            return count
 
     def get_paper(self, paper_id: str) -> PaperRecord | None:
         row = self.row("SELECT * FROM papers WHERE id=?", (paper_id,))
@@ -1247,5 +1284,14 @@ CREATE TABLE IF NOT EXISTS agent_idempotency(
   turn_id TEXT,
   response_json TEXT NOT NULL,
   created_at TEXT NOT NULL
+);
+"""
+
+_SCHEMA_V8 = """
+CREATE TABLE IF NOT EXISTS project_links(
+  source_project_id TEXT NOT NULL REFERENCES projects(id),
+  target_project_id TEXT NOT NULL REFERENCES projects(id),
+  created_at TEXT NOT NULL,
+  PRIMARY KEY(source_project_id, target_project_id)
 );
 """

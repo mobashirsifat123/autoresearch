@@ -54,6 +54,10 @@ def _claude_session_state(paths: ProductPaths, repository_root: Path) -> Path:
     return paths.state_dir / "claude-code-sessions" / f"{digest}.json"
 
 
+def _backend_repository_root() -> Path:
+    return Path(__file__).resolve().parents[3]
+
+
 def _read_claude_sessions(path: Path) -> dict[str, str]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -241,6 +245,7 @@ def run(
 def agent(
     mode: str = typer.Option(..., "--mode", help="One of review, novelty, or experiment."),
     prompt: str | None = typer.Option(None, "--prompt", help="Research request for the selected durable pipeline."),
+    project: str | None = typer.Option(None, "--project", help="Use an existing discover project ID for the paper set."),
     wait: bool = typer.Option(False, "--wait", help="Stream the session events until the current turn reaches a terminal state."),
 ) -> None:
     """Start or continue a Claude Code-facing research mode without exposing provider keys."""
@@ -252,9 +257,10 @@ def agent(
         raise typer.BadParameter("Provide --prompt, or use --wait only with an already-started turn.")
 
     paths, config = _paths(), _product_config()
-    repository_root = Path.cwd().resolve()
-    start_daemon(config, paths, repository_root=repository_root)
-    state_file = _claude_session_state(paths, repository_root)
+    workspace_root = Path.cwd().resolve()
+    backend_root = _backend_repository_root()
+    start_daemon(config, paths, repository_root=backend_root)
+    state_file = _claude_session_state(paths, workspace_root)
     sessions = _read_claude_sessions(state_file)
     session_id = sessions.get(normalized)
     session_payload: dict[str, Any] | None = None
@@ -269,9 +275,9 @@ def agent(
             "/v1/agent/sessions",
             method="POST",
             payload={
-                "project_title": repository_root.name or "AutoResearch workspace",
-                "active_repository": str(repository_root),
-                "working_directory": str(repository_root),
+                "project_title": workspace_root.name or "AutoResearch workspace",
+                "active_repository": str(backend_root),
+                "working_directory": str(backend_root),
                 "token_budget": 32_000,
                 "cost_budget": config.cost_budget_usd,
             },
@@ -282,7 +288,18 @@ def agent(
         _write_claude_sessions(state_file, sessions)
 
     api_request(config, f"/v1/agent/sessions/{session_id}/mode", method="POST", payload={"mode": normalized, "auto_routing": True}, timeout=5.0)
-    response: dict[str, Any] = {"mode": normalized, "session_id": session_id, "started": False, "provider_keys_exposed": False}
+
+    # If --project is provided, link the discover project's papers to the session's project
+    if project:
+        try:
+            api_request(config, f"/v1/agent/sessions/{session_id}/link-project", method="POST", payload={"project_id": project}, timeout=5.0)
+        except RuntimeError as exc:
+            _release_output({"mode": normalized, "session_id": session_id, "workspace": str(workspace_root), "error": f"Failed to link project '{project}': {exc}", "provider_keys_exposed": False})
+            raise typer.Exit(1)
+
+    response: dict[str, Any] = {"mode": normalized, "session_id": session_id, "workspace": str(workspace_root), "started": False, "provider_keys_exposed": False}
+    if project:
+        response["linked_project"] = project
     if prompt:
         overrides = {"literature_review": "@review", "novelty_generation": "@invent", "experiment": "@experiment"}
         turn = api_request(config, f"/v1/agent/sessions/{session_id}/turns", method="POST", payload={"message": f"{overrides[normalized]} {prompt}", "capability_override": None, "token_budget": None, "cost_budget": config.cost_budget_usd, "time_budget_seconds": 600}, timeout=10.0)
@@ -295,14 +312,20 @@ def agent(
 
 @app.command()
 def discover(
-    seed_paper: str = typer.Option(..., "--seed-paper", help="Seed PDF path, DOI, or HTTPS URL."),
+    seed_paper: str = typer.Option("", "--seed-paper", help="Seed PDF path, DOI, or HTTPS URL."),
+    from_catalog: Path | None = typer.Option(None, "--from-catalog", help="Import papers from a local JSON catalog instead of external search."),
     limit: int = typer.Option(20, "--limit", min=1, max=100),
     since_year: int = typer.Option(datetime.now(timezone.utc).year - 3, "--since-year", min=1900),
     max_cost_usd: float | None = typer.Option(None, "--max-cost-usd", min=0.0, help="Cumulative project provider-cost hard stop."),
     max_runtime_seconds: float | None = typer.Option(None, "--max-runtime-seconds", min=1.0, help="Runtime limit for this invocation."),
 ) -> None:
-    """Retrieve recent related papers and legally accessible PDFs."""
-    _run(lambda container: container.discovery.discover(seed_paper, limit=limit, since_year=since_year, max_cost_usd=max_cost_usd, max_runtime_seconds=max_runtime_seconds))
+    """Retrieve recent related papers and legally accessible PDFs. Use --from-catalog to import local papers."""
+    if from_catalog:
+        _run(lambda container: container.discovery.import_catalog(from_catalog))
+    elif seed_paper:
+        _run(lambda container: container.discovery.discover(seed_paper, limit=limit, since_year=since_year, max_cost_usd=max_cost_usd, max_runtime_seconds=max_runtime_seconds))
+    else:
+        raise typer.BadParameter("Provide --seed-paper for external search or --from-catalog for local import.")
 
 
 @app.command()

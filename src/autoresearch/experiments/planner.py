@@ -1,8 +1,10 @@
-"""Experiment planning translating novelty into concrete specifications."""
+"""Experiment planning translating novelty into concrete specifications.
+Now with multi-shot planning, adversarial falsification design,
+and power analysis."""
 
 from __future__ import annotations
 
-import json
+import math
 from uuid import uuid4
 
 from autoresearch.domain.models import (
@@ -42,6 +44,8 @@ SPEC_SCHEMA = {
         "required_seed_count": {"type": "integer", "minimum": 1},
         "network_policy": {"type": "string", "enum": ["disabled", "allowlisted"]},
         "target_worker": {"type": "string"},
+        "expected_effect_size": {"type": "number", "description": "Expected Cohen's d effect size for power analysis"},
+        "power_target": {"type": "number", "minimum": 0.5, "maximum": 0.99, "description": "Target statistical power (e.g., 0.8)"},
     },
     "required": [
         "hypothesis", "causal_mechanism", "falsification_condition",
@@ -55,7 +59,30 @@ SPEC_SCHEMA = {
     "additionalProperties": False,
 }
 
-PROMPT_VERSION = "experiment-planner-v1"
+ADVERSARIAL_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "what_would_disprove": {"type": "string"},
+        "confounding_factors": {"type": "array", "items": {"type": "string"}},
+        "minimal_viable_experiment": {"type": "string"},
+        "expected_null_outcome": {"type": "string"},
+        "failure_modes": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["what_would_disprove", "confounding_factors", "minimal_viable_experiment", "expected_null_outcome", "failure_modes"],
+    "additionalProperties": False,
+}
+
+SPEC_SELECTION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "selected_index": {"type": "integer", "minimum": 0, "maximum": 2},
+        "selection_rationale": {"type": "string"},
+    },
+    "required": ["selected_index", "selection_rationale"],
+    "additionalProperties": False,
+}
+
+PROMPT_VERSION = "experiment-planner-v2"
 
 
 class ExperimentSpecGenerator:
@@ -63,62 +90,146 @@ class ExperimentSpecGenerator:
         self.router = router
 
     async def plan(self, candidate: NoveltyCandidate) -> ExperimentSpec:
-        messages = [
-            {"role": "system", "content": "You are a meticulous experimental designer. Translate the proposed novelty candidate into a highly-detailed, reproducible experiment specification. Specify random seeds, ablations, and exact stopping conditions."},
-            {"role": "user", "content": f"Candidate Method: {candidate.method}\nExpected Effect: {candidate.expected_effect}\nAblations: {candidate.required_ablations}\nObjections: {candidate.risks_and_objections}"}
+        # Step 1: Generate 2-3 experiment designs with different focuses
+        designs = []
+        focuses = [
+            "default: a standard rigorous experiment design",
+            "efficient: a minimal viable experiment that can quickly falsify the hypothesis",
+            "comprehensive: an exhaustive experiment with many ablations and robustness tests",
         ]
-        
-        payload = await self.router.structured_output(
-            ModelRole.RESEARCH_REASONING,
-            messages=messages,
-            schema={"name": "experiment_spec", "schema": SPEC_SCHEMA},
-            project_id=candidate.project_id,
-            run_id=candidate.run_id,
-            operation="experiment_planning",
-        )
-        
+        for focus in focuses:
+            design = await self._generate_single(candidate, focus)
+            designs.append(design)
+
+        # Step 2: Adversarial falsification analysis for each design
+        for design in designs:
+            adversarial = await self._adversarial_analysis(candidate, design)
+            design["_adversarial"] = adversarial
+
+        # Step 3: Power analysis to determine required seed count
+        for design in designs:
+            design["_required_seeds"] = self._power_analysis(design)
+
+        # Step 4: Select the best design
+        selected = await self._select_best_design(candidate, designs)
+
+        # Build the final spec
         provider, model = self.router.identity(ModelRole.RESEARCH_REASONING)
         provenance = ArtifactProvenance.create(
-            project_id=candidate.project_id,
-            run_id=candidate.run_id,
+            project_id=candidate.project_id, run_id=candidate.run_id,
             source_evidence=[candidate.id],
-            provider=provider,
-            model=model,
+            provider=provider, model=model,
             prompt_version=PROMPT_VERSION,
-            content=payload,
+            content={**selected, "adversarial": selected.get("_adversarial", {}),
+                     "required_seeds": selected.get("_required_seeds", 5)},
         )
-        
+
+        # Compute required_seed_count from power analysis or fall back
+        required_seeds = selected.get("_required_seeds", 5)
+        power_target = selected.get("power_target", 0.8)
+
         return ExperimentSpec(
-            id=uuid4().hex,
-            project_id=candidate.project_id,
-            run_id=candidate.run_id,
+            id=uuid4().hex, project_id=candidate.project_id, run_id=candidate.run_id,
             candidate_id=candidate.id,
-            hypothesis=payload.get("hypothesis", ""),
-            causal_mechanism=payload.get("causal_mechanism", ""),
-            falsification_condition=payload.get("falsification_condition", ""),
-            repository=payload.get("repository", ""),
-            baseline_commit=payload.get("baseline_commit", ""),
-            dataset_identity=payload.get("dataset_identity", ""),
-            dataset_checksum=payload.get("dataset_checksum", ""),
-            split_definition=payload.get("split_definition", ""),
-            baseline_configuration=payload.get("baseline_configuration", ""),
-            proposed_change=payload.get("proposed_change", ""),
-            independent_variables=tuple(payload.get("independent_variables", [])),
-            controlled_variables=tuple(payload.get("controlled_variables", [])),
-            metrics=tuple(payload.get("metrics", [])),
-            random_seeds=tuple(payload.get("random_seeds", [])),
-            ablations=tuple(payload.get("ablations", [])),
-            robustness_tests=tuple(payload.get("robustness_tests", [])),
-            statistical_plan=payload.get("statistical_plan", ""),
-            compute_budget=payload.get("compute_budget", ""),
-            stopping_conditions=tuple(payload.get("stopping_conditions", [])),
-            expected_outputs=tuple(payload.get("expected_outputs", [])),
-            artifact_contract=payload.get("artifact_contract", ""),
+            hypothesis=selected.get("hypothesis", ""),
+            causal_mechanism=selected.get("causal_mechanism", ""),
+            falsification_condition=selected.get("falsification_condition", ""),
+            repository=selected.get("repository", ""),
+            baseline_commit=selected.get("baseline_commit", ""),
+            dataset_identity=selected.get("dataset_identity", ""),
+            dataset_checksum=selected.get("dataset_checksum", ""),
+            split_definition=selected.get("split_definition", ""),
+            baseline_configuration=selected.get("baseline_configuration", ""),
+            proposed_change=selected.get("proposed_change", ""),
+            independent_variables=tuple(selected.get("independent_variables", [])),
+            controlled_variables=tuple(selected.get("controlled_variables", [])),
+            metrics=tuple(selected.get("metrics", [])),
+            random_seeds=tuple(selected.get("random_seeds", [])),
+            ablations=tuple(selected.get("ablations", [])),
+            robustness_tests=tuple(selected.get("robustness_tests", [])),
+            statistical_plan=selected.get("statistical_plan", ""),
+            compute_budget=selected.get("compute_budget", ""),
+            stopping_conditions=tuple(selected.get("stopping_conditions", [])),
+            expected_outputs=tuple(selected.get("expected_outputs", [])),
+            artifact_contract=selected.get("artifact_contract", ""),
             provenance=provenance,
-            metric_direction=payload.get("metric_direction", {}),
-            minimum_meaningful_effect=payload.get("minimum_meaningful_effect", {}),
-            required_seed_count=int(payload.get("required_seed_count", max(1, len(payload.get("random_seeds", []))))),
-            network_policy=payload.get("network_policy", "disabled"),
-            target_worker=payload.get("target_worker", "local"),
+            metric_direction=selected.get("metric_direction", {}),
+            minimum_meaningful_effect=selected.get("minimum_meaningful_effect", {}),
+            required_seed_count=required_seeds,
+            network_policy=selected.get("network_policy", "disabled"),
+            target_worker=selected.get("target_worker", "local"),
             approval_required=True,
         )
+
+    async def _generate_single(self, candidate: NoveltyCandidate, focus: str) -> dict:
+        """Generate one experiment design with a specific focus."""
+        messages = [
+            {"role": "system", "content": f"You are a meticulous experimental designer. Focus: {focus}. Translate the proposed novelty candidate into a highly-detailed, reproducible experiment specification. Specify random seeds, ablations, exact stopping conditions, and effect size estimates."},
+            {"role": "user", "content": f"Candidate Method: {candidate.method}\nExpected Effect: {candidate.expected_effect}\nAblations: {candidate.required_ablations}\nObjections: {candidate.risks_and_objections}"}
+        ]
+
+        payload = await self.router.structured_output(
+            ModelRole.RESEARCH_REASONING, messages=messages,
+            schema={"name": "experiment_spec", "schema": SPEC_SCHEMA},
+            project_id=candidate.project_id, run_id=candidate.run_id,
+            operation="experiment_planning",
+        )
+        return payload
+
+    async def _adversarial_analysis(self, candidate: NoveltyCandidate, design: dict) -> dict:
+        """Generate an adversarial analysis: what would disprove the hypothesis."""
+        messages = [
+            {"role": "system", "content": "You are an adversarial reviewer whose job is to find what would disprove this experiment's hypothesis. Be thorough and concrete."},
+            {"role": "user", "content": f"Hypothesis: {design.get('hypothesis', '')}\nProposed Change: {design.get('proposed_change', '')}\nCandidate Method: {candidate.method}\nFalsification Condition: {candidate.falsification_condition}"}
+        ]
+
+        payload = await self.router.structured_output(
+            ModelRole.SCIENTIFIC_CRITIC, messages=messages,
+            schema={"name": "adversarial_analysis", "schema": ADVERSARIAL_SCHEMA},
+            project_id=candidate.project_id, run_id=candidate.run_id,
+            operation="adversarial_experiment_analysis",
+        )
+        return payload
+
+    def _power_analysis(self, design: dict) -> int:
+        """Compute required seed count from expected effect size using a simplified power analysis.
+        Uses the formula: n ≈ (z_alpha/2 + z_beta)^2 / (d^2) for a two-sided test.
+        """
+        effect_size = design.get("expected_effect_size")
+        if effect_size is None or effect_size <= 0:
+            effect_size = 0.5  # default to medium effect
+        power_target = design.get("power_target", 0.8)
+
+        # z-scores for common power levels
+        z_scores = {0.5: 0.0, 0.6: 0.25, 0.7: 0.52, 0.8: 0.84, 0.9: 1.28, 0.95: 1.64, 0.99: 2.33}
+        z_beta = z_scores.get(power_target, 0.84)
+
+        # z for alpha=0.05 (two-sided)
+        z_alpha_half = 1.96
+
+        n_per_group = math.ceil(2 * (z_alpha_half + z_beta) ** 2 / (effect_size ** 2))
+        return max(3, min(n_per_group, 30))  # clamp between 3 and 30
+
+    async def _select_best_design(self, candidate: NoveltyCandidate, designs: list[dict]) -> dict:
+        """Select the best experiment design via meta-evaluation."""
+        if len(designs) == 1:
+            return designs[0]
+
+        designs_text = "\n\n---\n\n".join(
+            f"Design {i}:\nHypothesis: {d.get('hypothesis', '')[:200]}\n"
+            f"Seeds required: {d.get('_required_seeds', 'N/A')}\n"
+            f"Adversarial falsification: {d.get('_adversarial', {}).get('what_would_disprove', '')[:200]}"
+            for i, d in enumerate(designs)
+        )
+        selection = await self.router.structured_output(
+            ModelRole.RESEARCH_REASONING,
+            messages=[
+                {"role": "system", "content": "Select the best experiment design. Prefer designs that are maximally falsifiable, have appropriate seed counts from power analysis, and have clear adversarial falsification conditions."},
+                {"role": "user", "content": f"Candidate: {candidate.method}\n\n{designs_text}\n\nReturn selected_index and selection_rationale."},
+            ],
+            schema={"name": "design_selection", "schema": SPEC_SELECTION_SCHEMA},
+            project_id=candidate.project_id, run_id=candidate.run_id,
+            operation="experiment_design_selection",
+        )
+        idx = max(0, min(selection.get("selected_index", 0), len(designs) - 1))
+        return designs[idx]

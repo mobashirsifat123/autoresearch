@@ -32,6 +32,16 @@ async def test_experiment_pipeline(tmp_path):
     
     def _responder(messages):
         prompt = str(messages[-1]["content"])
+        if "Seeds required:" in prompt:
+            return {"selected_index": 0, "selection_rationale": "Design 0 is maximally falsifiable with adequate power."}
+        if "Candidate Method:" in prompt and "Falsification Condition:" in prompt:
+            return {
+                "what_would_disprove": "No consistent improvement.",
+                "confounding_factors": ["Seed variance"],
+                "minimal_viable_experiment": "One dataset, three seeds.",
+                "expected_null_outcome": "No consistent gain.",
+                "failure_modes": ["Implementation error"]
+            }
         if "Candidate Method:" in prompt or "experiment-planner-v1" in prompt:
             return {
                 "hypothesis": "H1",
@@ -88,6 +98,7 @@ async def test_experiment_pipeline(tmp_path):
     
     assignments = {
         ModelRole.RESEARCH_REASONING: ModelAssignment(ModelRole.RESEARCH_REASONING, "fake", "fake-model"),
+        ModelRole.SCIENTIFIC_CRITIC: ModelAssignment(ModelRole.SCIENTIFIC_CRITIC, "fake", "fake-model"),
     }
     router = ModelRouter(registry, assignments)
     

@@ -74,6 +74,11 @@ class ProviderSelectionRequest(BaseModel):
     model: str = Field(min_length=1, max_length=300)
 
 
+class LinkProjectRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    project_id: str = Field(min_length=1)
+
+
 class ApprovalRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     approved: bool
@@ -393,6 +398,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if idempotency_key:
             c.agent.store.save_idempotency(key, "agent_mode", session_id, None, response)
         return response
+
+    @app.post("/v1/agent/sessions/{session_id}/link-project", dependencies=[Depends(require_auth)])
+    async def link_project(session_id: str, payload: LinkProjectRequest):
+        c = container()
+        session = c.agent.store.require_session(session_id)
+        if not c.repository.get_project(payload.project_id):
+            raise HTTPException(404, f"Project '{payload.project_id}' was not found. Run 'discover --from-catalog' or 'discover --seed-paper' first.")
+        # Link the discover project's papers into the session's project
+        c.repository.link_project(payload.project_id, session.project_id)
+        paper_count = len(c.repository.list_papers(session.project_id))
+        c.agent.store.append_event(session_id, "agent.project_linked", {"session_id": session_id, "source_project": payload.project_id, "paper_count": paper_count})
+        return {"status": "linked", "session_id": session_id, "source_project": payload.project_id, "paper_count": paper_count}
 
     @app.post("/v1/agent/sessions/{session_id}/cancel", dependencies=[Depends(require_auth)])
     async def cancel_agent_session(session_id: str, idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):

@@ -21,7 +21,7 @@ async def test_review_keeps_only_exact_source_excerpts():
             {"claim_type": "result", "statement": "Fabricated", "excerpt": "This sentence is absent.", "page": 1, "section": "Results", "confidence": 0.9},
         ],
     }
-    provider = FakeLLMProvider(responses=[response])
+    provider = FakeLLMProvider(responses=[response, response, response])  # one per review perspective (rigor/reproducibility/novelty)
     registry = ProviderRegistry(); registry.register_llm("fake", provider)
     router = ModelRouter(registry, {ModelRole.LITERATURE_EXTRACTION: ModelAssignment(ModelRole.LITERATURE_EXTRACTION, "fake", "fake-model")})
     paper = PaperRecord("paper", "project", "discovery", "Paper", "Adaptive fusion improves robustness.", (), 2025, "2025-01-01", None, None, None, ("test",))

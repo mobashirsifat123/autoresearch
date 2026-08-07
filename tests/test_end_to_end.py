@@ -67,7 +67,7 @@ def _responder(messages):
         return {"title": "Seed Adaptive Fusion", "topic": "robust adaptive fusion", "research_question": "Can adaptive fusion improve cross-domain robustness?", "methods": ["adaptive fusion"], "datasets": ["Dataset-A"], "citations": [], "limitations": ["single-domain evaluation"], "keywords": ["robustness", "domain shift", "fusion"]}
     if "search-strategies-v1" in prompt:
         return {"strategies": [{"name": "topic", "query": "adaptive fusion robustness"}, {"name": "method", "query": "adaptive fusion domain shift"}, {"name": "question", "query": "cross-domain robust fusion"}, {"name": "limitation", "query": "single-domain evaluation limitation"}]}
-    if "paper-review-v1" in prompt:
+    if "paper-review-v2" in prompt:
         return {
             "problem": "Cross-domain robustness", "research_question": "Does adaptive fusion improve robustness?", "method": "Adaptive fusion",
             "datasets": ["Dataset-A"], "experimental_protocol": "Single-dataset controlled evaluation", "results": ["Improved robustness"],
@@ -77,10 +77,17 @@ def _responder(messages):
                 {"claim_type": "limitation", "statement": "Evaluation is limited to one dataset.", "excerpt": "Evaluation is limited to one dataset.", "page": None, "section": "abstract", "confidence": 0.95},
             ],
         }
-    if "evidence-gap-v1" in prompt:
+    if "limitation-cluster-v1" in prompt:
+        paper_ids = list(dict.fromkeys(re.findall(r'"paper_id":\s*"([a-f0-9]{24})"', prompt)))
+        return {"clusters": [{"theme": "single-domain evaluation", "frequency": 5, "paper_ids": paper_ids[:2], "description": "Most studies evaluate on a single dataset, limiting generalization."}]}
+    if "evidence-gap-v2" in prompt:
         claim_ids = re.findall(r'"claim_id":\s*"([a-f0-9]{32})"', prompt)
         paper_ids = list(dict.fromkeys(re.findall(r'"paper_id":\s*"([a-f0-9]{24})"', prompt)))
         return {"gap_statement": "Adaptive fusion lacks matched cross-domain validation.", "supporting_paper_ids": paper_ids[:2], "supporting_claim_ids": claim_ids[:2], "why_existing_work_does_not_solve_it": "The highest-priority studies evaluate only one dataset.", "missing_experiment": "A parameter-matched evaluation across three held-out domains.", "falsification_test": "Reject the gap if existing matched multi-domain evidence shows consistent gains across three domains.", "confidence": 0.88, "counter_evidence_claim_ids": claim_ids[2:3]}
+    if "counter-evidence-v1" in prompt:
+        return {"counter_evidence_claim_ids": [], "analysis": "No contradicting claims found in the supplied evidence corpus."}
+    if "gap-selection-v1" in prompt:
+        return {"selected_index": 0, "selection_rationale": "Candidate 0 is precisely stated and most strongly supported by paper evidence."}
     if "Research Gap:" in prompt or "limitation root cause elimination" in prompt or "candidate-gen-v1" in prompt:
         return {
             "strategy": "limitation root cause elimination", "method": "New Method", "causal_mechanism": "Cause",
@@ -90,6 +97,10 @@ def _responder(messages):
         }
     if "Prior Art Abstracts" in prompt or "prior-art-v1" in prompt:
         return {"overlap_status": "potentially_novel", "mechanism_comparison": "Comparison", "supporting_excerpts": [], "unresolved_overlap": "None"}
+    if "Seeds required:" in prompt:
+        return {"selected_index": 0, "selection_rationale": "Design 0 is maximally falsifiable with adequate statistical power."}
+    if "Candidate Method:" in prompt and "Falsification Condition:" in prompt:
+        return {"what_would_disprove": "No consistent improvement over baseline.", "confounding_factors": ["Seed variance"], "minimal_viable_experiment": "One dataset with three seeds.", "expected_null_outcome": "No consistent gain.", "failure_modes": ["Implementation error"]}
     if "Method:" in prompt or "novelty-critic-v1" in prompt:
         return {
             "novelty_score": 0.9, "significance_score": 0.9, "causal_plausibility_score": 0.9, "falsifiability_score": 0.9,
@@ -107,13 +118,15 @@ def _responder(messages):
         }
     if "Baseline Metrics:" in prompt or "result-analyzer-v1" in prompt:
         return {"failure_case_analysis": "None", "hypothesis_support_assessment": "Supported"}
+    if "Statistical Plan:" in prompt and "Baseline:" in prompt:
+        return {"construct_validity": "The metrics measure the claimed construct.", "internal_validity": "Confounds are controlled via matched baselines.", "external_validity": "Single-dataset results limit generalization.", "statistical_conclusion_validity": "Appropriate given the seed count."}
     if "Assessment:" in prompt or "report-writer-v1" in prompt:
         return {
             "literature_motivation": "Motiv", "research_gap": "Gap", "implementation_diff": "Diff", "uncertainty": "Uncert",
             "ablations": "Ablations", "robustness_tests": "Robust", "limitations": "Limit", "reproducibility_instructions": "Repro",
             "decision": "supported", "decision_evidence": "Evidence"
         }
-        
+
     raise AssertionError(f"Unexpected provider prompt: {prompt[:120]}")
 
 
@@ -310,14 +323,14 @@ async def test_interrupted_review_reuses_reviews_and_cached_embeddings(tmp_path)
         await review_service.review(discovery.project_id, top_k=5)
     run_id = repository.row("SELECT id FROM pipeline_runs WHERE kind='deep_literature_review'")["id"]
     paper_calls = sum("paper-review" in str(call["messages"][-1]["content"]) for call in llm.calls)
-    assert paper_calls == 20
+    assert paper_calls == 20 * 3  # multi-perspective review: 3 perspectives per paper
     assert len(repository.reviews(discovery.project_id, run_id)) == 20
     assert embeddings.calls == 1
 
     resumed = await review_service.resume(run_id)
     assert resumed.reviewed == 20
     assert embeddings.calls == 1
-    assert sum("paper-review" in str(call["messages"][-1]["content"]) for call in llm.calls) == 20
+    assert sum("paper-review" in str(call["messages"][-1]["content"]) for call in llm.calls) == 20 * 3
 
     llm_count = len(llm.calls)
     repeated = await review_service.resume(run_id)

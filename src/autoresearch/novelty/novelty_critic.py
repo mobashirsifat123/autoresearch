@@ -1,8 +1,9 @@
-"""Scientific novelty criticism and scoring."""
+"""Scientific novelty criticism and scoring with ensemble evaluation."""
 
 from __future__ import annotations
 
 import json
+from statistics import mean
 from uuid import uuid4
 
 from autoresearch.domain.models import (
@@ -39,7 +40,23 @@ CRITIQUE_SCHEMA = {
     "additionalProperties": False,
 }
 
-PROMPT_VERSION = "novelty-critic-v1"
+PROMPT_VERSION = "novelty-critic-v2"
+
+# Distinct reviewer perspectives for ensemble critique
+_CRITIC_PERSPECTIVES = [
+    {
+        "system": "You are a harsh but fair area chair for a top-tier machine learning conference. You value rigorous experimental validation above all. Score strictly. Provide explicit objections and failure scenarios.",
+        "tag": "area_chair",
+    },
+    {
+        "system": "You are a skeptical senior reviewer who has seen many claimed novelties fail to reproduce. Focus on whether the claimed effect is real and whether the falsification condition is meaningful. Score conservatively.",
+        "tag": "skeptic",
+    },
+    {
+        "system": "You are an optimistic junior reviewer excited by new ideas. You value creativity and potential impact, but still demand sound reasoning. Be fair but generous where the idea has merit.",
+        "tag": "enthusiast",
+    },
+]
 
 
 class ScientificCritic:
@@ -47,47 +64,94 @@ class ScientificCritic:
         self.router = router
 
     async def evaluate(self, candidate: NoveltyCandidate) -> NoveltyCritique:
+        """Evaluate using ensemble of 3 reviewer perspectives and aggregate."""
+        critiques = []
+        for perspective in _CRITIC_PERSPECTIVES:
+            critique = await self._single_evaluate(candidate, perspective)
+            critiques.append(critique)
+
+        # Aggregate scores: mean across ensemble
+        score_keys = [
+            "novelty_score", "significance_score", "causal_plausibility_score",
+            "falsifiability_score", "experimental_discriminability_score",
+            "feasibility_score", "implementation_risk_score",
+            "expected_information_gain_score", "compute_efficiency_score",
+            "publication_potential_score",
+        ]
+        aggregated = {}
+        for key in score_keys:
+            values = [c[key] for c in critiques]
+            aggregated[key] = round(mean(values), 6)
+
+        # Collect objections and failure scenarios from all perspectives
+        all_objections: list[str] = []
+        seen_obj: set[str] = set()
+        for c in critiques:
+            for obj in c.get("objections", []):
+                if obj not in seen_obj:
+                    all_objections.append(obj)
+                    seen_obj.add(obj)
+
+        all_failures: list[str] = []
+        seen_fail: set[str] = set()
+        for c in critiques:
+            for fail in c.get("failure_scenarios", []):
+                if fail not in seen_fail:
+                    all_failures.append(fail)
+                    seen_fail.add(fail)
+
+        provider, model = self.router.identity(ModelRole.SCIENTIFIC_CRITIC)
+        provenance = ArtifactProvenance.create(
+            project_id=candidate.project_id, run_id=candidate.run_id,
+            source_evidence=[],
+            provider=provider, model=model,
+            prompt_version=PROMPT_VERSION,
+            content={**aggregated, "perspectives": [c["tag"] for c in critiques],
+                     "ensemble_size": len(critiques)},
+        )
+
+        return NoveltyCritique(
+            id=uuid4().hex, project_id=candidate.project_id, run_id=candidate.run_id,
+            candidate_id=candidate.id,
+            novelty_score=aggregated["novelty_score"],
+            significance_score=aggregated["significance_score"],
+            causal_plausibility_score=aggregated["causal_plausibility_score"],
+            falsifiability_score=aggregated["falsifiability_score"],
+            experimental_discriminability_score=aggregated["experimental_discriminability_score"],
+            feasibility_score=aggregated["feasibility_score"],
+            implementation_risk_score=aggregated["implementation_risk_score"],
+            expected_information_gain_score=aggregated["expected_information_gain_score"],
+            compute_efficiency_score=aggregated["compute_efficiency_score"],
+            publication_potential_score=aggregated["publication_potential_score"],
+            objections=tuple(all_objections),
+            failure_scenarios=tuple(all_failures),
+            provenance=provenance,
+        )
+
+    async def _single_evaluate(self, candidate: NoveltyCandidate, perspective: dict) -> dict:
+        """Run one critic evaluation from a specific perspective."""
         messages = [
-            {"role": "system", "content": "You are a harsh but fair scientific reviewer for a top-tier machine learning conference. Score this candidate method strictly. Provide explicit objections and failure scenarios."},
+            {"role": "system", "content": perspective["system"]},
             {"role": "user", "content": f"Method: {candidate.method}\nMechanism: {candidate.causal_mechanism}\nFalsification condition: {candidate.falsification_condition}\nExpected effect: {candidate.expected_effect}"}
         ]
-        
+
         payload = await self.router.structured_output(
             ModelRole.SCIENTIFIC_CRITIC,
             messages=messages,
             schema={"name": "novelty_critique", "schema": CRITIQUE_SCHEMA},
-            project_id=candidate.project_id,
-            run_id=candidate.run_id,
-            operation="novelty_criticism",
+            project_id=candidate.project_id, run_id=candidate.run_id,
+            operation=f"novelty_criticism_{perspective['tag']}",
         )
-        
-        provider, model = self.router.identity(ModelRole.SCIENTIFIC_CRITIC)
-        provenance = ArtifactProvenance.create(
-            project_id=candidate.project_id,
-            run_id=candidate.run_id,
-            source_evidence=[],
-            provider=provider,
-            model=model,
-            prompt_version=PROMPT_VERSION,
-            content=payload,
-        )
-        
-        return NoveltyCritique(
-            id=uuid4().hex,
-            project_id=candidate.project_id,
-            run_id=candidate.run_id,
-            candidate_id=candidate.id,
-            novelty_score=payload.get("novelty_score", 0.0),
-            significance_score=payload.get("significance_score", 0.0),
-            causal_plausibility_score=payload.get("causal_plausibility_score", 0.0),
-            falsifiability_score=payload.get("falsifiability_score", 0.0),
-            experimental_discriminability_score=payload.get("experimental_discriminability_score", 0.0),
-            feasibility_score=payload.get("feasibility_score", 0.0),
-            implementation_risk_score=payload.get("implementation_risk_score", 0.0),
-            expected_information_gain_score=payload.get("expected_information_gain_score", 0.0),
-            compute_efficiency_score=payload.get("compute_efficiency_score", 0.0),
-            publication_potential_score=payload.get("publication_potential_score", 0.0),
-            objections=tuple(payload.get("objections", [])),
-            failure_scenarios=tuple(payload.get("failure_scenarios", [])),
-            provenance=provenance,
-        )
+
+        return {
+            "tag": perspective["tag"],
+            **{key: float(payload.get(key, 0.0)) for key in [
+                "novelty_score", "significance_score", "causal_plausibility_score",
+                "falsifiability_score", "experimental_discriminability_score",
+                "feasibility_score", "implementation_risk_score",
+                "expected_information_gain_score", "compute_efficiency_score",
+                "publication_potential_score",
+            ]},
+            "objections": list(payload.get("objections", [])),
+            "failure_scenarios": list(payload.get("failure_scenarios", [])),
+        }

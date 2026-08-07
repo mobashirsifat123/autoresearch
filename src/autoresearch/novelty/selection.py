@@ -1,4 +1,5 @@
-"""Portfolio selection mapping risk profiles to candidates."""
+"""Portfolio selection mapping risk profiles to candidates.
+Now with diversity-aware selection to avoid methodological overlap."""
 
 from __future__ import annotations
 
@@ -32,48 +33,85 @@ class PortfolioSelector:
         if not scored_candidates:
             raise ValueError("No candidate passed the scientific gates.")
 
+        # Diversity-aware selection: avoid selecting candidates with overlapping methods
+        # Compute pairwise methodological diversity using simple word overlap
+        def method_diversity(c1: NoveltyCandidate, c2: NoveltyCandidate) -> float:
+            words1 = set(c1.method.lower().split()) | set(c1.causal_mechanism.lower().split())
+            words2 = set(c2.method.lower().split()) | set(c2.causal_mechanism.lower().split())
+            if not words1 or not words2:
+                return 1.0
+            intersection = words1 & words2
+            union = words1 | words2
+            return 1.0 - (len(intersection) / len(union))  # 1.0 = completely different
+
         # Sort by expected compute efficiency (proxy for low risk/fast execution)
         low_risk = sorted(scored_candidates, key=lambda x: x[1].compute_efficiency_score + x[1].feasibility_score, reverse=True)[0]
-        
-        # Sort by balance (publication potential + feasibility)
-        balanced = sorted(scored_candidates, key=lambda x: x[1].publication_potential_score + x[1].feasibility_score, reverse=True)[0] if len(scored_candidates) > 1 else None
-        
-        # Sort by high risk (novelty + significance - feasibility)
-        high_risk = sorted(scored_candidates, key=lambda x: x[1].novelty_score + x[1].significance_score - x[1].feasibility_score, reverse=True)[0] if len(scored_candidates) > 2 else None
 
-        # Make sure they are unique if possible
-        if balanced and balanced[0].id == low_risk[0].id:
-            remaining = [c for c in scored_candidates if c[0].id != low_risk[0].id]
-            if remaining:
-                balanced = sorted(remaining, key=lambda x: x[1].publication_potential_score + x[1].feasibility_score, reverse=True)[0]
+        # Balance diversity with the best balanced candidate
+        remaining_for_balanced = [c for c in scored_candidates if c[0].id != low_risk[0].id]
+        if remaining_for_balanced:
+            # Score: publication_potential + feasibility + diversity_from_low_risk
+            balanced = max(
+                remaining_for_balanced,
+                key=lambda x: (
+                    x[1].publication_potential_score + x[1].feasibility_score
+                    + method_diversity(low_risk[0], x[0]) * 0.3  # diversity bonus
+                ),
+            )
+        else:
+            balanced = None
 
-        if high_risk and high_risk[0].id in (low_risk[0].id, balanced[0].id if balanced else None):
-            remaining = [c for c in scored_candidates if c[0].id not in (low_risk[0].id, balanced[0].id if balanced else None)]
-            if remaining:
-                high_risk = sorted(remaining, key=lambda x: x[1].novelty_score + x[1].significance_score - x[1].feasibility_score, reverse=True)[0]
+        # High risk: novelty + significance - feasibility + diversity from selected
+        selected_ids = {c[0].id for c in [low_risk, balanced] if c is not None}
+        remaining_for_high = [c for c in scored_candidates if c[0].id not in selected_ids]
+        if remaining_for_high:
+            # Compute average diversity from already-selected candidates
+            def avg_diversity(c: NoveltyCandidate) -> float:
+                selected = [s[0] for s in [low_risk, balanced] if s is not None and s[0].id != c.id]
+                if not selected:
+                    return 0.0
+                return sum(method_diversity(c, s) for s in selected) / len(selected)
+
+            high_risk = max(
+                remaining_for_high,
+                key=lambda x: (
+                    x[1].novelty_score + x[1].significance_score - x[1].feasibility_score
+                    + avg_diversity(x[0]) * 0.5  # strong diversity bonus
+                ),
+            )
+        else:
+            high_risk = None
 
         provenance = ArtifactProvenance.create(
-            project_id=project_id,
-            run_id=run_id,
+            project_id=project_id, run_id=run_id,
             source_evidence=[c[0].id for c in scored_candidates],
-            provider="deterministic",
-            model="heuristic",
-            prompt_version="portfolio-selector-v1",
-            content={"strategy": "risk_balancing"},
+            provider="deterministic", model="heuristic",
+            prompt_version="portfolio-selector-v2",
+            content={"strategy": "diversity_aware_risk_balancing"},
         )
 
+        # Build selection reasons
+        selection_reasons = {}
+        if low_risk:
+            selection_reasons["low_risk"] = "Highest feasibility and compute efficiency."
+        if balanced:
+            selection_reasons["balanced"] = (
+                f"Strong trade-off between publication potential, feasibility, "
+                f"and methodological diversity from low-risk candidate "
+                f"(diversity={method_diversity(low_risk[0], balanced[0]):.2f})."
+            )
+        if high_risk:
+            selection_reasons["high_risk"] = (
+                f"High information gain with explicitly higher risk, "
+                f"maximizing methodological diversity from other selected candidates."
+            )
+
         portfolio = NoveltyPortfolio(
-            id=uuid4().hex,
-            project_id=project_id,
-            run_id=run_id,
+            id=uuid4().hex, project_id=project_id, run_id=run_id,
             low_risk_candidate_id=low_risk[0].id,
             balanced_candidate_id=balanced[0].id if balanced else None,
             high_risk_candidate_id=high_risk[0].id if high_risk else None,
-            selection_reasons={
-                "low_risk": "Highest feasibility and compute efficiency.",
-                **({"balanced": "Strong trade-off between publication potential and feasibility."} if balanced else {}),
-                **({"high_risk": "High information gain with explicitly higher risk."} if high_risk else {}),
-            },
+            selection_reasons=selection_reasons,
             provenance=provenance,
         )
 

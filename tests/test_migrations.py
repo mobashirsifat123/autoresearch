@@ -8,7 +8,7 @@ def test_empty_database_migrates_idempotently(tmp_path):
     first = ResearchRepository(path, tmp_path / "artifacts")
     second = ResearchRepository(path, tmp_path / "artifacts")
     assert first.integrity_check() == "ok"
-    assert second.row("SELECT MAX(version) AS version FROM schema_migrations")["version"] == 7
+    assert second.row("SELECT MAX(version) AS version FROM schema_migrations")["version"] == 8
     assert second.row("SELECT name FROM sqlite_master WHERE type='table' AND name='api_events'") is not None
     tables = {row["name"] for row in second.rows("SELECT name FROM sqlite_master WHERE type='table'")}
     assert {"projects", "pipeline_runs", "pipeline_checkpoints", "papers", "paper_reviews", "evidence_claims", "research_gaps", "provider_usage", "artifacts", "novelty_candidates", "experiment_specs", "api_project_idempotency", "agent_sessions", "agent_messages", "agent_turns", "agent_tool_calls", "agent_permissions", "agent_events", "agent_artifact_refs"} <= tables
@@ -36,7 +36,7 @@ def test_upgrade_from_v1_and_v2_and_v3(tmp_path):
 
     repo = ResearchRepository(path, tmp_path / "artifacts")
     assert repo.integrity_check() == "ok"
-    assert repo.row("SELECT MAX(version) AS version FROM schema_migrations")["version"] == 7
+    assert repo.row("SELECT MAX(version) AS version FROM schema_migrations")["version"] == 8
     tables = {row["name"] for row in repo.rows("SELECT name FROM sqlite_master WHERE type='table'")}
     assert "novelty_candidates" in tables
     assert "api_project_idempotency" in tables

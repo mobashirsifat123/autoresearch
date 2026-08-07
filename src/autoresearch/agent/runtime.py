@@ -223,6 +223,26 @@ class AgentRuntime:
         self._event(session.id, "agent.tool_started", {"turn_id": turn.id, "tool_id": capability.id, "capability": asdict(capability)})
         run_id, summary = await self._run_scientific(capability.id, session, message)
         self.store.update_session(session.id, active_run_id=run_id)
+
+        # Passthrough mode: return structured data for Claude Code to process
+        if summary.get("passthrough"):
+            passthrough_msg = json.dumps(summary, indent=2, ensure_ascii=False, default=str)
+            response = (
+                f"**{capability.display_name} — Passthrough Mode**\n\n"
+                f"The backend has no LLM provider configured, so it's returning structured data "
+                f"for Claude Code to process. Here's what to do:\n\n"
+                f"1. Review the `papers` / `gap` / `candidate` data below\n"
+                f"2. Follow the `prompt_template` to do the reasoning\n"
+                f"3. Format your results according to `result_schema`\n"
+                f"4. POST the results to `{summary.get('result_endpoint', '')}`\n\n"
+                f"```json\n{passthrough_msg[:50000]}\n```"
+            )
+            self.store.append_message(session.id, "assistant", response, turn_id=turn.id, metadata={"run_id": run_id, "capability_id": capability.id, "passthrough": True})
+            self._response(session.id, turn.id, response)
+            self.store.update_turn(turn.id, status=TurnStatus.COMPLETED, completed=True)
+            self._event(session.id, "agent.turn_completed", {"turn_id": turn.id, "status": "completed", "run_id": run_id, "capability_id": capability.id, "passthrough": True})
+            return
+
         artifacts = self.container.repository.artifacts_for_run(run_id)
         for artifact in artifacts:
             self.store.link_artifact(session.id, artifact.id, turn.id)
@@ -236,6 +256,29 @@ class AgentRuntime:
 
     async def _run_scientific(self, capability_id: str, session: AgentSession, message: str) -> tuple[str, dict[str, Any]]:
         repository = self.container.repository
+
+        # --- Provider pre-checks ---
+        _provider_checks = {
+            "study_search": (ModelRole.LITERATURE_EXTRACTION, ModelRole.RESEARCH_REASONING),
+            "literature_review": (ModelRole.RESEARCH_REASONING, ModelRole.SCIENTIFIC_CRITIC),
+            "novelty_generation": (ModelRole.RESEARCH_REASONING, ModelRole.SCIENTIFIC_CRITIC),
+            "experiment_design": (ModelRole.EXPERIMENT_PLANNING,),
+            "experiment_execution_local": (),
+        }
+        required_roles = _provider_checks.get(capability_id, ())
+        passthrough = False
+        missing_roles: list[str] = []
+        for role in required_roles:
+            if role not in self.container.router.assignments:
+                missing_roles.append(role.value)
+        if missing_roles and capability_id in {"literature_review", "novelty_generation", "experiment_design"}:
+            passthrough = True
+        elif missing_roles:
+            raise ValueError(
+                f"provider_missing: No provider for roles: {', '.join(missing_roles)}. "
+                f"Run 'autoresearch setup --provider-config PATH' with a secret-free TOML."
+            )
+
         if capability_id == "study_search":
             seed = message.strip()
             if not seed:
@@ -246,36 +289,227 @@ class AgentRuntime:
             self._event(session.id, "agent.tool_progress", {"run_id": run.id, "stage": "study_search", "status": "running"})
             outcome = await self.container.discovery._execute(session.project_id, run.id, self.container.discovery.parser.parse_seed(seed), limit=limit, since_year=None, max_runtime_seconds=None)
             return run.id, asdict(outcome)
+
+        if capability_id == "local_import":
+            catalog_path = self._extract_path(message)
+            if not catalog_path:
+                raise ValueError("required_input_missing: specify a catalog path, e.g. '--from-catalog /path/to/paper_catalog.json'")
+            outcome = await self.container.discovery.import_catalog(Path(catalog_path))
+            return outcome.run_id, asdict(outcome)
+
         if capability_id == "literature_review":
-            if not repository.list_papers(session.project_id):
-                raise ValueError("required_input_missing: no paper set exists; run Study Search first")
+            papers = repository.list_papers(session.project_id)
+            if not papers:
+                raise ValueError(
+                    "required_input_missing: no paper set exists in this project. "
+                    "Run one of: (a) 'discover --seed-paper <DOI>' for external search, "
+                    "(b) 'discover --from-catalog <path>' to import a local paper_catalog.json, "
+                    "or (c) use 'agent --mode review --project <project_id>' to reference an existing discover project."
+                )
             top_k = _requested_count(message, default=5, maximum=15)
             run = repository.create_run(session.project_id, PipelineKind.REVIEW, {"top_k": top_k, "hierarchical": True, "max_cost_usd": None, "max_runtime_seconds": None})
             self.store.update_session(session.id, active_run_id=run.id)
+
+            if passthrough:
+                return self._passthrough_review(session, run, papers, top_k, message)
+
             outcome = await self.container.review._execute(run.id, session.project_id, top_k=top_k, hierarchical=True, max_runtime_seconds=None)
             return run.id, {**asdict(outcome), "gap": dataclass_payload(outcome.gap)}
+
         if capability_id == "novelty_generation":
             gaps = repository.rows("SELECT id,confidence,statement FROM research_gaps WHERE project_id=? ORDER BY confidence DESC", (session.project_id,))
+            if not gaps:
+                raise ValueError(
+                    "required_input_missing: no research gap exists in this project. "
+                    "Run 'review' first to generate a gap from the paper set, or import a gap "
+                    "via the NoveltyService.import_gap method."
+                )
             gap_id = _mentioned_id(message, gaps) or _resolve_artifact(gaps, message, "research gap")
             run = repository.create_run(session.project_id, PipelineKind.NOVELTY, {"gap_id": gap_id})
             self.store.update_session(session.id, active_run_id=run.id)
+
+            if passthrough:
+                return self._passthrough_novelty(session, run, gaps, gap_id, message)
+
             portfolio_id = await self.container.novelty.generate_portfolio(session.project_id, gap_id=gap_id, run_id=run.id)
             repository.finish_run(run.id)
             portfolio = repository.get_novelty_portfolio(run.id)
             return run.id, {"portfolio_id": portfolio_id, "portfolio": dataclass_payload(portfolio) if portfolio else None, "novelty_status": "potentially novel; expert review required"}
+
         if capability_id in {"experiment_design", "experiment_execution_local"}:
             candidates = repository.rows("SELECT id,method,status FROM novelty_candidates WHERE project_id=? ORDER BY rowid DESC", (session.project_id,))
+            if not candidates:
+                raise ValueError(
+                    "required_input_missing: no novelty candidate exists in this project. "
+                    "Run 'novelty' first to generate candidates from a gap, or import a candidate "
+                    "via the ExperimentService.import_candidate method."
+                )
             candidate_id = _mentioned_id(message, candidates) or _resolve_artifact(candidates, message, "novelty candidate")
             mode = "execute" if capability_id == "experiment_execution_local" else "plan"
             run = repository.create_run(session.project_id, PipelineKind.EXPERIMENT, {"candidate_id": candidate_id, "mode": mode})
             self.store.update_session(session.id, active_run_id=run.id)
+
+            if passthrough and mode == "plan":
+                return self._passthrough_experiment(session, run, candidates, candidate_id, message)
+
             spec_id = await self.container.experiment.execute_candidate(candidate_id, run_id=run.id, mode=mode)
             repository.finish_run(run.id)
             preview = self.container.experiment.approval_preview_for_candidate(candidate_id)
             return run.id, {"spec_id": spec_id, "candidate_id": candidate_id, "mode": mode, "approval": preview if mode == "plan" else {"checksum": preview["checksum"], "executed": True}}
+
         if capability_id == "result_conditioned_reinvention":
             raise ValueError("capability_unavailable: Reinvention pipeline is not implemented in the Python backend")
         raise ValueError(f"capability_unavailable: unsupported scientific capability '{capability_id}'")
+
+    def _passthrough_review(self, session: AgentSession, run, papers, top_k: int, message: str) -> tuple[str, dict[str, Any]]:
+        """Return structured paper data for Claude Code to review (no backend LLM needed)."""
+        paper_data = []
+        for p in papers[:max(top_k * 3, 15)]:
+            paper_data.append({
+                "id": p.id, "title": p.title, "abstract": p.abstract[:3000] if p.abstract else "",
+                "authors": list(p.authors), "year": p.year, "venue": p.venue,
+                "doi": p.doi, "url": p.url,
+            })
+        return run.id, {
+            "passthrough": True,
+            "capability": "literature_review",
+            "session_id": session.id,
+            "run_id": run.id,
+            "project_id": session.project_id,
+            "top_k": top_k,
+            "papers": paper_data,
+            "paper_count": len(paper_data),
+            "total_papers": len(papers),
+            "user_request": message,
+            "prompt_template": (
+                "You are conducting a deep literature review. Review the provided papers "
+                "in the context of the user's research request. For each paper:\n"
+                "1. Extract the key method/architecture and its empirical claims\n"
+                "2. Identify limitations and failure modes\n"
+                "3. Assess relevance to the user's research question\n\n"
+                "Then rank the top papers and identify ONE precise research gap:\n"
+                "- gap_statement: what specific problem remains unsolved\n"
+                "- supporting_paper_ids: which papers support this gap\n"
+                "- why_existing_work_does_not_solve_it: explanation\n"
+                "- missing_experiment: what experiment would address this gap\n"
+                "- falsification_test: how to prove the hypothesis wrong\n"
+                "- confidence: 0.0-1.0\n\n"
+                "Return results as JSON with: reviews[], ranked_paper_ids[], and gap{}."
+            ),
+            "result_schema": {
+                "type": "object",
+                "properties": {
+                    "reviews": {"type": "array", "items": {
+                        "type": "object", "properties": {
+                            "paper_id": {"type": "string"}, "method": {"type": "string"},
+                            "strengths": {"type": "array", "items": {"type": "string"}},
+                            "limitations": {"type": "array", "items": {"type": "string"}},
+                            "relevance_score": {"type": "number"},
+                        }, "required": ["paper_id", "method"]
+                    }},
+                    "ranked_paper_ids": {"type": "array", "items": {"type": "string"}},
+                    "gap": {"type": "object", "properties": {
+                        "gap_statement": {"type": "string"},
+                        "supporting_paper_ids": {"type": "array", "items": {"type": "string"}},
+                        "why_existing_work_does_not_solve_it": {"type": "string"},
+                        "missing_experiment": {"type": "string"},
+                        "falsification_test": {"type": "string"},
+                        "confidence": {"type": "number"},
+                    }, "required": ["gap_statement", "why_existing_work_does_not_solve_it"]},
+                },
+            },
+            "result_endpoint": f"/v1/agent/sessions/{session.id}/passthrough-result",
+            "next_step": "POST the review results as JSON to the result_endpoint above.",
+        }
+
+    def _passthrough_novelty(self, session: AgentSession, run, gaps, gap_id: str, message: str) -> tuple[str, dict[str, Any]]:
+        """Return gap data for Claude Code to generate novelty candidates."""
+        gap_row = next((g for g in gaps if g["id"] == gap_id), gaps[0])
+        return run.id, {
+            "passthrough": True,
+            "capability": "novelty_generation",
+            "session_id": session.id,
+            "run_id": run.id,
+            "project_id": session.project_id,
+            "gap": {
+                "id": str(gap_row["id"]),
+                "statement": str(gap_row["statement"]),
+                "confidence": float(gap_row.get("confidence", 0.5)),
+            },
+            "user_request": message,
+            "prompt_template": (
+                "You are generating novelty candidates for a research gap. "
+                "Given the gap statement, propose 2-4 novel approaches that address it. "
+                "For each candidate:\n"
+                "1. method: a clear name for the approach\n"
+                "2. description: how it works (2-3 sentences)\n"
+                "3. mechanism: the key technical innovation\n"
+                "4. why_novel: why existing work doesn't do this\n"
+                "5. feasibility: high/medium/low\n\n"
+                "Return results as JSON with: candidates[]."
+            ),
+            "result_schema": {
+                "type": "object",
+                "properties": {
+                    "candidates": {"type": "array", "items": {
+                        "type": "object", "properties": {
+                            "method": {"type": "string"}, "description": {"type": "string"},
+                            "mechanism": {"type": "string"}, "why_novel": {"type": "string"},
+                            "feasibility": {"type": "string"},
+                        }, "required": ["method", "description", "mechanism"]
+                    }},
+                },
+            },
+            "result_endpoint": f"/v1/agent/sessions/{session.id}/passthrough-result",
+            "next_step": "POST the novelty candidates as JSON to the result_endpoint above.",
+        }
+
+    def _passthrough_experiment(self, session: AgentSession, run, candidates, candidate_id: str, message: str) -> tuple[str, dict[str, Any]]:
+        """Return candidate data for Claude Code to design experiments."""
+        cand_row = next((c for c in candidates if c["id"] == candidate_id), candidates[0])
+        return run.id, {
+            "passthrough": True,
+            "capability": "experiment_design",
+            "session_id": session.id,
+            "run_id": run.id,
+            "project_id": session.project_id,
+            "candidate": {
+                "id": str(cand_row["id"]),
+                "method": str(cand_row["method"]),
+                "status": str(cand_row.get("status", "proposed")),
+            },
+            "user_request": message,
+            "prompt_template": (
+                "You are designing a scientific experiment to validate a novelty candidate. "
+                "Given the candidate method, design a falsifiable experiment:\n"
+                "1. hypothesis: the claim being tested\n"
+                "2. independent_variables: what you vary\n"
+                "3. dependent_variables: what you measure\n"
+                "4. baselines: methods to compare against\n"
+                "5. datasets: evaluation datasets\n"
+                "6. metrics: quantitative measures\n"
+                "7. expected_outcome: what result would validate the hypothesis\n"
+                "8. falsification: what result would disprove it\n\n"
+                "Return results as JSON with: experiment_spec{}."
+            ),
+            "result_schema": {
+                "type": "object",
+                "properties": {
+                    "experiment_spec": {"type": "object", "properties": {
+                        "hypothesis": {"type": "string"},
+                        "independent_variables": {"type": "array", "items": {"type": "string"}},
+                        "dependent_variables": {"type": "array", "items": {"type": "string"}},
+                        "baselines": {"type": "array", "items": {"type": "string"}},
+                        "datasets": {"type": "array", "items": {"type": "string"}},
+                        "metrics": {"type": "array", "items": {"type": "string"}},
+                        "expected_outcome": {"type": "string"},
+                        "falsification": {"type": "string"},
+                    }, "required": ["hypothesis", "baselines", "metrics"]},
+                },
+            },
+            "result_endpoint": f"/v1/agent/sessions/{session.id}/passthrough-result",
+            "next_step": "POST the experiment spec as JSON to the result_endpoint above.",
+        }
 
     async def _scientific_response(self, turn: AgentTurn, session: AgentSession, name: str, summary: dict[str, Any], artifacts: list[Any]) -> str:
         current = self.store.require_turn(turn.id)
@@ -383,6 +617,20 @@ def _resolve_artifact(rows: list[dict[str, Any]], message: str, label: str) -> s
         return str(rows[0]["id"])
     choices = [{key: value for key, value in row.items() if key in {"id", "statement", "method", "confidence", "status"}} for row in rows[:10]]
     raise ValueError(f"ambiguous_artifact: choose one {label}: {json.dumps(choices, ensure_ascii=False)}")
+
+
+def _extract_path(message: str) -> str | None:
+    """Extract a filesystem path from a message that may contain --from-catalog or similar."""
+    import shlex
+    # Try to find --from-catalog PATH pattern
+    match = re.search(r"(?:--from-catalog|--catalog|--catalog-path)\s+(\S+)", message)
+    if match:
+        return match.group(1).strip("'\"")
+    # Try to find a bare path that looks like a catalog file
+    match = re.search(r"(\S+\.json)\b", message)
+    if match and "paper_catalog" in match.group(1).lower():
+        return match.group(1).strip("'\"")
+    return None
 
 
 def _error_code(exc: Exception) -> str:

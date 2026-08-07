@@ -1,4 +1,6 @@
-"""Strict, evidence-backed per-paper structured review."""
+"""Strict, evidence-backed per-paper structured review.
+Now with multi-perspective extraction: each paper reviewed from 3 angles
+(rigor, reproducibility, and novelty) with aggregated output."""
 
 from __future__ import annotations
 
@@ -12,7 +14,7 @@ from autoresearch.ingestion.chunking import DocumentChunk
 from autoresearch.providers.capabilities import ModelRole
 from autoresearch.providers.router import ModelRouter
 
-REVIEW_PROMPT_VERSION = "paper-review-v1"
+REVIEW_PROMPT_VERSION = "paper-review-v2"
 HIERARCHICAL_REVIEW_PROMPT_VERSION = "paper-review-hierarchical-v1"
 _STRING_ARRAY = {"type": "array", "items": {"type": "string"}}
 REVIEW_SCHEMA = {
@@ -49,6 +51,13 @@ REVIEW_SCHEMA = {
     "additionalProperties": False,
 }
 
+# Perspective-specific system prompts for multi-angle review
+_PERSPECTIVE_PROMPTS = {
+    "rigor": "Act as a rigorous scientific reviewer focused on experimental rigor. Scrutinize the methodology, statistical validity, and reproducibility. Every evidence item must quote an exact contiguous excerpt from the supplied source. Do not infer missing results.",
+    "reproducibility": "Act as a reproducibility auditor. Focus on whether the methods, datasets, and evaluation protocols are sufficiently detailed to reproduce. Flag missing details, ambiguous configurations, and incomplete ablations. Every evidence item must quote an exact contiguous excerpt from the supplied source.",
+    "novelty": "Act as a novelty-focused reviewer. Assess what is genuinely new compared to prior work, what the key technical contribution is, and whether the claimed novelty is substantiated. Every evidence item must quote an exact contiguous excerpt from the supplied source.",
+}
+
 
 @dataclass(frozen=True)
 class ReviewBundle:
@@ -66,29 +75,42 @@ class PaperReviewExtractor:
             source_text = fallback_text or paper.abstract
         if not source_text.strip():
             raise ValueError(f"Paper '{paper.title}' has neither extractable PDF text nor abstract metadata.")
+
         if not hierarchical or len(source_text) <= 40_000:
-            return await self._extract_source(paper, run_id=run_id, source_text=source_text, prompt_version=REVIEW_PROMPT_VERSION, operation="paper_review")
+            # Multi-perspective extraction: review from 3 angles and aggregate
+            return await self._multi_perspective_extract(paper, run_id=run_id, source_text=source_text)
 
         groups = _source_groups(chunks, max_characters=35_000)
         if not groups:
             groups = (source_text,)
         leaves = [
-            await self._extract_source(
-                paper,
-                run_id=run_id,
-                source_text=group,
-                prompt_version=HIERARCHICAL_REVIEW_PROMPT_VERSION,
-                operation=f"paper_review_leaf_{index}",
+            await self._multi_perspective_extract(
+                paper, run_id=run_id, source_text=group,
             )
-            for index, group in enumerate(groups, start=1)
+            for group in groups
         ]
         return self._merge_leaves(paper, run_id, leaves)
 
-    async def _extract_source(self, paper: PaperRecord, *, run_id: str, source_text: str, prompt_version: str, operation: str) -> ReviewBundle:
+    async def _multi_perspective_extract(self, paper: PaperRecord, *, run_id: str, source_text: str) -> ReviewBundle:
+        """Extract reviews from 3 perspectives and aggregate the best elements."""
+        bundles = []
+        for perspective, system_prompt in _PERSPECTIVE_PROMPTS.items():
+            bundle = await self._extract_source(
+                paper, run_id=run_id, source_text=source_text,
+                prompt_version=f"{REVIEW_PROMPT_VERSION}-{perspective}",
+                operation=f"paper_review_{perspective}",
+                system_prompt=system_prompt,
+            )
+            bundles.append(bundle)
+
+        return self._merge_perspectives(paper, run_id, bundles)
+
+    async def _extract_source(self, paper: PaperRecord, *, run_id: str, source_text: str, prompt_version: str, operation: str, system_prompt: str | None = None) -> ReviewBundle:
+        system = system_prompt or "Act as a rigorous scientific reviewer. Every evidence item must quote an exact contiguous excerpt from the supplied source. Do not infer missing results."
         payload = await self.router.structured_output(
             ModelRole.LITERATURE_EXTRACTION,
             messages=[
-                {"role": "system", "content": "Act as a rigorous scientific reviewer. Every evidence item must quote an exact contiguous excerpt from the supplied source. Do not infer missing results."},
+                {"role": "system", "content": system},
                 {"role": "user", "content": f"Prompt version: {prompt_version}\nPaper ID: {paper.id}\nTitle: {paper.title}\n\nSOURCE:\n{source_text[:100_000]}\n\nReturn one object with problem, research_question, method, datasets[], experimental_protocol, results[], ablations[], limitations[], failure_modes[], confidence, and evidence_spans[]. Each evidence span requires claim_type, statement, excerpt, page, section, confidence."},
             ],
             schema={"name": "paper_review", "schema": REVIEW_SCHEMA},
@@ -112,10 +134,30 @@ class PaperReviewExtractor:
         review = PaperReview(uuid4().hex, paper.project_id, run_id, paper.id, review_content["problem"], review_content["research_question"], review_content["method"], review_content["datasets"], review_content["experimental_protocol"], review_content["results"], review_content["ablations"], review_content["limitations"], review_content["failure_modes"], review_content["evidence_claim_ids"], review_content["confidence"], provenance)
         return ReviewBundle(review, claims)
 
-    def _merge_leaves(self, paper: PaperRecord, run_id: str, leaves: list[ReviewBundle]) -> ReviewBundle:
-        claims = tuple(claim for leaf in leaves for claim in leaf.claims)
-        reviews = [leaf.review for leaf in leaves]
+    def _merge_perspectives(self, paper: PaperRecord, run_id: str, bundles: list[ReviewBundle]) -> ReviewBundle:
+        """Merge multi-perspective reviews by taking the union of all claims and the longest/best fields."""
+        if not bundles:
+            raise ValueError("No review bundles to merge.")
+        if len(bundles) == 1:
+            return bundles[0]
+
+        all_claims = tuple(claim for bundle in bundles for claim in bundle.claims)
+        reviews = [bundle.review for bundle in bundles]
         provider, model = self.router.identity(ModelRole.LITERATURE_EXTRACTION)
+
+        # Union all claims, deduplicating by evidence content so the same
+        # source excerpt is counted once regardless of how many perspectives
+        # surfaced it. Fresh per-perspective claim IDs are not a uniqueness key.
+        merged_claims: list[EvidenceClaim] = []
+        seen_evidence: set[tuple[str, str, str]] = set()
+        for claim in all_claims:
+            key = (_normalize(claim.statement), _normalize(claim.excerpt), claim.section or "")
+            if key in seen_evidence:
+                continue
+            seen_evidence.add(key)
+            merged_claims.append(claim)
+        merged_claim_ids = [claim.id for claim in merged_claims]
+
         content = {
             "problem": _longest(review.problem for review in reviews),
             "research_question": _longest(review.research_question for review in reviews),
@@ -126,25 +168,28 @@ class PaperReviewExtractor:
             "ablations": _unique(item for review in reviews for item in review.ablations),
             "limitations": _unique(item for review in reviews for item in review.limitations),
             "failure_modes": _unique(item for review in reviews for item in review.failure_modes),
-            "evidence_claim_ids": tuple(claim.id for claim in claims),
+            "evidence_claim_ids": tuple(merged_claim_ids),
             "confidence": round(sum(review.confidence for review in reviews) / len(reviews), 6),
         }
         provenance = ArtifactProvenance.create(
-            project_id=paper.project_id,
-            run_id=run_id,
+            project_id=paper.project_id, run_id=run_id,
             source_evidence=content["evidence_claim_ids"],
-            provider=provider,
-            model=model,
-            prompt_version=HIERARCHICAL_REVIEW_PROMPT_VERSION,
-            content=content,
+            provider=provider, model=model,
+            prompt_version=f"{REVIEW_PROMPT_VERSION}-multi-perspective",
+            content={**content, "perspectives": [r.provenance.prompt_version for r in reviews]},
         )
         review = PaperReview(
-            uuid4().hex, paper.project_id, run_id, paper.id, content["problem"], content["research_question"],
-            content["method"], content["datasets"], content["experimental_protocol"], content["results"],
-            content["ablations"], content["limitations"], content["failure_modes"], content["evidence_claim_ids"],
+            uuid4().hex, paper.project_id, run_id, paper.id, content["problem"],
+            content["research_question"], content["method"], content["datasets"],
+            content["experimental_protocol"], content["results"], content["ablations"],
+            content["limitations"], content["failure_modes"], content["evidence_claim_ids"],
             content["confidence"], provenance,
         )
-        return ReviewBundle(review, claims)
+        return ReviewBundle(review, tuple(merged_claims))
+
+    def _merge_leaves(self, paper: PaperRecord, run_id: str, leaves: list[ReviewBundle]) -> ReviewBundle:
+        """Merge hierarchical chunks (for long PDFs) - same logic but chunks are page groups."""
+        return self._merge_perspectives(paper, run_id, leaves)
 
     @staticmethod
     def _claims(value: object, paper: PaperRecord, run_id: str, source_text: str, provider: str, model: str, prompt_version: str = REVIEW_PROMPT_VERSION) -> tuple[EvidenceClaim, ...]:

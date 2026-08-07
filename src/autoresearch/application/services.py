@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Sequence
 from uuid import uuid4
 
-from autoresearch.domain.models import ArtifactProvenance, ArtifactReference, DownloadStatus, GapClassification, PipelineKind, ResearchGap, RunStatus, SeedPaper, ExperimentSpec, content_checksum, utc_now
+from autoresearch.domain.models import ArtifactProvenance, ArtifactReference, CandidateStatus, DownloadStatus, GapClassification, NoveltyCandidate, PaperRecord, PipelineKind, PriorArtStatus, ResearchGap, RunStatus, SeedPaper, ExperimentSpec, content_checksum, utc_now
 from autoresearch.ingestion.chunking import DocumentChunk, chunk_document
 from autoresearch.ingestion.document_parser import DocumentParser, ParsedDocument, ParsedPage
 from autoresearch.ingestion.extraction import SEED_PROMPT_VERSION, SeedAnalysis, SeedAnalyzer
@@ -120,6 +120,85 @@ class DiscoveryService:
         self.parser = parser or DocumentParser()
         self.seed_analyzer = SeedAnalyzer(router)
         self.strategy_generator = SearchStrategyGenerator(router)
+
+    async def import_catalog(
+        self,
+        catalog_path: Path,
+        *,
+        project_title: str | None = None,
+    ) -> DiscoveryOutcome:
+        """Import papers from a local JSON catalog without external API calls."""
+        catalog_path = catalog_path.expanduser().resolve()
+        if not catalog_path.is_file():
+            raise ValueError(f"Catalog file not found: {catalog_path}")
+        with open(catalog_path, encoding="utf-8") as handle:
+            catalog = json.load(handle)
+        if not isinstance(catalog, list):
+            raise ValueError("Catalog must be a JSON array of paper entries.")
+        title = project_title or f"Local catalog: {catalog_path.name}"
+        project = self.repository.create_project(title)
+        run = self.repository.create_run(project.id, PipelineKind.DISCOVERY, {
+            "seed_input": str(catalog_path), "limit": len(catalog), "since_year": None,
+            "max_cost_usd": None, "max_runtime_seconds": None,
+            "source": "local_catalog",
+        })
+        papers: list[PaperRecord] = []
+        skipped = 0
+        for entry in catalog:
+            if not isinstance(entry, dict):
+                skipped += 1
+                continue
+            paper_id = str(entry.get("id") or uuid4().hex)
+            title_text = " ".join(str(entry.get("title") or "").split())
+            if not title_text:
+                skipped += 1
+                continue
+            authors_raw = entry.get("authors")
+            if isinstance(authors_raw, str) and authors_raw.strip():
+                authors = tuple(a.strip() for a in authors_raw.split(",") if a.strip())
+            elif isinstance(authors_raw, list):
+                authors = tuple(str(a) for a in authors_raw if str(a).strip())
+            else:
+                authors = ()
+            year = None
+            raw_year = entry.get("year")
+            if raw_year is not None:
+                try:
+                    year = int(raw_year)
+                except (TypeError, ValueError):
+                    pass
+            doi = str(entry.get("doi") or "").strip() or None
+            venue = str(entry.get("venue") or "").strip()
+            abstract = str(entry.get("abstract") or entry.get("raw_text") or "").strip()
+            url = str(entry.get("pdf_url") or entry.get("url") or "").strip() or None
+            source_names = ("local_catalog",)
+            checksum = content_checksum(f"{paper_id}|{title_text}|{abstract[:200]}")
+            paper = PaperRecord(
+                id=paper_id, project_id=project.id, run_id=run.id,
+                title=title_text, abstract=abstract, authors=authors,
+                year=year, publication_date=None, doi=doi, arxiv_id=None,
+                url=url, source_names=source_names,
+                open_access_pdf_url=url, is_open_access=bool(url),
+                citation_count=0, venue=venue, checksum=checksum,
+            )
+            papers.append(paper)
+        if not papers:
+            raise ValueError("No valid paper entries found in catalog.")
+        imported = self.repository.import_papers_batch(papers)
+        self.repository.finish_run(run.id)
+        artifact_path = str(self.repository.artifact_root / project.id / run.id / "catalog_import.json")
+        Path(artifact_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(artifact_path).write_text(json.dumps({
+            "project_id": project.id, "run_id": run.id,
+            "catalog_path": str(catalog_path), "entries": len(catalog),
+            "imported": imported, "skipped": skipped,
+        }, indent=2, ensure_ascii=False), encoding="utf-8")
+        return DiscoveryOutcome(
+            project_id=project.id, run_id=run.id,
+            requested=len(catalog), retrieved=imported,
+            downloaded=0, unavailable=0, rejected=skipped, failed=0,
+            artifact_path=artifact_path,
+        )
 
     async def discover(
         self,
@@ -507,6 +586,37 @@ class NoveltyService:
             selector=PortfolioSelector(repository),
         )
 
+    async def import_gap(self, project_id: str, gap_data: dict[str, Any]) -> ResearchGap:
+        """Import a research gap from external data (e.g., from a prior literature review)."""
+        statement = " ".join(str(gap_data.get("statement") or gap_data.get("gap_statement") or "").split())
+        if not statement:
+            raise ValueError("Gap data must include a 'statement' or 'gap_statement' field.")
+        why_unsolved = " ".join(str(gap_data.get("why_unsolved") or gap_data.get("why_existing_work_does_not_solve_it") or "").split())
+        missing_experiment = " ".join(str(gap_data.get("missing_experiment") or "").split())
+        falsification_test = " ".join(str(gap_data.get("falsification_test") or "").split())
+        confidence = float(gap_data.get("confidence", 0.5))
+        classification = GapClassification.EVIDENCE_SUPPORTED if gap_data.get("supporting_paper_ids") else GapClassification.HYPOTHESIS
+        provenance = ArtifactProvenance.create(
+            project_id=project_id, run_id="imported",
+            source_evidence=(), provider="manual_import", model="user",
+            prompt_version="imported-gap-v1",
+            content={"statement": statement, "why_unsolved": why_unsolved,
+                     "missing_experiment": missing_experiment,
+                     "falsification_test": falsification_test},
+        )
+        gap = ResearchGap(
+            id=uuid4().hex, project_id=project_id, run_id="imported",
+            statement=statement,
+            supporting_paper_ids=tuple(str(p) for p in (gap_data.get("supporting_paper_ids") or [])),
+            supporting_claim_ids=tuple(str(c) for c in (gap_data.get("supporting_claim_ids") or [])),
+            why_unsolved=why_unsolved, missing_experiment=missing_experiment,
+            falsification_test=falsification_test, confidence=confidence,
+            counter_evidence_claim_ids=(), classification=classification,
+            provenance=provenance,
+        )
+        self.repository.save_gap(gap)
+        return gap
+
     async def generate_portfolio(self, project_id: str, *, gap_id: str | None = None, run_id: str | None = None) -> str:
         gap = self.repository.row("SELECT * FROM research_gaps WHERE project_id=? AND (? IS NULL OR id=?) ORDER BY confidence DESC LIMIT 1", (project_id, gap_id, gap_id))
         if not gap:
@@ -547,6 +657,35 @@ class ExperimentService:
             report_writer=ScientificReportWriter(router),
         )
         self.worker = worker
+
+    async def import_candidate(self, candidate_data: dict[str, Any]) -> NoveltyCandidate:
+        """Import a novelty candidate from external data (e.g., from a prior analysis)."""
+        from dataclasses import replace
+        method = " ".join(str(candidate_data.get("method") or candidate_data.get("title") or "").split())
+        if not method:
+            raise ValueError("Candidate data must include a 'method' or 'title' field.")
+        project_id = str(candidate_data.get("project_id") or "")
+        if not project_id:
+            raise ValueError("Candidate data must include a 'project_id' field.")
+        candidate = NoveltyCandidate(
+            id=uuid4().hex, project_id=project_id, run_id=candidate_data.get("run_id", "imported"),
+            method=method,
+            description=str(candidate_data.get("description") or ""),
+            mechanism=str(candidate_data.get("mechanism") or ""),
+            prior_art_status=PriorArtStatus.UNCHECKED,
+            status=CandidateStatus.PROPOSED,
+            prior_art_assessment=None, novelty_critique=None,
+            revisions=(), claim_ledger=None, portfolio_id=None,
+            evidence_claim_ids=(), gap_id=str(candidate_data.get("gap_id") or ""),
+            provenance=ArtifactProvenance.create(
+                project_id=project_id, run_id="imported",
+                source_evidence=(), provider="manual_import", model="user",
+                prompt_version="imported-candidate-v1",
+                content={"method": method},
+            ),
+        )
+        self.repository.save_novelty_candidate(candidate)
+        return candidate
 
     def action_plan(self, spec: ExperimentSpec) -> tuple[ExecutionAction, ...]:
         scripts = [item for item in spec.expected_outputs if str(item).endswith(".py")]
