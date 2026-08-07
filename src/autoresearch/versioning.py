@@ -5,7 +5,7 @@ from __future__ import annotations
 PRODUCT_VERSION = "0.1.0-alpha.1"
 API_VERSION = "2.0.0"
 CLI_VERSION = "0.1.0-alpha.1"
-DATABASE_SCHEMA_VERSION = 7
+DATABASE_SCHEMA_VERSION = 8
 WORKER_PROTOCOL_VERSION = "1.0.0"
 
 
