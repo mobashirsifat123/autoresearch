@@ -16,6 +16,7 @@ import typer
 from autoresearch.application.config import load_settings
 from autoresearch.application.factory import ApplicationContainer
 from autoresearch.application.audit import write_audit
+from autoresearch.cli.skills import skill_app
 from autoresearch.domain.models import PipelineKind
 from autoresearch.providers.redaction import redact, redact_text
 from autoresearch.release import (
@@ -379,6 +380,9 @@ def _run(operation: Any) -> None:
         typer.echo(json.dumps({"error": redact_text(str(exc)), "type": type(exc).__name__}, indent=2), err=True)
         raise typer.Exit(1) from exc
     typer.echo(json.dumps(asdict(result) if hasattr(result, "__dataclass_fields__") else result, indent=2, default=str))
+
+
+app.add_typer(skill_app)
 
 
 def main() -> None:

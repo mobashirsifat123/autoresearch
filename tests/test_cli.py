@@ -29,7 +29,21 @@ def test_product_commands_are_exposed_without_raw_secret_input():
 
 def test_claude_code_research_skills_are_available():
     root = Path(__file__).resolve().parents[1]
-    for name in ("review", "novelty", "experiment"):
-        content = (root / ".claude" / "skills" / name / "SKILL.md").read_text(encoding="utf-8")
-        assert f"--mode {name}" in content
-        assert "provider keys stay in the backend environment" in content.lower()
+    canonical = root / "claude-skills"
+    expected = {"deep-research": "deep-research", "novelty": "novelty", "experiment": "experiment"}
+    for name, command in expected.items():
+        content = (canonical / name / "SKILL.md").read_text(encoding="utf-8")
+        # Bridge skills call the stable skill CLI, never the conversational agent.
+        assert "agent --mode" not in content
+        assert "skill " + command in content
+        assert "Exit codes" in content
+
+
+def test_no_divergent_skill_copies_remain():
+    root = Path(__file__).resolve().parents[1]
+    repo_copies = root / ".claude" / "skills"
+    assert not (repo_copies / "deep-research").exists()
+    assert not (repo_copies / "novelty").exists()
+    assert not (repo_copies / "experiment").exists()
+    user_copies = Path.home() / ".claude" / "skills"
+    assert not (user_copies / "review").exists(), "divergent review skill must be removed"
