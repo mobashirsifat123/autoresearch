@@ -204,7 +204,7 @@ class GapAnalyzer:
         cluster_summary = ""
         if limitation_clusters:
             cluster_summary = "\n".join(
-                f"- Theme '{c['theme']}' (appears in {c['frequency']} papers): {c['description']}"
+                f"- Theme '{c.get('theme', 'unlabeled')}' (appears in {c.get('n', c.get('frequency', 0))} papers): {c.get('description', '')}"
                 for c in limitation_clusters
             )
         candidates_text = "\n\n---\n\n".join(

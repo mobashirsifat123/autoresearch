@@ -5,6 +5,7 @@ and power analysis."""
 from __future__ import annotations
 
 import math
+from pathlib import Path
 from uuid import uuid4
 
 from autoresearch.domain.models import (
@@ -84,6 +85,40 @@ SPEC_SELECTION_SCHEMA = {
 
 PROMPT_VERSION = "experiment-planner-v2"
 
+# json_object mode drops the schema, so the prompt must enumerate the contract.
+_FIELD_CONTRACT = (
+    "Return ONLY a JSON object with exactly these keys:\n"
+    "- hypothesis: string\n"
+    "- causal_mechanism: string\n"
+    "- falsification_condition: string\n"
+    "- repository: string\n"
+    "- baseline_commit: string\n"
+    "- dataset_identity: string\n"
+    "- dataset_checksum: string\n"
+    "- split_definition: string\n"
+    "- baseline_configuration: string\n"
+    "- proposed_change: string\n"
+    "- independent_variables: array of strings\n"
+    "- controlled_variables: array of strings\n"
+    "- metrics: array of strings\n"
+    "- random_seeds: array of integers\n"
+    "- ablations: array of strings\n"
+    "- robustness_tests: array of strings\n"
+    "- statistical_plan: string\n"
+    "- compute_budget: string\n"
+    "- stopping_conditions: array of strings\n"
+    "- expected_outputs: array of strings\n"
+    "- artifact_contract: string\n"
+    "- metric_direction: object mapping metric name to 'maximize' or 'minimize'\n"
+    "- minimum_meaningful_effect: object mapping metric name to a number\n"
+    "- required_seed_count: integer\n"
+    "- network_policy: 'disabled' or 'allowlisted'\n"
+    "- target_worker: string\n"
+    "- expected_effect_size: number (expected Cohen's d)\n"
+    "- power_target: number (0.5-0.99)\n"
+    "Every required key must be present with concrete, non-empty values. No other keys."
+)
+
 
 class ExperimentSpecGenerator:
     def __init__(self, router: ModelRouter) -> None:
@@ -128,13 +163,20 @@ class ExperimentSpecGenerator:
         required_seeds = selected.get("_required_seeds", 5)
         power_target = selected.get("power_target", 0.8)
 
+        # The repository is an execution target: never trust the LLM to invent
+        # it (it emits URLs and hallucinated paths). Default to the process CWD
+        # when the claimed path does not exist on disk.
+        repository = str(selected.get("repository") or "").strip()
+        if not repository or not Path(repository).expanduser().is_dir():
+            repository = str(Path.cwd().expanduser().resolve())
+
         return ExperimentSpec(
             id=uuid4().hex, project_id=candidate.project_id, run_id=candidate.run_id,
             candidate_id=candidate.id,
             hypothesis=selected.get("hypothesis", ""),
             causal_mechanism=selected.get("causal_mechanism", ""),
             falsification_condition=selected.get("falsification_condition", ""),
-            repository=selected.get("repository", ""),
+            repository=repository,
             baseline_commit=selected.get("baseline_commit", ""),
             dataset_identity=selected.get("dataset_identity", ""),
             dataset_checksum=selected.get("dataset_checksum", ""),
@@ -165,7 +207,7 @@ class ExperimentSpecGenerator:
         """Generate one experiment design with a specific focus."""
         messages = [
             {"role": "system", "content": f"You are a meticulous experimental designer. Focus: {focus}. Translate the proposed novelty candidate into a highly-detailed, reproducible experiment specification. Specify random seeds, ablations, exact stopping conditions, and effect size estimates."},
-            {"role": "user", "content": f"Candidate Method: {candidate.method}\nExpected Effect: {candidate.expected_effect}\nAblations: {candidate.required_ablations}\nObjections: {candidate.risks_and_objections}"}
+            {"role": "user", "content": f"Prompt version: {PROMPT_VERSION}\nCandidate Method: {candidate.method}\nExpected Effect: {candidate.expected_effect}\nAblations: {candidate.required_ablations}\nObjections: {candidate.risks_and_objections}\n\n{_FIELD_CONTRACT}"}
         ]
 
         payload = await self.router.structured_output(
@@ -180,7 +222,7 @@ class ExperimentSpecGenerator:
         """Generate an adversarial analysis: what would disprove the hypothesis."""
         messages = [
             {"role": "system", "content": "You are an adversarial reviewer whose job is to find what would disprove this experiment's hypothesis. Be thorough and concrete."},
-            {"role": "user", "content": f"Hypothesis: {design.get('hypothesis', '')}\nProposed Change: {design.get('proposed_change', '')}\nCandidate Method: {candidate.method}\nFalsification Condition: {candidate.falsification_condition}"}
+            {"role": "user", "content": f"Hypothesis: {design.get('hypothesis', '')}\nProposed Change: {design.get('proposed_change', '')}\nCandidate Method: {candidate.method}\nFalsification Condition: {candidate.falsification_condition}\n\nReturn ONLY a JSON object with exactly these keys:\n- what_would_disprove: string\n- confounding_factors: array of strings\n- minimal_viable_experiment: string\n- expected_null_outcome: string\n- failure_modes: array of strings\nEvery key must be present. No other keys."}
         ]
 
         payload = await self.router.structured_output(

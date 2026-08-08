@@ -59,6 +59,7 @@ def provider_config(name: str, raw: dict[str, Any]) -> ProviderConfig:
         requests_per_second=float(raw["requests_per_second"]) if raw.get("requests_per_second") is not None else None,
         embedding_dimension=int(raw["embedding_dimension"]) if raw.get("embedding_dimension") is not None else None,
         embedding_batch_size=int(raw.get("embedding_batch_size", 64)),
+        structured_output_mode=str(raw.get("structured_output_mode", "json_schema")),
         pricing=dict(raw.get("pricing") or {}),
     )
 

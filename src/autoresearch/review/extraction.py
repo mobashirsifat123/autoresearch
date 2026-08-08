@@ -51,12 +51,42 @@ REVIEW_SCHEMA = {
     "additionalProperties": False,
 }
 
+# Shared verbatim-quoting rule appended to every perspective prompt. Models
+# routinely paraphrase otherwise; evidence claims are rejected unless the
+# excerpt appears verbatim in the source, so compliance is mandatory.
+_VERBATIM_RULE = (
+    "Every evidence item MUST quote a single contiguous excerpt copied "
+    "character-for-character from the SOURCE text. Do not paraphrase, shorten, "
+    "or rephrase the excerpt. If you cannot find an exact verbatim quote in the "
+    "SOURCE, OMIT that evidence span entirely rather than approximating it."
+)
+
+_RIGOR_SYSTEM_PROMPT = (
+    "Act as a rigorous scientific reviewer. Every evidence item must quote an "
+    "exact contiguous excerpt from the supplied source. Do not infer missing "
+    "results. " + _VERBATIM_RULE
+)
+
 # Perspective-specific system prompts for multi-angle review
 _PERSPECTIVE_PROMPTS = {
-    "rigor": "Act as a rigorous scientific reviewer focused on experimental rigor. Scrutinize the methodology, statistical validity, and reproducibility. Every evidence item must quote an exact contiguous excerpt from the supplied source. Do not infer missing results.",
-    "reproducibility": "Act as a reproducibility auditor. Focus on whether the methods, datasets, and evaluation protocols are sufficiently detailed to reproduce. Flag missing details, ambiguous configurations, and incomplete ablations. Every evidence item must quote an exact contiguous excerpt from the supplied source.",
-    "novelty": "Act as a novelty-focused reviewer. Assess what is genuinely new compared to prior work, what the key technical contribution is, and whether the claimed novelty is substantiated. Every evidence item must quote an exact contiguous excerpt from the supplied source.",
+    "rigor": "Act as a rigorous scientific reviewer focused on experimental rigor. Scrutinize the methodology, statistical validity, and reproducibility. Do not infer missing results. " + _VERBATIM_RULE,
+    "reproducibility": "Act as a reproducibility auditor. Focus on whether the methods, datasets, and evaluation protocols are sufficiently detailed to reproduce. Flag missing details, ambiguous configurations, and incomplete ablations. " + _VERBATIM_RULE,
+    "novelty": "Act as a novelty-focused reviewer. Assess what is genuinely new compared to prior work, what the key technical contribution is, and whether the claimed novelty is substantiated. " + _VERBATIM_RULE,
 }
+
+_EXTRACTION_USER_TEMPLATE = (
+    "Prompt version: {prompt_version}\n"
+    "Paper ID: {paper_id}\n"
+    "Title: {paper_title}\n\n"
+    "SOURCE:\n{source}\n\n"
+    "Return one JSON object with problem, research_question, method, "
+    "datasets[], experimental_protocol, results[], ablations[], limitations[], "
+    "failure_modes[], confidence, and evidence_spans[]. Each evidence span "
+    "requires claim_type, statement, excerpt, page, section, confidence.\n\n"
+    "CRITICAL: every excerpt must be copied word-for-word from the SOURCE "
+    "above, including mathematical symbols. Omit any span you cannot quote "
+    "verbatim. Fewer verified spans are better than paraphrased ones."
+)
 
 
 @dataclass(frozen=True)
@@ -92,26 +122,40 @@ class PaperReviewExtractor:
         return self._merge_leaves(paper, run_id, leaves)
 
     async def _multi_perspective_extract(self, paper: PaperRecord, *, run_id: str, source_text: str) -> ReviewBundle:
-        """Extract reviews from 3 perspectives and aggregate the best elements."""
-        bundles = []
+        """Extract reviews from 3 perspectives and aggregate the best elements.
+
+        Perspectives are fault-tolerant: one perspective failing (e.g. a
+        provider JSON hiccup or a paper with no verbatim quote in that angle)
+        must not discard evidence the other perspectives produced. The paper
+        only fails when every perspective fails.
+        """
+        bundles: list[ReviewBundle] = []
+        first_error: Exception | None = None
         for perspective, system_prompt in _PERSPECTIVE_PROMPTS.items():
-            bundle = await self._extract_source(
-                paper, run_id=run_id, source_text=source_text,
-                prompt_version=f"{REVIEW_PROMPT_VERSION}-{perspective}",
-                operation=f"paper_review_{perspective}",
-                system_prompt=system_prompt,
-            )
+            try:
+                bundle = await self._extract_source(
+                    paper, run_id=run_id, source_text=source_text,
+                    prompt_version=f"{REVIEW_PROMPT_VERSION}-{perspective}",
+                    operation=f"paper_review_{perspective}",
+                    system_prompt=system_prompt,
+                )
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
+                continue
             bundles.append(bundle)
 
+        if not bundles:
+            raise first_error or ValueError(f"Paper '{paper.title}' yielded no evidence-backed review.")
         return self._merge_perspectives(paper, run_id, bundles)
 
     async def _extract_source(self, paper: PaperRecord, *, run_id: str, source_text: str, prompt_version: str, operation: str, system_prompt: str | None = None) -> ReviewBundle:
-        system = system_prompt or "Act as a rigorous scientific reviewer. Every evidence item must quote an exact contiguous excerpt from the supplied source. Do not infer missing results."
+        system = system_prompt or _RIGOR_SYSTEM_PROMPT
         payload = await self.router.structured_output(
             ModelRole.LITERATURE_EXTRACTION,
             messages=[
                 {"role": "system", "content": system},
-                {"role": "user", "content": f"Prompt version: {prompt_version}\nPaper ID: {paper.id}\nTitle: {paper.title}\n\nSOURCE:\n{source_text[:100_000]}\n\nReturn one object with problem, research_question, method, datasets[], experimental_protocol, results[], ablations[], limitations[], failure_modes[], confidence, and evidence_spans[]. Each evidence span requires claim_type, statement, excerpt, page, section, confidence."},
+                {"role": "user", "content": _EXTRACTION_USER_TEMPLATE.format(paper_id=paper.id, paper_title=paper.title, prompt_version=prompt_version, source=source_text[:100_000])},
             ],
             schema={"name": "paper_review", "schema": REVIEW_SCHEMA},
             project_id=paper.project_id,

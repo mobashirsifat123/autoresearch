@@ -307,6 +307,8 @@ def _classify(exc: Exception) -> tuple[str, int]:
         head = text.split(":", 1)[0].strip().lower()
         if re.fullmatch(r"[a-z][a-z0-9_]+", head):
             candidate = head
+    if candidate and candidate.endswith("_not_found"):
+        return candidate, EXIT_NOT_FOUND
     if candidate in _KNOWN_CODES:
         return candidate, _KNOWN_CODES[candidate]
     if candidate:
@@ -428,7 +430,7 @@ def skill_status(
         rows = c.repository.rows("SELECT id,title,created_at FROM projects ORDER BY created_at DESC")
         return {"projects": [_project_status(c, str(row["id"])) for row in rows[:20]]}
 
-    _invoke(operation, "skill/status")
+    _invoke(operation, operation_name="skill/status")
 
 
 def _project_status(c: ApplicationContainer, project_id: str) -> dict[str, Any]:
@@ -480,22 +482,24 @@ def deep_research(
     """Discover related papers, run a deep review, and surface one cited gap."""
 
     async def operation(c: ApplicationContainer) -> dict[str, Any]:
-        if project:
-            existing = c.repository.get_project(project)
+        project_id: str | None = project
+        if project_id:
+            existing = c.repository.get_project(project_id)
             if not existing:
-                raise ValueError(f"project_not_found: project '{project}' not found")
-            discovery_summary: dict[str, Any] = {"project_id": project, "used_existing": True}
+                raise ValueError(f"project_not_found: project '{project_id}' not found")
+            discovery_summary: dict[str, Any] = {"project_id": project_id, "used_existing": True}
         elif from_catalog:
             outcome = await c.discovery.import_catalog(from_catalog)
-            project = outcome.project_id
+            project_id = outcome.project_id
             discovery_summary = _discovery_summary(outcome)
         elif seed_paper:
             outcome = await c.discovery.discover(seed_paper, limit=limit, since_year=since_year)
-            project = outcome.project_id
+            project_id = outcome.project_id
             discovery_summary = _discovery_summary(outcome)
         else:
             raise ValueError("usage: provide --seed-paper, --from-catalog, or --project")
-        review = await c.review.review(project, top_k=top_k, hierarchical=hierarchical)
+        assert project_id is not None
+        review = await c.review.review(project_id, top_k=top_k, hierarchical=hierarchical)
         return {
             "project_id": review.project_id,
             "discovery": discovery_summary,
@@ -508,7 +512,7 @@ def deep_research(
             "markdown_report": review.markdown_report,
         }
 
-    _invoke(operation, "deep-research")
+    _invoke(operation, operation_name="deep-research")
 
 
 @skill_app.command("review")
@@ -532,7 +536,7 @@ def review(
             "markdown_report": outcome.markdown_report,
         }
 
-    _invoke(operation, "review")
+    _invoke(operation, operation_name="review")
 
 
 @skill_app.command("novelty")
@@ -564,7 +568,7 @@ def novelty(
             "high_risk_candidate_id": portfolio["high_risk_candidate_id"],
         }
 
-    _invoke(operation, "novelty")
+    _invoke(operation, operation_name="novelty")
 
 
 # --------------------------------------------------------------------------
@@ -612,7 +616,7 @@ def experiment_plan(
             "spec": _spec_summary(spec),
         }
 
-    _invoke(operation, "experiment/plan")
+    _invoke(operation, operation_name="experiment/plan")
 
 
 @experiment_app.command("validate")
@@ -635,7 +639,7 @@ def experiment_validate(
             "environment": _manifest_summary(manifest),
         }
 
-    _invoke(operation, "experiment/validate")
+    _invoke(operation, operation_name="experiment/validate")
 
 
 @experiment_app.command("approve")
@@ -676,7 +680,7 @@ def experiment_approve(
             "preview": _approval_preview(preview),
         }
 
-    _invoke(operation, "experiment/approve")
+    _invoke(operation, operation_name="experiment/approve")
 
 
 def _approval_preview(preview: dict[str, Any]) -> dict[str, Any]:
@@ -720,7 +724,7 @@ def experiment_execute(
             "jobs": jobs,
         }
 
-    _invoke(operation, "experiment/execute")
+    _invoke(operation, operation_name="experiment/execute")
 
 
 @experiment_app.command("inspect")
@@ -743,7 +747,7 @@ def experiment_inspect(
             "environment": _manifest_summary(manifest),
         }
 
-    _invoke(operation, "experiment/inspect")
+    _invoke(operation, operation_name="experiment/inspect")
 
 
 @experiment_app.command("report")
@@ -774,7 +778,7 @@ def experiment_report(
             "decision_evidence": report.decision_evidence,
         }
 
-    _invoke(operation, "experiment/report")
+    _invoke(operation, operation_name="experiment/report")
 
 
 @experiment_app.command("cancel")
@@ -790,7 +794,7 @@ def experiment_cancel(
         c.repository.cancel_run(run_id)
         return {"run_id": run_id, "status": "cancelled"}
 
-    _invoke(operation, "experiment/cancel")
+    _invoke(operation, operation_name="experiment/cancel")
 
 
 skill_app.add_typer(experiment_app)

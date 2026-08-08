@@ -23,6 +23,7 @@ class ProviderConfig:
     requests_per_second: float | None = None
     embedding_dimension: int | None = None
     embedding_batch_size: int = 64
+    structured_output_mode: str = "json_schema"
     pricing: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -34,6 +35,8 @@ class ProviderConfig:
             raise ValueError("Provider concurrency must be at least one.")
         if self.requests_per_second is not None and self.requests_per_second <= 0:
             raise ValueError("requests_per_second must be positive.")
+        if self.structured_output_mode not in ("json_schema", "json_object"):
+            raise ValueError(f"Provider '{self.name}' structured_output_mode must be 'json_schema' or 'json_object'.")
 
 
 @dataclass(frozen=True)

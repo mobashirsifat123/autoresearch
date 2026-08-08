@@ -130,9 +130,35 @@ class ScientificCritic:
 
     async def _single_evaluate(self, candidate: NoveltyCandidate, perspective: dict) -> dict:
         """Run one critic evaluation from a specific perspective."""
+        score_keys = [
+            "novelty_score", "significance_score", "causal_plausibility_score",
+            "falsifiability_score", "experimental_discriminability_score",
+            "feasibility_score", "implementation_risk_score",
+            "expected_information_gain_score", "compute_efficiency_score",
+            "publication_potential_score",
+        ]
+        # json_object mode drops the schema, so the contract must be in the
+        # prompt itself: enumerate every expected key with its range.
+        instruction = (
+            "Score the idea from your perspective. Return ONLY a JSON object with "
+            "exactly these keys, each score a number between 0.0 and 1.0:\n"
+            + "\n".join(f"- {key}: number 0.0-1.0" for key in score_keys)
+            + "\n- objections: array of strings (explicit objections)\n"
+            + "- failure_scenarios: array of strings (concrete ways the idea fails)\n"
+            + "Every score key must be present. No other keys."
+        )
         messages = [
             {"role": "system", "content": perspective["system"]},
-            {"role": "user", "content": f"Method: {candidate.method}\nMechanism: {candidate.causal_mechanism}\nFalsification condition: {candidate.falsification_condition}\nExpected effect: {candidate.expected_effect}"}
+            {
+                "role": "user",
+                "content": (
+                    f"Prompt version: {PROMPT_VERSION}\n"
+                    f"Method: {candidate.method}\n"
+                    f"Mechanism: {candidate.causal_mechanism}\n"
+                    f"Falsification condition: {candidate.falsification_condition}\n"
+                    f"Expected effect: {candidate.expected_effect}\n\n{instruction}"
+                ),
+            },
         ]
 
         payload = await self.router.structured_output(
@@ -143,15 +169,32 @@ class ScientificCritic:
             operation=f"novelty_criticism_{perspective['tag']}",
         )
 
+        # json_object mode does not enforce the schema, so validate: a missing
+        # score key must fail loudly rather than silently persist all-zero.
+        parsed: dict[str, float] = {}
+        for key in score_keys:
+            value = payload.get(key)
+            if value is None:
+                raise ValueError(
+                    f"Novelty critic omitted required score key '{key}'. "
+                    f"Raw payload keys: {sorted(payload)}"
+                )
+            parsed[key] = _to_score(value, key)
+
         return {
             "tag": perspective["tag"],
-            **{key: float(payload.get(key, 0.0)) for key in [
-                "novelty_score", "significance_score", "causal_plausibility_score",
-                "falsifiability_score", "experimental_discriminability_score",
-                "feasibility_score", "implementation_risk_score",
-                "expected_information_gain_score", "compute_efficiency_score",
-                "publication_potential_score",
-            ]},
+            **parsed,
             "objections": list(payload.get("objections", [])),
             "failure_scenarios": list(payload.get("failure_scenarios", [])),
         }
+
+
+def _to_score(value: object, key: str) -> float:
+    """Coerce a 0-1 score from number or numeric string, clamped to [0, 1]."""
+    try:
+        score = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"Novelty critic returned non-numeric '{key}': {value!r}")
+    if not 0.0 <= score <= 1.0:
+        raise ValueError(f"Novelty critic returned '{key}' outside 0-1: {value!r}")
+    return score

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 
 import httpx
@@ -140,6 +141,43 @@ async def test_openai_compatible_adapter_contract(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_openai_compatible_json_object_mode_translates_schema_and_injects_json_word(monkeypatch):
+    monkeypatch.setenv("TEST_PROVIDER_KEY", "not-a-real-secret")
+
+    def handler(request: httpx.Request):
+        body = json.loads(request.content)
+        assert body["response_format"] == {"type": "json_object"}, "json_schema must be translated to json_object"
+        user_content = body["messages"][-1]["content"]
+        assert "json" in user_content.lower(), "providers requiring the json word must get an injected instruction"
+        assert "Return your response as a single JSON object" in user_content
+        return httpx.Response(200, json={"id": "req-3", "model": "external-model", "choices": [{"message": {"content": '{"ok":true}'}}], "usage": {"prompt_tokens": 10, "completion_tokens": 2}})
+
+    config = ProviderConfig("external", "openai_compatible", "https://provider.example/v1", "TEST_PROVIDER_KEY", frozenset({Capability.TEXT, Capability.STRUCTURED_OUTPUT}), structured_output_mode="json_object")
+    provider = OpenAICompatibleProvider(config, transport=httpx.MockTransport(handler))
+    result = await provider.complete(model="external-model", messages=[{"role": "user", "content": "Return one object with a boolean ok field."}], response_format={"type": "json_schema", "json_schema": {"name": "answer", "schema": {"type": "object"}}})
+    assert json.loads(result.text) == {"ok": True}
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_openai_compatible_json_object_mode_leaves_prompt_untouched_when_json_present(monkeypatch):
+    monkeypatch.setenv("TEST_PROVIDER_KEY", "not-a-real-secret")
+
+    def handler(request: httpx.Request):
+        body = json.loads(request.content)
+        user_content = body["messages"][-1]["content"]
+        assert user_content == "Return JSON now", "prompt with the json word must not be amended"
+        assert body["response_format"] == {"type": "json_object"}
+        return httpx.Response(200, json={"id": "req-4", "model": "external-model", "choices": [{"message": {"content": '{"ok":true}'}}], "usage": {"prompt_tokens": 5, "completion_tokens": 2}})
+
+    config = ProviderConfig("external", "openai_compatible", "https://provider.example/v1", "TEST_PROVIDER_KEY", frozenset({Capability.TEXT, Capability.STRUCTURED_OUTPUT}), structured_output_mode="json_object")
+    provider = OpenAICompatibleProvider(config, transport=httpx.MockTransport(handler))
+    result = await provider.complete(model="external-model", messages=[{"role": "user", "content": "Return JSON now"}], response_format={"type": "json_schema", "json_schema": {"name": "answer", "schema": {"type": "object"}}})
+    assert result.text == '{"ok":true}'
+    await provider.close()
+
+
+@pytest.mark.asyncio
 async def test_openai_compatible_adapter_retries_rate_limit(monkeypatch):
     monkeypatch.setenv("TEST_PROVIDER_KEY", "not-a-real-secret")
     calls = 0
@@ -193,6 +231,40 @@ async def test_gemini_adapter_sends_json_schema(monkeypatch):
     result = await provider.complete(model="gemini-test", messages=[{"role": "user", "content": "hello"}], response_format={"type": "json_schema", "json_schema": {"name": "answer", "schema": {"type": "object", "properties": {"ok": {"type": "boolean"}}, "required": ["ok"]}}})
     assert json.loads(result.text) == {"ok": True}
     await provider.close()
+
+
+def test_structured_output_extracts_fenced_or_prose_wrapped_json(monkeypatch):
+    monkeypatch.setenv("TEST_PROVIDER_KEY", "not-a-real-secret")
+
+    async def probe(fenced_text: str):
+        def handler(request: httpx.Request):
+            return httpx.Response(200, json={"id": "req-5", "model": "external-model", "choices": [{"message": {"content": fenced_text}}], "usage": {"prompt_tokens": 5, "completion_tokens": 2}})
+        config = ProviderConfig("external", "openai_compatible", "https://provider.example/v1", "TEST_PROVIDER_KEY", frozenset({Capability.TEXT, Capability.STRUCTURED_OUTPUT}), structured_output_mode="json_object")
+        provider = OpenAICompatibleProvider(config, transport=httpx.MockTransport(handler))
+        registry = ProviderRegistry()
+        registry.register_llm("external", provider)
+        router = ModelRouter(registry, {ModelRole.LITERATURE_EXTRACTION: ModelAssignment(ModelRole.LITERATURE_EXTRACTION, "external", "external-model")})
+        try:
+            return await router.structured_output(ModelRole.LITERATURE_EXTRACTION, messages=[{"role": "user", "content": "Return JSON now"}], schema={})
+        finally:
+            await provider.close()
+
+    assert asyncio.run(probe('```json\n{"ok": true}\n```')) == {"ok": True}
+    assert asyncio.run(probe('Here is the result: {"ok": true}. That is all.')) == {"ok": True}
+
+
+def test_structured_output_rejects_when_no_object_is_parseable(monkeypatch):
+    monkeypatch.setenv("TEST_PROVIDER_KEY", "not-a-real-secret")
+
+    def handler(request: httpx.Request):
+        return httpx.Response(200, json={"id": "req-6", "model": "external-model", "choices": [{"message": {"content": "I am sorry, I cannot produce JSON."}}], "usage": {"prompt_tokens": 5, "completion_tokens": 2}})
+    config = ProviderConfig("external", "openai_compatible", "https://provider.example/v1", "TEST_PROVIDER_KEY", frozenset({Capability.TEXT, Capability.STRUCTURED_OUTPUT}), structured_output_mode="json_object")
+    provider = OpenAICompatibleProvider(config, transport=httpx.MockTransport(handler))
+    registry = ProviderRegistry()
+    registry.register_llm("external", provider)
+    router = ModelRouter(registry, {ModelRole.LITERATURE_EXTRACTION: ModelAssignment(ModelRole.LITERATURE_EXTRACTION, "external", "external-model")})
+    with pytest.raises(ProviderError, match="invalid JSON"):
+        asyncio.run(router.structured_output(ModelRole.LITERATURE_EXTRACTION, messages=[{"role": "user", "content": "Return JSON now"}], schema={}))
 
 
 def test_configuration_rejects_inline_secrets():

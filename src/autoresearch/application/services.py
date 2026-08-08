@@ -693,6 +693,17 @@ class ExperimentService:
             return (ExecutionAction(ActionType.RUN_PYTHON_SCRIPT, str(scripts[0]), ()),)
         return (ExecutionAction(ActionType.RUN_PYTEST, ".", ()),)
 
+    def _execution_worker(self, spec: ExperimentSpec) -> str:
+        """Bind approval to the worker that will actually execute.
+
+        ``spec.target_worker`` is an LLM-chosen preference and may name a worker
+        that is not configured (e.g. a hallucinated GPU worker). The checksum
+        must use the real worker identity, or approval never matches execution.
+        """
+        if self.worker is not None:
+            return self.worker.worker_id
+        return spec.target_worker or "local"
+
     def approval_preview(self, run_id: str) -> dict[str, object]:
         run = self.repository.get_run(run_id)
         if not run:
@@ -703,16 +714,18 @@ class ExperimentService:
         from autoresearch.storage.repository import _experiment_spec
         typed_spec = _experiment_spec(spec)
         actions = self.action_plan(typed_spec)
-        checksum = specification_checksum(typed_spec, actions, typed_spec.target_worker)
-        return {"run_id": run_id, "spec_id": typed_spec.id, "candidate_id": typed_spec.candidate_id, "checksum": checksum, "worker": typed_spec.target_worker, "actions": [{"kind": action.kind.value, "target": action.target, "arguments": list(action.arguments)} for action in actions], "budget": 0.0, "expires_at": None}
+        worker = self._execution_worker(typed_spec)
+        checksum = specification_checksum(typed_spec, actions, worker)
+        return {"run_id": run_id, "spec_id": typed_spec.id, "candidate_id": typed_spec.candidate_id, "checksum": checksum, "worker": worker, "actions": [{"kind": action.kind.value, "target": action.target, "arguments": list(action.arguments)} for action in actions], "budget": 0.0, "expires_at": None}
 
     def approval_preview_for_candidate(self, candidate_id: str) -> dict[str, object]:
         spec = self.repository.get_experiment_spec(candidate_id)
         if not spec:
             raise ValueError("approval_required: plan the experiment before approving execution")
         actions = self.action_plan(spec)
-        checksum = specification_checksum(spec, actions, spec.target_worker)
-        return {"run_id": spec.run_id, "spec_id": spec.id, "candidate_id": candidate_id, "checksum": checksum, "worker": spec.target_worker, "actions": [{"kind": action.kind.value, "target": action.target, "arguments": list(action.arguments)} for action in actions], "budget": 3600.0, "expires_at": None}
+        worker = self._execution_worker(spec)
+        checksum = specification_checksum(spec, actions, worker)
+        return {"run_id": spec.run_id, "spec_id": spec.id, "candidate_id": candidate_id, "checksum": checksum, "worker": worker, "actions": [{"kind": action.kind.value, "target": action.target, "arguments": list(action.arguments)} for action in actions], "budget": 3600.0, "expires_at": None}
 
     async def execute_candidate(self, candidate_id: str, *, run_id: str | None = None, mode: str = "plan") -> str:
         candidate_row = self.repository.row("SELECT * FROM novelty_candidates WHERE id=?", (candidate_id,))

@@ -42,7 +42,27 @@ CANDIDATE_SCHEMA = {
     "additionalProperties": False,
 }
 
-PROMPT_VERSION = "candidate-gen-v1"
+PROMPT_VERSION = "candidate-gen-v2"
+
+# json_object mode drops the schema, so the prompt must carry the contract:
+# every expected key, enumerated. Without this the model returns renamed keys
+# and every field defaults to "".
+_FIELD_CONTRACT = (
+    "Return ONLY a JSON object with exactly these keys:\n"
+    "- strategy: string\n"
+    "- method: string (the proposed method, specific and detailed)\n"
+    "- causal_mechanism: string (why it works, mechanistic account)\n"
+    "- target_limitation: string\n"
+    "- difference_from_existing: string (how it differs from prior work)\n"
+    "- expected_effect: string (quantified where possible)\n"
+    "- falsification_condition: string (a concrete condition that would refute it)\n"
+    "- minimum_validating_experiment: string (the smallest decisive experiment)\n"
+    "- required_ablations: array of strings\n"
+    "- implementation_complexity: string\n"
+    "- expected_compute: string\n"
+    "- risks_and_objections: array of strings\n"
+    "Every key must be present with non-empty values. No other keys."
+)
 
 
 class LLMCandidateGenerator:
@@ -64,7 +84,7 @@ class LLMCandidateGenerator:
             strategy = strategies[i]
             messages = [
                 {"role": "system", "content": "You are a world-class AI researcher proposing a novel method to address a validated research gap. Return a precise, highly-detailed structured specification of your proposed method. Reject vague claims."},
-                {"role": "user", "content": f"Research Gap:\n{gap.statement}\nWhy Unsolved: {gap.why_unsolved}\n\nGenerate a candidate using strategy: {strategy}."}
+                {"role": "user", "content": f"Prompt version: {PROMPT_VERSION}\nResearch Gap:\n{gap.statement}\nWhy Unsolved: {gap.why_unsolved}\n\nGenerate a candidate using strategy: {strategy}.\n\n{_FIELD_CONTRACT}"}
             ]
             
             payload = await self.router.structured_output(
@@ -118,7 +138,7 @@ class LLMCandidateGenerator:
             ModelRole.RESEARCH_REASONING,
             messages=[
                 {"role": "system", "content": "Revise the candidate to address documented overlap and critic objections. Narrow claims when needed. Do not claim novelty. Return the complete candidate schema."},
-                {"role": "user", "content": f"Method: {candidate.method}\nOverlap: {assessment.mechanism_comparison}\nUncertainty: {assessment.unresolved_overlap}\nObjections: {critique.objections}\nRevision round: {revision_count}"},
+                {"role": "user", "content": f"Prompt version: candidate-revision-v1\nMethod: {candidate.method}\nOverlap: {assessment.mechanism_comparison}\nUncertainty: {assessment.unresolved_overlap}\nObjections: {critique.objections}\nRevision round: {revision_count}\n\n{_FIELD_CONTRACT}"},
             ],
             schema={"name": "candidate_revision", "schema": CANDIDATE_SCHEMA},
             project_id=candidate.project_id, run_id=candidate.run_id, operation="candidate_revision",

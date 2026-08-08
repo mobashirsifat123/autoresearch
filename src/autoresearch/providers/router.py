@@ -61,10 +61,9 @@ class ModelRouter:
 
     async def structured_output(self, role: ModelRole | str, *, messages: list[dict[str, Any]], schema: dict[str, Any], max_tokens: int | None = None, project_id: str | None = None, run_id: str | None = None, operation: str = "structured_output") -> dict[str, Any]:
         result = await self.complete(role, messages=messages, max_tokens=max_tokens, project_id=project_id, run_id=run_id, operation=operation, prompt_version="structured-output-v1", response_format={"type": "json_schema", "json_schema": schema}, structured_output_status="requested")
-        try:
-            value = json.loads(result.text)
-        except json.JSONDecodeError as exc:
-            raise ProviderError("Provider returned invalid JSON for a structured operation.", ErrorKind.SCHEMA, request_id=result.request_id) from exc
+        value = _extract_json_object(result.text)
+        if value is None:
+            raise ProviderError("Provider returned invalid JSON for a structured operation.", ErrorKind.SCHEMA, request_id=result.request_id)
         if not isinstance(value, dict):
             raise ProviderError("Structured provider output must be a JSON object.", ErrorKind.SCHEMA, request_id=result.request_id)
         return value
@@ -115,3 +114,26 @@ class ModelRouter:
 
     async def close(self) -> None:
         await self.registry.close()
+
+
+def _extract_json_object(text: str) -> dict[str, Any] | None:
+    """Parse the first JSON object embedded in provider output.
+
+    Text-only providers in json_object mode occasionally wrap the object in
+    markdown code fences or surrounding prose. Scan for a balanced top-level
+    object and raw-decode it; returns None only when no object is parseable.
+    """
+    candidate = text.strip()
+    if candidate.startswith("```"):
+        candidate = "\n".join(line for line in candidate.splitlines() if not line.strip().startswith("```")).strip()
+    decoder = json.JSONDecoder()
+    for index, char in enumerate(candidate):
+        if char != "{":
+            continue
+        try:
+            value, _ = decoder.raw_decode(candidate[index:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            return value
+    return None

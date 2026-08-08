@@ -19,15 +19,41 @@ class OpenAICompatibleProvider(HTTPProviderBase):
     def headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self.api_key()}", "Content-Type": "application/json"}
 
+    def _structured_output_format(self, response_format: dict[str, Any]) -> dict[str, Any]:
+        """Translate the router's json_schema request into the provider's supported mode."""
+        if self.config.structured_output_mode == "json_object":
+            return {"type": "json_object"}
+        normalized_format = dict(response_format)
+        if normalized_format.get("type") == "json_schema":
+            schema_document = dict(normalized_format.get("json_schema") or {})
+            schema_document["strict"] = True
+            normalized_format["json_schema"] = schema_document
+        return normalized_format
+
+    @staticmethod
+    def _ensure_json_instruction(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Some json_object providers require the word 'json' in the prompt.
+
+        If no message already mentions it, append a JSON-format instruction to
+        the last user message so the request is accepted without corrupting the
+        original prompt.
+        """
+        if any("json" in str(item.get("content", "")).lower() for item in messages):
+            return messages
+        for index in range(len(messages) - 1, -1, -1):
+            if messages[index].get("role") == "user":
+                amended = list(messages)
+                amended[index] = {**messages[index], "content": f"{messages[index].get('content', '')}\n\nReturn your response as a single JSON object."}
+                return amended
+        return messages
+
     async def complete(self, *, model: str, messages: list[dict[str, Any]], temperature: float = 0.2, max_tokens: int = 2048, response_format: dict[str, Any] | None = None, tools: list[dict[str, Any]] | None = None) -> CompletionResult:
         body: dict[str, Any] = {"model": model, "messages": messages, "temperature": temperature, "max_tokens": max_tokens}
         if response_format:
-            normalized_format = dict(response_format)
-            if normalized_format.get("type") == "json_schema":
-                schema_document = dict(normalized_format.get("json_schema") or {})
-                schema_document["strict"] = True
-                normalized_format["json_schema"] = schema_document
-            body["response_format"] = normalized_format
+            if self.config.structured_output_mode == "json_object":
+                messages = self._ensure_json_instruction(messages)
+            body["messages"] = messages
+            body["response_format"] = self._structured_output_format(response_format)
         if tools:
             body["tools"] = tools
         payload, headers = await self.request_json("POST", "/chat/completions", headers=self.headers(), json_body=body)

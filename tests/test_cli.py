@@ -39,6 +39,24 @@ def test_claude_code_research_skills_are_available():
         assert "Exit codes" in content
 
 
+def test_skill_cli_classifies_not_found_exit_codes(monkeypatch, tmp_path):
+    monkeypatch.setenv("AUTORESEARCH_DATA_ROOT", str(tmp_path / "data"))
+    runner = CliRunner()
+    result = runner.invoke(app, ["skill", "novelty", "--project", "missing-project"])
+    assert result.exit_code == 4
+    assert "project_not_found" in (result.stdout + result.stderr)
+    result2 = runner.invoke(app, ["skill", "experiment", "plan", "--candidate-id", "missing-candidate"])
+    assert result2.exit_code == 4
+    assert "novelty_candidate_not_found" in (result2.stdout + result2.stderr)
+
+
+def test_skill_cli_experiment_plan_requires_candidate(monkeypatch, tmp_path):
+    monkeypatch.setenv("AUTORESEARCH_DATA_ROOT", str(tmp_path / "data"))
+    runner = CliRunner()
+    result = runner.invoke(app, ["skill", "experiment", "plan"])
+    assert result.exit_code == 2, "missing required --candidate-id is a usage error"
+
+
 def test_no_divergent_skill_copies_remain():
     root = Path(__file__).resolve().parents[1]
     repo_copies = root / ".claude" / "skills"
