@@ -77,6 +77,10 @@ class ReviewRanker:
             provider, model = "deterministic", "lexical-ranking"
         else:
             provider, model = self.router.identity(ModelRole.EMBEDDINGS)
+        years = [p.year for p in usable if p.year]
+        year_spread = (max(years) - min(years)) if len(years) >= 2 else 0
+        active_weights = _adaptive_weights(len(usable), year_spread)
+
         scores: list[PriorityScore] = []
         for index, paper in enumerate(usable, start=1):
             review = review_by_paper[paper.id]
@@ -97,11 +101,30 @@ class ReviewRanker:
                 "evidence_quality": min(1.0, review.confidence * (0.6 + min(len(review.evidence_claim_ids), 4) * 0.1)),
             }
             components = {key: round(max(0.0, min(1.0, value)), 6) for key, value in components.items()}
-            total = round(sum(components[key] * WEIGHTS[key] for key in WEIGHTS), 6)
-            explanation = {"weights": WEIGHTS, "components": components, "formula": "weighted_sum", "similarity_basis": "lexical" if lexical else "embeddings"}
+            total = round(sum(components[key] * active_weights[key] for key in active_weights), 6)
+            explanation = {"weights": active_weights, "components": components, "formula": "weighted_sum", "similarity_basis": "lexical" if lexical else "embeddings"}
             provenance = ArtifactProvenance.create(project_id=seed.project_id, run_id=run_id, source_evidence=review.evidence_claim_ids, provider=provider, model=model, prompt_version=f"{RANKING_VERSION}{'-lexical' if lexical else ''}", content={**components, "total": total})
             scores.append(PriorityScore(uuid4().hex, seed.project_id, run_id, paper.id, components["semantic_similarity"], components["methodological_similarity"], components["research_question_similarity"], components["recency"], components["influence"], components["evidence_quality"], total, explanation, provenance))
         return sorted(scores, key=lambda score: (-score.total, score.paper_id))
+
+
+def _adaptive_weights(paper_count: int, max_year_spread: int) -> dict[str, float]:
+    """Shift weight emphasis dynamically based on corpus size and year spread (R5)."""
+    base = dict(WEIGHTS)
+    if paper_count <= 5:
+        base["recency"] = 0.08
+        base["influence"] = 0.05
+        base["evidence_quality"] = 0.12
+        base["semantic_similarity"] = 0.40
+    elif paper_count >= 30:
+        base["semantic_similarity"] = 0.25
+        base["methodological_similarity"] = 0.25
+        base["research_question_similarity"] = 0.20
+    if max_year_spread <= 2:
+        base["recency"] = 0.05
+        base["evidence_quality"] += 0.10
+    total = sum(base.values())
+    return {k: round(v / total, 6) for k, v in base.items()}
 
 
 def _unit_cosine(left: Sequence[float], right: Sequence[float]) -> float:

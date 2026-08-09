@@ -9,6 +9,8 @@ from uuid import uuid4
 
 from autoresearch.domain.models import ArtifactProvenance, ExecutionResult, ExperimentSpec, StatisticalAnalysis
 
+import random
+
 # Bayesian prior constants
 PRIOR_EFFECT_LOCATION = 0.0
 PRIOR_EFFECT_SCALE = 0.5  # weak prior (medium effect size)
@@ -28,7 +30,6 @@ def paired_effects(baseline: list[float], proposed: list[float]) -> dict[str, fl
     cohens_d = avg / deviation if deviation else 0.0
 
     # Bayesian estimation: posterior mean with conjugate normal prior
-    # Posterior = (prior_precision * prior_mean + data_precision * data_mean) / (prior_precision + data_precision)
     prior_precision = PRIOR_SAMPLE_SIZE / (PRIOR_EFFECT_SCALE ** 2) if PRIOR_EFFECT_SCALE > 0 else 0
     data_precision = n / (deviation ** 2) if deviation > 0 else 0
     posterior_mean = (prior_precision * PRIOR_EFFECT_LOCATION + data_precision * avg) / (prior_precision + data_precision) if (prior_precision + data_precision) > 0 else avg
@@ -40,6 +41,8 @@ def paired_effects(baseline: list[float], proposed: list[float]) -> dict[str, fl
     else:
         p_positive = 1.0 if posterior_mean > 0 else 0.0
 
+    ci = _bootstrap_ci(differences)
+
     return {
         "sample_count": n,
         "mean_difference": round(avg, 6),
@@ -47,8 +50,43 @@ def paired_effects(baseline: list[float], proposed: list[float]) -> dict[str, fl
         "bayesian_posterior_mean": round(posterior_mean, 6),
         "bayesian_posterior_sd": round(posterior_sd, 6),
         "bayesian_p_positive": round(p_positive, 6),
+        "bootstrap_ci_low": ci[0],
+        "bootstrap_ci_high": ci[1],
         "status": "INSUFFICIENT_EVIDENCE" if n < 2 else "ESTIMATE",
     }
+
+
+def _bootstrap_ci(differences: list[float], n_bootstrap: int = 1000, alpha: float = 0.05, seed: int = 42) -> tuple[float, float]:
+    """Non-parametric percentile bootstrap CI (E4)."""
+    if len(differences) < 2:
+        val = differences[0] if differences else 0.0
+        return (round(val, 6), round(val, 6))
+    rng = random.Random(seed)
+    n = len(differences)
+    means: list[float] = []
+    for _ in range(n_bootstrap):
+        sample = [differences[rng.randint(0, n - 1)] for _ in range(n)]
+        means.append(sum(sample) / n)
+    means.sort()
+    low_idx = int(n_bootstrap * (alpha / 2))
+    high_idx = int(n_bootstrap * (1.0 - alpha / 2))
+    return (round(means[low_idx], 6), round(means[high_idx], 6))
+
+
+def _holm_bonferroni(p_values: dict[str, float], alpha: float = 0.05) -> dict[str, bool]:
+    """Step-down Holm-Bonferroni multiple comparison correction (E3)."""
+    sorted_items = sorted(p_values.items(), key=lambda x: x[1])
+    m = len(sorted_items)
+    significant: dict[str, bool] = {}
+    is_sig = True
+    for rank, (metric, p) in enumerate(sorted_items):
+        adjusted_alpha = alpha / (m - rank)
+        if is_sig and p <= adjusted_alpha:
+            significant[metric] = True
+        else:
+            is_sig = False
+            significant[metric] = False
+    return significant
 
 
 def _normal_cdf(x: float, mean: float, sd: float) -> float:
@@ -89,6 +127,7 @@ class StatisticalAnalyzer:
         bayesian_p_positive: dict[str, float] = {}
         bayesian_posterior_mean: dict[str, float] = {}
         cohens_d: dict[str, float] = {}
+        uncorrected_p: dict[str, float] = {}
         status = "INSUFFICIENT_EVIDENCE"
         for metric in sorted(metrics):
             before = [float(row["baseline"][metric]) for row in seed_level if isinstance(row.get("baseline"), dict) and metric in row["baseline"]]
@@ -96,15 +135,16 @@ class StatisticalAnalyzer:
             if before and len(before) == len(after):
                 summary = paired_effects(before, after)
                 effects[metric] = float(summary["mean_difference"])
-                bayesian_p_positive[metric] = float(summary["bayesian_p_positive"])
+                p_pos = float(summary["bayesian_p_positive"])
+                bayesian_p_positive[metric] = p_pos
+                uncorrected_p[metric] = round(1.0 - p_pos if p_pos > 0.5 else p_pos, 6)
                 bayesian_posterior_mean[metric] = float(summary["bayesian_posterior_mean"])
                 cohens_d[metric] = float(summary["cohens_d"])
-                intervals[metric] = (
-                    effects[metric] - 1.96 * abs(effects[metric]) / math.sqrt(len(after)),
-                    effects[metric] + 1.96 * abs(effects[metric]) / math.sqrt(len(after)),
-                ) if len(after) > 0 else (effects[metric], effects[metric])
+                intervals[metric] = (float(summary["bootstrap_ci_low"]), float(summary["bootstrap_ci_high"]))
                 if len(after) >= 2:
                     status = "ESTIMATE"
+
+        sig_adjusted = _holm_bonferroni(uncorrected_p) if uncorrected_p else {}
 
         return StatisticalAnalysis(
             id=uuid4().hex, project_id=spec.project_id, run_id=spec.run_id, spec_id=spec.id,
@@ -117,12 +157,13 @@ class StatisticalAnalyzer:
                 project_id=spec.project_id, run_id=spec.run_id,
                 source_evidence=[result.id],
                 provider="deterministic", model="statistics",
-                prompt_version="stats-v3",
+                prompt_version="stats-v4-bootstrap-holm",
                 content={
                     "status": status,
                     "bayesian_p_positive": bayesian_p_positive,
                     "bayesian_posterior_mean": bayesian_posterior_mean,
                     "cohens_d": cohens_d,
+                    "holm_bonferroni_significant": sig_adjusted,
                 },
             ),
         )

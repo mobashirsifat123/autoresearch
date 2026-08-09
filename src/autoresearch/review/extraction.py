@@ -4,6 +4,7 @@ Now with multi-perspective extraction: each paper reviewed from 3 angles
 
 from __future__ import annotations
 
+import asyncio
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -122,28 +123,30 @@ class PaperReviewExtractor:
         return self._merge_leaves(paper, run_id, leaves)
 
     async def _multi_perspective_extract(self, paper: PaperRecord, *, run_id: str, source_text: str) -> ReviewBundle:
-        """Extract reviews from 3 perspectives and aggregate the best elements.
+        """Extract reviews from 3 perspectives concurrently and aggregate the best elements.
 
         Perspectives are fault-tolerant: one perspective failing (e.g. a
         provider JSON hiccup or a paper with no verbatim quote in that angle)
         must not discard evidence the other perspectives produced. The paper
         only fails when every perspective fails.
         """
+        tasks = [
+            self._extract_source(
+                paper, run_id=run_id, source_text=source_text,
+                prompt_version=f"{REVIEW_PROMPT_VERSION}-{perspective}",
+                operation=f"paper_review_{perspective}",
+                system_prompt=system_prompt,
+            )
+            for perspective, system_prompt in _PERSPECTIVE_PROMPTS.items()
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
         bundles: list[ReviewBundle] = []
         first_error: Exception | None = None
-        for perspective, system_prompt in _PERSPECTIVE_PROMPTS.items():
-            try:
-                bundle = await self._extract_source(
-                    paper, run_id=run_id, source_text=source_text,
-                    prompt_version=f"{REVIEW_PROMPT_VERSION}-{perspective}",
-                    operation=f"paper_review_{perspective}",
-                    system_prompt=system_prompt,
-                )
-            except Exception as exc:
-                if first_error is None:
-                    first_error = exc
-                continue
-            bundles.append(bundle)
+        for res in results:
+            if isinstance(res, ReviewBundle):
+                bundles.append(res)
+            elif first_error is None and isinstance(res, Exception):
+                first_error = res
 
         if not bundles:
             raise first_error or ValueError(f"Paper '{paper.title}' yielded no evidence-backed review.")
@@ -179,19 +182,17 @@ class PaperReviewExtractor:
         return ReviewBundle(review, claims)
 
     def _merge_perspectives(self, paper: PaperRecord, run_id: str, bundles: list[ReviewBundle]) -> ReviewBundle:
-        """Merge multi-perspective reviews by taking the union of all claims and the longest/best fields."""
-        if not bundles:
-            raise ValueError("No review bundles to merge.")
-        if len(bundles) == 1:
-            return bundles[0]
+        reviews = [b.review for b in bundles]
+        all_claims = [claim for b in bundles for claim in b.claims]
+        provider = reviews[0].provenance.provider
+        model = reviews[0].provenance.model
 
-        all_claims = tuple(claim for bundle in bundles for claim in bundle.claims)
-        reviews = [bundle.review for bundle in bundles]
-        provider, model = self.router.identity(ModelRole.LITERATURE_EXTRACTION)
+        # Cross-reference analysis (R3): count occurrence frequency of each claim across perspectives
+        evidence_counts: dict[tuple[str, str, str], int] = {}
+        for claim in all_claims:
+            key = (_normalize(claim.statement), _normalize(claim.excerpt), claim.section or "")
+            evidence_counts[key] = evidence_counts.get(key, 0) + 1
 
-        # Union all claims, deduplicating by evidence content so the same
-        # source excerpt is counted once regardless of how many perspectives
-        # surfaced it. Fresh per-perspective claim IDs are not a uniqueness key.
         merged_claims: list[EvidenceClaim] = []
         seen_evidence: set[tuple[str, str, str]] = set()
         for claim in all_claims:
@@ -199,7 +200,14 @@ class PaperReviewExtractor:
             if key in seen_evidence:
                 continue
             seen_evidence.add(key)
-            merged_claims.append(claim)
+            count = evidence_counts.get(key, 1)
+            # Calibrate claim confidence based on multi-perspective agreement
+            calibrated_conf = round(max(0.0, min(1.0, claim.confidence * (0.6 + 0.133 * count))), 6)
+            merged_claims.append(EvidenceClaim(
+                claim.id, claim.project_id, claim.run_id, claim.paper_id,
+                claim.claim_type, claim.statement, claim.excerpt, claim.page,
+                claim.section, calibrated_conf, claim.provenance,
+            ))
         merged_claim_ids = [claim.id for claim in merged_claims]
 
         content = {
@@ -239,14 +247,13 @@ class PaperReviewExtractor:
     def _claims(value: object, paper: PaperRecord, run_id: str, source_text: str, provider: str, model: str, prompt_version: str = REVIEW_PROMPT_VERSION) -> tuple[EvidenceClaim, ...]:
         if not isinstance(value, list):
             return ()
-        normalized_source = _normalize(source_text)
         claims: list[EvidenceClaim] = []
         for raw in value:
             if not isinstance(raw, dict):
                 continue
             excerpt = _string(raw.get("excerpt"))
             statement = _string(raw.get("statement"))
-            if not excerpt or not statement or _normalize(excerpt) not in normalized_source:
+            if not excerpt or not statement or not _fuzzy_verbatim_match(excerpt, source_text):
                 continue
             content = {"paper_id": paper.id, "statement": statement, "excerpt": excerpt, "page": raw.get("page"), "section": raw.get("section")}
             provenance = ArtifactProvenance.create(project_id=paper.project_id, run_id=run_id, source_evidence=(f"paper:{paper.id}",), provider=provider, model=model, prompt_version=prompt_version, content=content)
@@ -274,6 +281,26 @@ def _strings(value: object) -> tuple[str, ...]:
 
 def _normalize(value: str) -> str:
     return " ".join(re.findall(r"\w+", value.lower()))
+
+
+def _fuzzy_verbatim_match(excerpt: str, source_text: str, threshold: float = 0.92) -> bool:
+    """Exact substring first; sliding-window fuzzy ratio fallback for minor LLM formatting variations."""
+    from difflib import SequenceMatcher
+    norm_excerpt = _normalize(excerpt)
+    norm_source = _normalize(source_text)
+    if not norm_excerpt:
+        return False
+    if norm_excerpt in norm_source:
+        return True
+    excerpt_len = len(norm_excerpt)
+    if excerpt_len < 20 or excerpt_len > len(norm_source):
+        return False
+    step = max(1, excerpt_len // 4)
+    for i in range(0, len(norm_source) - excerpt_len + 1, step):
+        window = norm_source[i:i + excerpt_len + excerpt_len // 5]
+        if SequenceMatcher(None, norm_excerpt, window).ratio() >= threshold:
+            return True
+    return False
 
 
 def _confidence(value: object) -> float:

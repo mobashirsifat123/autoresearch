@@ -69,15 +69,14 @@ class ScientificReportWriter:
         # Step 1: Validity assessment
         validity = await self._assess_validity(spec, analysis)
 
-        # Step 2: Generate the main report (with Bayesian context)
-        bayesian_context = ""
-        provenance_data = analysis.provenance.content if isinstance(analysis.provenance.content, dict) else {}
+        # Step 2: Generate the main report with standardized effect size interpretation (E5)
+        provenance_data = getattr(analysis.provenance, "content", {}) if isinstance(getattr(analysis.provenance, "content", None), dict) else {}
         bayesian_probs = provenance_data.get("bayesian_p_positive", {})
-        if bayesian_probs:
-            bayesian_context = "\nBayesian probabilities of positive effect:\n" + json.dumps(bayesian_probs, indent=2)
         cohens_d_vals = provenance_data.get("cohens_d", {})
-        if cohens_d_vals:
-            bayesian_context += "\nCohen's d effect sizes:\n" + json.dumps(cohens_d_vals, indent=2)
+        holm_sig = provenance_data.get("holm_bonferroni_significant", {})
+
+        effect_summary = _effect_interpretation(cohens_d_vals, bayesian_probs, holm_sig)
+        bayesian_context = f"\nStandardized Effect Interpretation:\n{effect_summary}\n" if effect_summary else ""
 
         messages = [
             {"role": "system", "content": "You are the final scientific author. Synthesize the experimental setup and results into a comprehensive, reproducible report. Explicitly make a decision on whether the hypothesis is supported. Consider both frequentist and Bayesian evidence."},
@@ -92,13 +91,16 @@ class ScientificReportWriter:
             operation="report_writing",
         )
 
+        decision_str = payload.get("decision", "supported")
+        decision_conf = _calibrate_decision_confidence(decision_str, bayesian_probs, len(spec.random_seeds))
+
         provider, model = self.router.identity(ModelRole.RESEARCH_REASONING)
         provenance = ArtifactProvenance.create(
             project_id=spec.project_id, run_id=spec.run_id,
             source_evidence=[analysis.id],
             provider=provider, model=model,
-            prompt_version=PROMPT_VERSION,
-            content={**payload, "validity": validity},
+            prompt_version="report-writer-v3",
+            content={**payload, "decision_confidence": decision_conf, "validity": validity},
         )
 
         return ExperimentReport(
@@ -121,10 +123,30 @@ class ScientificReportWriter:
             cost=analysis.training_inference_cost,
             limitations=payload.get("limitations", ""),
             reproducibility_instructions=payload.get("reproducibility_instructions", ""),
-            decision=ExperimentDecision(payload.get("decision", "supported")),
+            decision=ExperimentDecision(decision_str),
             decision_evidence=payload.get("decision_evidence", ""),
             provenance=provenance,
         )
+
+
+def _effect_interpretation(cohens_d: dict, bayesian_probs: dict, holm_sig: dict) -> str:
+    """Deterministic effect size interpretation framework (E5)."""
+    lines = []
+    for metric, d in cohens_d.items():
+        mag = "negligible" if abs(d) < 0.2 else "small" if abs(d) < 0.5 else "medium" if abs(d) < 0.8 else "large"
+        prob = bayesian_probs.get(metric, 0.5)
+        certainty = "strong" if prob > 0.95 else "moderate" if prob > 0.80 else "weak" if prob > 0.60 else "inconclusive"
+        sig_str = "statistically significant (Holm-Bonferroni corrected)" if holm_sig.get(metric) else "not significant after correction"
+        lines.append(f"  - {metric}: Cohen's d={d:.3f} ({mag} effect), P(positive)={prob:.3f} ({certainty} Bayesian evidence), {sig_str}")
+    return "\n".join(lines)
+
+
+def _calibrate_decision_confidence(decision: str, bayesian_probs: dict, seed_count: int) -> float:
+    """Calibrate decision confidence score between 0.0 and 1.0 (E7)."""
+    avg_p = sum(bayesian_probs.values()) / max(len(bayesian_probs), 1) if bayesian_probs else 0.5
+    base = avg_p if decision in ("supported", "partially_supported") else (1.0 - avg_p)
+    sample_factor = min(1.0, seed_count / 10.0)
+    return round(max(0.1, min(1.0, base * 0.6 + sample_factor * 0.4)), 4)
 
     async def _assess_validity(self, spec: ExperimentSpec, analysis: StatisticalAnalysis) -> dict:
         """Assess construct, internal, external, and statistical conclusion validity."""

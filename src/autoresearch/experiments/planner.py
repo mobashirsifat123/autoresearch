@@ -120,28 +120,27 @@ _FIELD_CONTRACT = (
 )
 
 
+import asyncio
+
+
 class ExperimentSpecGenerator:
     def __init__(self, router: ModelRouter) -> None:
         self.router = router
 
     async def plan(self, candidate: NoveltyCandidate) -> ExperimentSpec:
-        # Step 1: Generate 2-3 experiment designs with different focuses
-        designs = []
+        # Step 1 & 2: Generate 3 experiment designs & run adversarial analysis concurrently (E6)
         focuses = [
             "default: a standard rigorous experiment design",
             "efficient: a minimal viable experiment that can quickly falsify the hypothesis",
             "comprehensive: an exhaustive experiment with many ablations and robustness tests",
         ]
-        for focus in focuses:
-            design = await self._generate_single(candidate, focus)
-            designs.append(design)
+        designs = list(await asyncio.gather(*[self._generate_single(candidate, focus) for focus in focuses]))
 
-        # Step 2: Adversarial falsification analysis for each design
-        for design in designs:
-            adversarial = await self._adversarial_analysis(candidate, design)
-            design["_adversarial"] = adversarial
+        adversarials = await asyncio.gather(*[self._adversarial_analysis(candidate, design) for design in designs])
+        for design, adv in zip(designs, adversarials):
+            design["_adversarial"] = adv
 
-        # Step 3: Power analysis to determine required seed count
+        # Step 3: Multi-metric power analysis to determine required seed count (E2)
         for design in designs:
             design["_required_seeds"] = self._power_analysis(design)
 
@@ -234,23 +233,31 @@ class ExperimentSpecGenerator:
         return payload
 
     def _power_analysis(self, design: dict) -> int:
-        """Compute required seed count from expected effect size using a simplified power analysis.
-        Uses the formula: n ≈ (z_alpha/2 + z_beta)^2 / (d^2) for a two-sided test.
-        """
-        effect_size = design.get("expected_effect_size")
-        if effect_size is None or effect_size <= 0:
-            effect_size = 0.5  # default to medium effect
+        """Compute required seed count as max across all metrics (E2)."""
+        minimum_effects = design.get("minimum_meaningful_effect", {})
         power_target = design.get("power_target", 0.8)
-
-        # z-scores for common power levels
         z_scores = {0.5: 0.0, 0.6: 0.25, 0.7: 0.52, 0.8: 0.84, 0.9: 1.28, 0.95: 1.64, 0.99: 2.33}
         z_beta = z_scores.get(power_target, 0.84)
-
-        # z for alpha=0.05 (two-sided)
         z_alpha_half = 1.96
 
+        if isinstance(minimum_effects, dict) and minimum_effects:
+            required = []
+            for metric, min_effect in minimum_effects.items():
+                try:
+                    eff = float(min_effect)
+                    if eff > 0:
+                        n = math.ceil(2 * (z_alpha_half + z_beta) ** 2 / (eff ** 2))
+                        required.append(n)
+                except (TypeError, ValueError):
+                    pass
+            if required:
+                return max(3, min(max(required), 30))
+
+        effect_size = design.get("expected_effect_size")
+        if effect_size is None or not isinstance(effect_size, (int, float)) or effect_size <= 0:
+            effect_size = 0.5
         n_per_group = math.ceil(2 * (z_alpha_half + z_beta) ** 2 / (effect_size ** 2))
-        return max(3, min(n_per_group, 30))  # clamp between 3 and 30
+        return max(3, min(n_per_group, 30))
 
     async def _select_best_design(self, candidate: NoveltyCandidate, designs: list[dict]) -> dict:
         """Select the best experiment design via meta-evaluation."""

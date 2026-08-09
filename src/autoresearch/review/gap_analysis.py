@@ -4,6 +4,7 @@ and cross-paper limitation clustering."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Sequence
 from uuid import uuid4
@@ -166,15 +167,14 @@ class GapAnalyzer:
         return payload.get("clusters", [])
 
     async def _generate_gap_candidates(self, project_id, run_id, context, claim_map, provider, model) -> list[dict]:
-        """Generate 3 distinct gap candidates."""
+        """Generate 3 distinct gap candidates concurrently (R6)."""
         perspectives = [
             "methodological: a gap in the core methods/architectures used across these papers",
             "evaluation: a gap in how results are measured or compared, suggesting a missing benchmark or protocol",
             "theoretical: a gap in the underlying theory or assumptions that limits generalization",
         ]
-        candidates = []
-        for perspective in perspectives:
-            payload = await self.router.structured_output(
+        tasks = [
+            self.router.structured_output(
                 ModelRole.SCIENTIFIC_CRITIC,
                 messages=[
                     {"role": "system", "content": f"Identify one precise research gap from the {perspective} perspective. Use only the supplied paper and claim IDs. Unsupported statements must be labeled as hypotheses."},
@@ -183,8 +183,9 @@ class GapAnalyzer:
                 schema={"name": "research_gap", "schema": GAP_SCHEMA},
                 project_id=project_id, run_id=run_id, operation=f"gap_analysis_{perspective.split(':')[0]}",
             )
-            candidates.append(payload)
-        return candidates
+            for perspective in perspectives
+        ]
+        return list(await asyncio.gather(*tasks))
 
     async def _find_counter_evidence(self, project_id, run_id, candidate, context, claim_map, provider, model) -> list[str]:
         """Explicitly search for evidence that contradicts or weakens the gap claim."""
@@ -259,7 +260,15 @@ def validate_gap_payload(payload: dict, *, project_id: str, run_id: str, valid_p
     }
     source_evidence = (*claim_ids, *counter_ids)
     provenance = ArtifactProvenance.create(project_id=project_id, run_id=run_id, source_evidence=source_evidence, provider=provider, model=model, prompt_version=GAP_PROMPT_VERSION, content=content)
-    return ResearchGap(uuid4().hex, project_id, run_id, content["statement"], paper_ids, claim_ids, content["why_unsolved"], content["missing_experiment"], content["falsification_test"], _confidence(payload.get("confidence")), counter_ids, classification, provenance)
+
+    # R7: Calibrated confidence score based on LLM rating, evidence coverage, claim density, and counter-evidence penalty
+    raw_conf = _confidence(payload.get("confidence"))
+    coverage = len(paper_ids) / max(1, len(valid_papers))
+    claim_density = min(1.0, len(claim_ids) / 5.0)
+    counter_penalty = 0.15 * len(counter_ids)
+    calibrated_conf = round(max(0.0, min(1.0, raw_conf * 0.4 + coverage * 0.3 + claim_density * 0.3 - counter_penalty)), 6)
+
+    return ResearchGap(uuid4().hex, project_id, run_id, content["statement"], paper_ids, claim_ids, content["why_unsolved"], content["missing_experiment"], content["falsification_test"], calibrated_conf, counter_ids, classification, provenance)
 
 
 def _ids(value: object) -> tuple[str, ...]:

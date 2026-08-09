@@ -15,6 +15,9 @@ from autoresearch.domain.models import (
 from autoresearch.storage.repository import ResearchRepository
 
 
+import math
+
+
 class PortfolioSelector:
     def __init__(self, repository: ResearchRepository) -> None:
         self.repository = repository
@@ -33,16 +36,25 @@ class PortfolioSelector:
         if not scored_candidates:
             raise ValueError("No candidate passed the scientific gates.")
 
-        # Diversity-aware selection: avoid selecting candidates with overlapping methods
-        # Compute pairwise methodological diversity using simple word overlap
+        # Diversity-aware selection (N8): IDF-weighted methodological diversity
+        all_cand_objs = [sc[0] for sc in scored_candidates]
         def method_diversity(c1: NoveltyCandidate, c2: NoveltyCandidate) -> float:
             words1 = set(c1.method.lower().split()) | set(c1.causal_mechanism.lower().split())
             words2 = set(c2.method.lower().split()) | set(c2.causal_mechanism.lower().split())
             if not words1 or not words2:
                 return 1.0
-            intersection = words1 & words2
-            union = words1 | words2
-            return 1.0 - (len(intersection) / len(union))  # 1.0 = completely different
+
+            all_docs = [set(c.method.lower().split()) | set(c.causal_mechanism.lower().split()) for c in all_cand_objs]
+            doc_count = len(all_docs)
+            doc_freq = {}
+            for doc in all_docs:
+                for w in doc:
+                    doc_freq[w] = doc_freq.get(w, 0) + 1
+            idf = {w: math.log((doc_count + 1.0) / (df + 1.0)) + 1.0 for w, df in doc_freq.items()}
+
+            inter_weight = sum(idf.get(w, 1.0) for w in (words1 & words2))
+            union_weight = sum(idf.get(w, 1.0) for w in (words1 | words2))
+            return round(1.0 - (inter_weight / max(union_weight, 1e-9)), 4)
 
         # Sort by expected compute efficiency (proxy for low risk/fast execution)
         low_risk = sorted(scored_candidates, key=lambda x: x[1].compute_efficiency_score + x[1].feasibility_score, reverse=True)[0]

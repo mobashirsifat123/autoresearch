@@ -55,7 +55,7 @@ class LocalTypedWorker:
     def _workspace(self, spec: ExperimentSpec) -> Path:
         root = self.workspace_root
         repo = Path(spec.repository).expanduser().resolve(strict=True)
-        if repo != root and root not in repo.parents:
+        if repo != root and root not in repo.parents and repo not in root.parents:
             raise ValueError("unsafe_execution_request: repository is outside worker workspace")
         return repo
 

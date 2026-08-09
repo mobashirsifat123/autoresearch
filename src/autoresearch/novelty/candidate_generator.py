@@ -69,9 +69,39 @@ class LLMCandidateGenerator:
     def __init__(self, router: ModelRouter) -> None:
         self.router = router
 
+import asyncio
+
+_STRATEGY_SYSTEM_PROMPTS = {
+    "limitation root cause elimination": (
+        "You are a world-class AI researcher proposing a novel method to address a validated research gap. "
+        "You MUST propose a method that directly removes the root cause of the documented limitation. "
+        "Do NOT propose a method that merely mitigates symptoms or adds post-processing/regularization."
+    ),
+    "cross-domain mechanism transfer": (
+        "You are a world-class AI researcher proposing a novel method to address a validated research gap. "
+        "You MUST borrow a causal mechanism from a DIFFERENT scientific domain (e.g., control theory, biology, physics, signal processing). "
+        "Do NOT propose mechanisms standard in the target domain."
+    ),
+    "contradiction resolution": (
+        "You are a world-class AI researcher proposing a novel method to address a validated research gap. "
+        "You MUST resolve a fundamental trade-off or contradiction between two opposing paradigms."
+    ),
+    "theoretical boundary extension": (
+        "You are a world-class AI researcher proposing a novel method to address a validated research gap. "
+        "You MUST extend a theoretical formulation beyond its current failure boundary or assumption set."
+    ),
+    "computational bottleneck bypass": (
+        "You are a world-class AI researcher proposing a novel method to address a validated research gap. "
+        "You MUST replace an expensive computational bottleneck with an algorithmic or statistical proxy."
+    ),
+}
+
+
+class LLMCandidateGenerator:
+    def __init__(self, router: ModelRouter) -> None:
+        self.router = router
+
     async def generate(self, gap: ResearchGap, count: int = 5) -> tuple[NoveltyCandidate, ...]:
-        candidates: list[NoveltyCandidate] = []
-        # We prompt the LLM for multiple strategies to generate diverse candidates.
         strategies = [
             "limitation root cause elimination",
             "cross-domain mechanism transfer",
@@ -79,66 +109,84 @@ class LLMCandidateGenerator:
             "theoretical boundary extension",
             "computational bottleneck bypass",
         ]
-        
-        for i in range(min(count, len(strategies))):
-            strategy = strategies[i]
-            messages = [
-                {"role": "system", "content": "You are a world-class AI researcher proposing a novel method to address a validated research gap. Return a precise, highly-detailed structured specification of your proposed method. Reject vague claims."},
-                {"role": "user", "content": f"Prompt version: {PROMPT_VERSION}\nResearch Gap:\n{gap.statement}\nWhy Unsolved: {gap.why_unsolved}\n\nGenerate a candidate using strategy: {strategy}.\n\n{_FIELD_CONTRACT}"}
-            ]
-            
-            payload = await self.router.structured_output(
-                ModelRole.RESEARCH_REASONING,
-                messages=messages,
-                schema={"name": "novelty_candidate", "schema": CANDIDATE_SCHEMA},
-                project_id=gap.project_id,
-                run_id=gap.run_id,
-                operation="novelty_generation",
-            )
-            
-            provider, model = self.router.identity(ModelRole.RESEARCH_REASONING)
-            provenance = ArtifactProvenance.create(
-                project_id=gap.project_id,
-                run_id=gap.run_id,
-                source_evidence=gap.supporting_paper_ids,
-                provider=provider,
-                model=model,
-                prompt_version=PROMPT_VERSION,
-                content=payload,
-            )
-            
-            candidate = NoveltyCandidate(
-                id=uuid4().hex,
-                project_id=gap.project_id,
-                run_id=gap.run_id,
-                gap_id=gap.id,
-                strategy=payload.get("strategy", strategy),
-                method=payload.get("method", ""),
-                causal_mechanism=payload.get("causal_mechanism", ""),
-                target_limitation=payload.get("target_limitation", ""),
-                difference_from_existing=payload.get("difference_from_existing", ""),
-                expected_effect=payload.get("expected_effect", ""),
-                falsification_condition=payload.get("falsification_condition", ""),
-                minimum_validating_experiment=payload.get("minimum_validating_experiment", ""),
-                required_ablations=tuple(payload.get("required_ablations", [])),
-                implementation_complexity=payload.get("implementation_complexity", ""),
-                expected_compute=payload.get("expected_compute", ""),
-                risks_and_objections=tuple(payload.get("risks_and_objections", [])),
-                status=CandidateStatus.GENERATED,
-                provenance=provenance,
-            )
-            candidates.append(candidate)
-            
+        selected_strategies = strategies[:min(count, len(strategies))]
+        tasks = [
+            self._generate_single(gap, strategy)
+            for strategy in selected_strategies
+        ]
+        candidates = await asyncio.gather(*tasks)
         return tuple(candidates)
+
+    async def _generate_single(self, gap: ResearchGap, strategy: str) -> NoveltyCandidate:
+        system_prompt = _STRATEGY_SYSTEM_PROMPTS.get(
+            strategy,
+            "You are a world-class AI researcher proposing a novel method to address a validated research gap. Return a precise, highly-detailed structured specification of your proposed method. Reject vague claims."
+        )
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"Prompt version: {PROMPT_VERSION}\nResearch Gap:\n{gap.statement}\nWhy Unsolved: {gap.why_unsolved}\n\nGenerate a candidate using strategy: {strategy}.\n\n{_FIELD_CONTRACT}"}
+        ]
+
+        payload = await self.router.structured_output(
+            ModelRole.RESEARCH_REASONING,
+            messages=messages,
+            schema={"name": "novelty_candidate", "schema": CANDIDATE_SCHEMA},
+            project_id=gap.project_id,
+            run_id=gap.run_id,
+            operation="novelty_generation",
+        )
+
+        provider, model = self.router.identity(ModelRole.RESEARCH_REASONING)
+        provenance = ArtifactProvenance.create(
+            project_id=gap.project_id,
+            run_id=gap.run_id,
+            source_evidence=gap.supporting_paper_ids,
+            provider=provider,
+            model=model,
+            prompt_version=PROMPT_VERSION,
+            content=payload,
+        )
+
+        return NoveltyCandidate(
+            id=uuid4().hex,
+            project_id=gap.project_id,
+            run_id=gap.run_id,
+            gap_id=gap.id,
+            strategy=payload.get("strategy", strategy),
+            method=payload.get("method", ""),
+            causal_mechanism=payload.get("causal_mechanism", ""),
+            target_limitation=payload.get("target_limitation", ""),
+            difference_from_existing=payload.get("difference_from_existing", ""),
+            expected_effect=payload.get("expected_effect", ""),
+            falsification_condition=payload.get("falsification_condition", ""),
+            minimum_validating_experiment=payload.get("minimum_validating_experiment", ""),
+            required_ablations=tuple(payload.get("required_ablations", [])),
+            implementation_complexity=payload.get("implementation_complexity", ""),
+            expected_compute=payload.get("expected_compute", ""),
+            risks_and_objections=tuple(payload.get("risks_and_objections", [])),
+            status=CandidateStatus.GENERATED,
+            provenance=provenance,
+        )
 
     async def revise(self, candidate: NoveltyCandidate, assessment: PriorArtAssessment, critique: NoveltyCritique, revision_count: int = 1) -> tuple[NoveltyCandidate, CandidateRevision]:
         if revision_count not in (1, 2):
             raise ValueError("Candidate revision is bounded to two rounds")
+
+        score_items = [
+            ("falsifiability", critique.falsifiability_score),
+            ("experimental_discriminability", critique.experimental_discriminability_score),
+            ("feasibility", critique.feasibility_score),
+            ("causal_plausibility", critique.causal_plausibility_score),
+            ("compute_efficiency", critique.compute_efficiency_score),
+        ]
+        weakest = sorted(score_items, key=lambda x: x[1])[:3]
+        weakest_str = ", ".join(f"{name}={score:.2f}" for name, score in weakest)
+
         payload = await self.router.structured_output(
             ModelRole.RESEARCH_REASONING,
             messages=[
                 {"role": "system", "content": "Revise the candidate to address documented overlap and critic objections. Narrow claims when needed. Do not claim novelty. Return the complete candidate schema."},
-                {"role": "user", "content": f"Prompt version: candidate-revision-v1\nMethod: {candidate.method}\nOverlap: {assessment.mechanism_comparison}\nUncertainty: {assessment.unresolved_overlap}\nObjections: {critique.objections}\nRevision round: {revision_count}\n\n{_FIELD_CONTRACT}"},
+                {"role": "user", "content": f"Prompt version: candidate-revision-v2\nMethod: {candidate.method}\nOverlap: {assessment.mechanism_comparison}\nUncertainty: {assessment.unresolved_overlap}\nObjections: {critique.objections}\nWeakest dimensions to improve: {weakest_str}\nRevision round: {revision_count}\n\n{_FIELD_CONTRACT}"},
             ],
             schema={"name": "candidate_revision", "schema": CANDIDATE_SCHEMA},
             project_id=candidate.project_id, run_id=candidate.run_id, operation="candidate_revision",
@@ -146,7 +194,7 @@ class LLMCandidateGenerator:
         provider, model = self.router.identity(ModelRole.RESEARCH_REASONING)
         provenance = ArtifactProvenance.create(project_id=candidate.project_id, run_id=candidate.run_id,
             source_evidence=[candidate.id, assessment.id, critique.id], provider=provider, model=model,
-            prompt_version="candidate-revision-v1", content=payload)
+            prompt_version="candidate-revision-v2", content=payload)
         revised = NoveltyCandidate(
             uuid4().hex, candidate.project_id, candidate.run_id, candidate.gap_id,
             payload.get("strategy", candidate.strategy), payload.get("method", ""), payload.get("causal_mechanism", ""),

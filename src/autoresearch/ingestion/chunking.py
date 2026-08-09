@@ -44,8 +44,21 @@ def chunk_document(document: ParsedDocument, *, target_characters: int = 5000, o
     return tuple(chunks)
 
 
+_SECTION_PATTERNS = [
+    re.compile(r"^(\d+(?:\.\d+)*\s+[A-Z][^\n]{2,80})$", re.M),
+    re.compile(r"^(Abstract|Introduction|Related Work|Background|Methodology|Methods|Experimental Setup|Experiments|Results|Discussion|Limitations|Conclusion|Ablation Study|Ablations|Appendix)\b", re.M | re.I),
+    re.compile(r"^([A-Z][A-Z\s]{3,60})$", re.M),
+]
+
+
 def _section(text: str) -> str:
-    first = text.splitlines()[0][:120]
-    if len(first.split()) <= 12 and (first.isupper() or re.match(r"^\d+(?:\.\d+)*\s+", first)):
-        return first
+    """Multi-pattern section header detection scanning page content."""
+    for line in text.splitlines()[:10]:
+        line_clean = line.strip()
+        if not line_clean:
+            continue
+        for pattern in _SECTION_PATTERNS:
+            match = pattern.search(line_clean)
+            if match:
+                return match.group(0)[:120]
     return "body"

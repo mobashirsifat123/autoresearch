@@ -59,6 +59,15 @@ _CRITIC_PERSPECTIVES = [
 ]
 
 
+from statistics import mean, stdev
+
+_ROLE_WEIGHTS = {
+    "area_chair":  {"novelty_score": 1.5, "significance_score": 1.5, "publication_potential_score": 1.5, "falsifiability_score": 1.2},
+    "skeptic":     {"feasibility_score": 1.5, "implementation_risk_score": 1.5, "compute_efficiency_score": 1.3, "causal_plausibility_score": 1.3},
+    "enthusiast":  {"expected_information_gain_score": 1.3},
+}
+
+
 class ScientificCritic:
     def __init__(self, router: ModelRouter) -> None:
         self.router = router
@@ -70,7 +79,7 @@ class ScientificCritic:
             critique = await self._single_evaluate(candidate, perspective)
             critiques.append(critique)
 
-        # Aggregate scores: mean across ensemble
+        # Aggregate scores: weighted mean across ensemble (N5) & agreement (N6)
         score_keys = [
             "novelty_score", "significance_score", "causal_plausibility_score",
             "falsifiability_score", "experimental_discriminability_score",
@@ -79,9 +88,17 @@ class ScientificCritic:
             "publication_potential_score",
         ]
         aggregated = {}
+        agreement = {}
         for key in score_keys:
-            values = [c[key] for c in critiques]
-            aggregated[key] = round(mean(values), 6)
+            vals = [c[key] for c in critiques]
+            # Role-weighted average
+            w_sum = sum(c[key] * _ROLE_WEIGHTS.get(c["tag"], {}).get(key, 1.0) for c in critiques)
+            w_total = sum(_ROLE_WEIGHTS.get(c["tag"], {}).get(key, 1.0) for c in critiques)
+            aggregated[key] = round(w_sum / max(w_total, 1e-9), 6)
+
+            # Inter-reviewer agreement score (N6): 1.0 = perfect agreement, 0.0 = high disagreement
+            sd = stdev(vals) if len(vals) > 1 else 0.0
+            agreement[key] = round(max(0.0, 1.0 - 2.0 * sd), 4)
 
         # Collect objections and failure scenarios from all perspectives
         all_objections: list[str] = []
@@ -106,7 +123,7 @@ class ScientificCritic:
             source_evidence=[],
             provider=provider, model=model,
             prompt_version=PROMPT_VERSION,
-            content={**aggregated, "perspectives": [c["tag"] for c in critiques],
+            content={**aggregated, "agreement": agreement, "perspectives": [c["tag"] for c in critiques],
                      "ensemble_size": len(critiques)},
         )
 

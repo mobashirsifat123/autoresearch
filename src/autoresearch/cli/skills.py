@@ -75,23 +75,29 @@ class SkillMeta:
 
 
 SKILLS = {
-    "deep-research": SkillMeta(
-        name="deep-research",
+    "review": SkillMeta(
+        name="review",
         version="1.0.0",
-        description="Discover related papers, run an evidence-backed deep review, and surface a cited research gap.",
-        entry='autoresearch skill deep-research --seed-paper <pdf|doi|url>',
+        description="Evidence-backed deep literature review: discover papers, extract evidence, rank by relevance, and surface a cited research gap. Primary skill — run first.",
+        entry='autoresearch skill review --project <id>  # or: autoresearch skill deep-research --seed-paper <pdf|doi|url>',
     ),
     "novelty": SkillMeta(
         name="novelty",
         version="1.0.0",
-        description="Generate, prior-art-check, and adversarially critique novelty candidates for a validated gap.",
+        description="Generate, prior-art-check, and adversarially critique novelty candidates for a validated gap. Run after review.",
         entry='autoresearch skill novelty --project <id>',
     ),
     "experiment": SkillMeta(
         name="experiment",
         version="1.0.0",
-        description="Plan, approve, execute, inspect, and report a falsifiable experiment from a novelty candidate.",
+        description="Plan, approve, execute, inspect, and report a falsifiable experiment from a novelty candidate. Run after novelty.",
         entry='autoresearch skill experiment plan --candidate-id <id>',
+    ),
+    "deep-research": SkillMeta(
+        name="deep-research",
+        version="1.0.0",
+        description="Legacy combined skill: discover + review + gap in one shot. Prefer the 'review' skill for new workflows.",
+        entry='autoresearch skill deep-research --seed-paper <pdf|doi|url>',
     ),
 }
 
