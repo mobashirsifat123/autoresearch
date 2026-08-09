@@ -10,6 +10,7 @@ from autoresearch.domain.models import (
     NoveltyCandidate,
     PriorArtAssessment,
     PriorArtStatus,
+    utc_now,
 )
 from autoresearch.papers.search_pipeline import StudySearchPipeline
 from autoresearch.providers.capabilities import ModelRole
@@ -55,12 +56,12 @@ class EvidenceBackedPriorArtChecker:
         # Step 2: External prior-art search using search pipeline sources directly
         import asyncio
         external_results: list[dict] = []
+        search_queries = [
+            candidate.method[:200],
+            f"{candidate.causal_mechanism[:200]} machine learning",
+            f"{candidate.difference_from_existing[:200]} method",
+        ]
         if self.search_pipeline and hasattr(self.search_pipeline, 'sources') and self.search_pipeline.sources:
-            search_queries = [
-                candidate.method[:200],
-                f"{candidate.causal_mechanism[:200]} machine learning",
-                f"{candidate.difference_from_existing[:200]} method",
-            ]
             external_tasks = []
             for source in self.search_pipeline.sources[:2]:
                 for query in search_queries:
@@ -127,6 +128,16 @@ class EvidenceBackedPriorArtChecker:
             operation="prior_art_check",
         )
 
+        # A corpus-only check cannot legitimately establish broad novelty.  The
+        # explicit status preserves what was searched instead of turning an LLM
+        # absence-of-evidence judgement into a novelty claim.
+        if not external_results and payload.get("overlap_status") == PriorArtStatus.POTENTIALLY_NOVEL.value:
+            payload["overlap_status"] = PriorArtStatus.EXPERT_REVIEW_REQUIRED.value
+            payload["unresolved_overlap"] = (
+                "CORPUS_BOUNDED_ASSESSMENT: not found in the reviewed corpus; "
+                "external prior-art retrieval was unavailable."
+            )
+
         provider, model = self.router.identity(ModelRole.RESEARCH_REASONING)
         provenance = ArtifactProvenance.create(
             project_id=candidate.project_id,
@@ -135,7 +146,9 @@ class EvidenceBackedPriorArtChecker:
             provider=provider,
             model=model,
             prompt_version=PROMPT_VERSION,
-            content={**payload, "external_search_included": bool(external_results)},
+            content={**payload, "external_search_included": bool(external_results),
+                     "queries": search_queries, "retrieval_timestamp": utc_now(),
+                     "retrieved_papers": external_results},
         )
 
         return PriorArtAssessment(

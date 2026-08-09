@@ -329,6 +329,8 @@ class CandidateStatus(StrEnum):
 class ExperimentDecision(StrEnum):
     SUPPORTED = "supported"
     PARTIALLY_SUPPORTED = "partially_supported"
+    REFUTED = "refuted"
+    INSUFFICIENT_EVIDENCE = "insufficient_evidence"
     NO_EFFECT = "no_effect"
     IMPLEMENTATION_FAILURE = "implementation_failure"
     OPTIMIZATION_FAILURE = "optimization_failure"
@@ -485,6 +487,11 @@ class ExperimentSpec:
     network_policy: str = "disabled"
     target_worker: str = "local"
     approval_required: bool = True
+    # The contract is deliberately explicit: validation output is not evidence.
+    required_artifacts: tuple[str, ...] = (
+        "implementation_diff", "training_log", "checkpoint", "seed_metrics",
+        "parameter_profile", "flop_profile", "latency_profile", "evaluation_report",
+    )
 
 
 @dataclass(frozen=True)
@@ -567,6 +574,8 @@ class ExecutionResult:
     checkpoint_manifest: tuple[str, ...]
     failure_classification: str | None
     provenance: ArtifactProvenance
+    identity: Mapping[str, Any] = field(default_factory=dict)
+    artifacts: tuple[Mapping[str, Any], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -587,6 +596,9 @@ class StatisticalAnalysis:
     failure_case_analysis: str
     hypothesis_support_assessment: str
     provenance: ArtifactProvenance
+    decision_gates: Mapping[str, bool | None] = field(default_factory=dict)
+    statistical_tests: Mapping[str, Any] = field(default_factory=dict)
+    evidence_status: str = "INSUFFICIENT_EVIDENCE"
 
 
 @dataclass(frozen=True)

@@ -39,6 +39,7 @@ from autoresearch.release import (
 from autoresearch.versioning import API_VERSION, CLI_VERSION, DATABASE_SCHEMA_VERSION, PRODUCT_VERSION, WORKER_PROTOCOL_VERSION
 
 app = typer.Typer(name="autoresearch", help="AutoResearch local-first coding and scientific workflows.", no_args_is_help=False)
+audit_app = typer.Typer(help="Inspect auditable scientific provenance.")
 
 
 def _paths() -> ProductPaths:
@@ -358,13 +359,34 @@ def resume(
     _run(operation)
 
 
-@app.command()
-def audit(
+@audit_app.command("project")
+def audit_project(
     project: str = typer.Option(..., "--project", help="Project ID to validate."),
     run: str | None = typer.Option(None, "--run", help="Optional run ID to associate with the validation artifact."),
 ) -> None:
     """Validate provenance, evidence, usage, recovery, and secret redaction."""
     _run(lambda container: {"project": project, "validation_path": str(write_audit(container.repository, project, run_id=run))})
+
+
+@audit_app.command("run")
+def audit_run(
+    run_id: str = typer.Argument(..., metavar="RUN_ID"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Emit claim/value/provenance/source verification records for one run."""
+    async def operation(container: ApplicationContainer) -> dict[str, Any]:
+        run = container.repository.get_run(run_id)
+        if not run:
+            raise ValueError(f"run_not_found: {run_id}")
+        claims: list[dict[str, Any]] = []
+        for artifact in container.repository.rows("SELECT id,artifact_type,path,source_evidence_json,checksum,created_at FROM artifacts WHERE run_id=?", (run_id,)):
+            claims.append({"claim": artifact["artifact_type"], "value": artifact["path"], "provenance": "EXTRACTED_FROM_SOURCE", "source_artifact": artifact["id"], "source_run": run_id, "verification": "checksum_recorded"})
+        for analysis in container.repository.rows("SELECT id,hypothesis_support_assessment,provenance_json FROM statistical_analyses WHERE run_id=?", (run_id,)):
+            claims.append({"claim": "experiment_decision", "value": analysis["hypothesis_support_assessment"], "provenance": "DERIVED", "source_artifact": analysis["id"], "source_run": run_id, "verification": "deterministic_gates_required"})
+        for report in container.repository.rows("SELECT id,decision,decision_evidence FROM experiment_reports WHERE run_id=?", (run_id,)):
+            claims.append({"claim": "experiment_report", "value": report["decision"], "provenance": "DERIVED", "source_artifact": report["id"], "source_run": run_id, "verification": report["decision_evidence"]})
+        return {"run_id": run_id, "kind": run.kind.value, "status": run.status.value, "claims": claims}
+    _run(operation)
 
 
 def _run(operation: Any) -> None:
@@ -383,6 +405,7 @@ def _run(operation: Any) -> None:
 
 
 app.add_typer(skill_app)
+app.add_typer(audit_app, name="audit")
 
 
 def main() -> None:

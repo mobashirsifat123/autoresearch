@@ -157,7 +157,7 @@ class LLMCandidateGenerator:
             causal_mechanism=payload.get("causal_mechanism", ""),
             target_limitation=payload.get("target_limitation", ""),
             difference_from_existing=payload.get("difference_from_existing", ""),
-            expected_effect=payload.get("expected_effect", ""),
+            expected_effect=_model_hypothesis(payload.get("expected_effect", "")),
             falsification_condition=payload.get("falsification_condition", ""),
             minimum_validating_experiment=payload.get("minimum_validating_experiment", ""),
             required_ablations=tuple(payload.get("required_ablations", [])),
@@ -198,7 +198,7 @@ class LLMCandidateGenerator:
         revised = NoveltyCandidate(
             uuid4().hex, candidate.project_id, candidate.run_id, candidate.gap_id,
             payload.get("strategy", candidate.strategy), payload.get("method", ""), payload.get("causal_mechanism", ""),
-            payload.get("target_limitation", ""), payload.get("difference_from_existing", ""), payload.get("expected_effect", ""),
+            payload.get("target_limitation", ""), payload.get("difference_from_existing", ""), _model_hypothesis(payload.get("expected_effect", "")),
             payload.get("falsification_condition", ""), payload.get("minimum_validating_experiment", ""),
             tuple(payload.get("required_ablations", [])), payload.get("implementation_complexity", ""), payload.get("expected_compute", ""),
             tuple(payload.get("risks_and_objections", [])), CandidateStatus.GENERATED, provenance,
@@ -206,3 +206,10 @@ class LLMCandidateGenerator:
         revision = CandidateRevision(uuid4().hex, candidate.project_id, candidate.run_id, candidate.id, revised.id,
             critique.id, revision_count, assessment.mechanism_comparison or "Revised to reduce documented overlap.", provenance)
         return revised, revision
+
+
+def _model_hypothesis(value: object) -> str:
+    text = str(value or "").strip()
+    if not text or text.startswith("MODEL_HYPOTHESIS:"):
+        return text
+    return f"MODEL_HYPOTHESIS: {text}"

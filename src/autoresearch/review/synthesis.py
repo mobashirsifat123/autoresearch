@@ -20,8 +20,21 @@ class ReviewSynthesisWriter:
         paper_map = {paper.id: paper for paper in papers}
         review_map = {review.paper_id: review for review in reviews}
         claim_map = {claim.id: claim for claim in claims}
+        downloads = self.repository.rows("SELECT paper_id,status,path FROM download_records WHERE project_id=? ORDER BY created_at", (project_id,))
+        legal_full_text = {str(row["paper_id"]) for row in downloads if row["status"] == "downloaded" and row.get("path")}
+        reviewed_ids = set(review_map)
+        evidence_papers = {claim.paper_id for claim in claims}
+        verified_evidence = {claim.paper_id for claim in claims if claim.excerpt.strip()}
+        coverage = {
+            "papers_ingested": len(papers), "papers_parsed": len(reviewed_ids),
+            "full_text_papers": len(legal_full_text), "abstract_only_papers": len(set(paper_map) - legal_full_text),
+            "papers_with_extracted_evidence": len(evidence_papers),
+            "papers_with_verified_evidence": len(verified_evidence),
+            "failures": len(self.repository.rows("SELECT id FROM review_failures WHERE run_id=?", (run_id,))),
+        }
         payload = {
             "project_id": project_id, "run_id": run_id,
+            "coverage": coverage,
             "provenance": {"provider": gap.provenance.provider, "model": gap.provenance.model, "prompt_version": gap.provenance.prompt_version, "timestamp": gap.provenance.created_at, "checksum": gap.provenance.checksum, "source_evidence": gap.provenance.source_evidence},
             "ranked_papers": [{"rank": index, "paper": _paper_payload(paper_map[score.paper_id]), "review": _review_payload(review_map[score.paper_id]), "score": {"total": score.total, **dict(score.explanation)}} for index, score in enumerate(scores, start=1)],
             "gap": {"statement": gap.statement, "classification": gap.classification.value, "supporting_paper_ids": gap.supporting_paper_ids, "supporting_claims": [_claim_payload(claim_map[item]) for item in gap.supporting_claim_ids], "why_existing_work_does_not_solve_it": gap.why_unsolved, "missing_experiment": gap.missing_experiment, "falsification_test": gap.falsification_test, "confidence": gap.confidence, "counter_evidence": [_claim_payload(claim_map[item]) for item in gap.counter_evidence_claim_ids if item in claim_map]},
@@ -46,7 +59,7 @@ def _paper_payload(paper: PaperRecord) -> dict:
 
 
 def _review_payload(review: PaperReview) -> dict:
-    return {"problem": review.problem, "research_question": review.research_question, "method": review.method, "datasets": review.datasets, "experimental_protocol": review.experimental_protocol, "results": review.results, "ablations": review.ablations, "limitations": review.limitations, "failure_modes": review.failure_modes, "confidence": review.confidence, "evidence_claim_ids": review.evidence_claim_ids}
+    return {"problem": review.problem, "research_question": review.research_question, "method": review.method, "datasets": review.datasets, "experimental_protocol": review.experimental_protocol, "results": review.results, "ablations": review.ablations, "limitations": review.limitations, "failure_modes": review.failure_modes, "llm_evidence_support_score": review.confidence, "evidence_claim_ids": review.evidence_claim_ids}
 
 
 def _claim_payload(claim: EvidenceClaim) -> dict:
@@ -60,7 +73,7 @@ def _markdown(payload: dict) -> str:
         "# Evidence-cited Research Gap",
         "",
         f"**Classification:** {gap['classification']}",
-        f"**Confidence:** {gap['confidence']:.2f}",
+        f"**LLM evidence-support score (not statistical confidence):** {gap['confidence']:.2f}",
         "",
         "## Provenance",
         "",
@@ -83,6 +96,8 @@ def _markdown(payload: dict) -> str:
         "## Supporting evidence",
         "",
     ]
+    coverage = payload.get("coverage", {})
+    lines.extend(["## Review coverage", "", *[f"- {key.replace('_', ' ')}: {value}" for key, value in coverage.items()], ""])
     for claim in gap["supporting_claims"]:
         lines.extend([f"- `{claim['paper_id']}` — {claim['statement']}", f"  > {claim['excerpt']}"])
     lines.extend(["", "## Missing experiment", "", gap["missing_experiment"], "", "## Falsification test", "", gap["falsification_test"], "", "## Counter-evidence", ""])

@@ -100,7 +100,10 @@ class NoveltyPipeline:
                 bool(candidate.difference_from_existing.strip()),
                 bool(candidate.falsification_condition.strip()),
                 bool(candidate.minimum_validating_experiment.strip()),
-                assessment.overlap_status.value not in ("unsupported", "expert_review_required"),
+                # Corpus-bounded assessments may remain visible to a human as
+                # candidates, but their ledger retains EXPERT_REVIEW_REQUIRED;
+                # they never become a broad POTENTIALLY_NOVEL claim.
+                assessment.overlap_status.value not in ("unsupported", "known_method"),
                 critique.falsifiability_score > 0,
                 critique.experimental_discriminability_score > 0,
                 critique.feasibility_score > 0,

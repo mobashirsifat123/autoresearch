@@ -710,7 +710,11 @@ class ExperimentService:
         scripts = [item for item in spec.expected_outputs if str(item).endswith(".py")]
         if scripts:
             return (ExecutionAction(ActionType.RUN_PYTHON_SCRIPT, str(scripts[0]), ()),)
-        return (ExecutionAction(ActionType.RUN_PYTEST, ".", ()),)
+        # A test suite validates an environment; it is never an experiment.
+        # Refuse execution unless the immutable spec names an actual experiment
+        # entry point.  This prevents ``pytest .`` from being mislabelled as
+        # model training or evaluation.
+        raise ValueError("experiment_action_missing: spec must declare an explicit scientific Python entry point")
 
     def _execution_worker(self, spec: ExperimentSpec) -> str:
         """Bind approval to the worker that will actually execute.
@@ -783,33 +787,14 @@ class ExperimentService:
                     raise PermissionError("approval_expired: experiment approval has expired")
                 result = await self.worker.run(spec, self.action_plan(spec), approved_checksum=str(preview["checksum"]), timeout_seconds=int(approval.get("approved_budget") or 3600))
                 if result.get("state") != "COMPLETED":
-                    raise RuntimeError("validation_failed: worker did not complete the approved action plan")
-                from autoresearch.domain.models import StatisticalAnalysis
-                analysis = StatisticalAnalysis(
-                    id=uuid4().hex,
-                    project_id=spec.project_id,
-                    run_id=spec.run_id,
-                    spec_id=spec.id,
-                    baseline_metrics={"mAP50-95": 0.58555, "params": 2620000, "gflops": 6.6},
-                    proposed_metrics={"mAP50-95": 0.59628, "params": 2450000, "gflops": 3.96},
-                    effect_size={"mAP50-95": 0.01073},
-                    confidence_intervals={"mAP50-95": (0.005, 0.016)},
-                    seed_level_results=({"seed": 42, "mAP50-95": 0.59628}, {"seed": 123, "mAP50-95": 0.59580}, {"seed": 456, "mAP50-95": 0.59650}),
-                    ablation_contributions={"spatial_windowing": 0.008, "sparse_masking": 0.003},
-                    parameter_count_diff=-170000,
-                    flops_latency_diff=-2.64,
-                    training_inference_cost=0.0,
-                    failure_case_analysis="No significant failure modes detected under 1% label budget.",
-                    hypothesis_support_assessment="SUPPORTED: SGKH reduces parameters by >50% and FLOPs by >40% while improving mAP50-95 by +1.83% rel over baseline.",
-                    provenance=ArtifactProvenance.create(
-                        project_id=spec.project_id, run_id=spec.run_id,
-                        source_evidence=(result.get("id", "worker"),),
-                        provider="local_worker", model="policy_worker",
-                        prompt_version="analysis-v1",
-                        content={"status": "completed"}
-                    )
-                )
-                self.repository.save_statistical_analysis(analysis)
+                    raise RuntimeError("execution_failed: worker did not complete the approved scientific action")
+                # Completion only proves that a command ended successfully.  It
+                # deliberately creates no scientific result: artifact ingestion
+                # and identity validation are required before analysis.
+                self.repository.append_api_event(run.id, "experiment.execution_completed", {
+                    "job_id": result.get("job_id"), "scientific_result": "INSUFFICIENT_EVIDENCE",
+                    "reason": "no validated measurement artifact ingested",
+                })
             if owns_run:
                 self.repository.finish_run(run.id)
             return spec.id
