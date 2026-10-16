@@ -473,26 +473,11 @@ class ManuscriptService:
     def _tables(self, analysis) -> tuple[str, str]:
         if analysis is None:
             return ("No validated measurements available.", "% No validated measurements available.")
-        header = "| Metric | Baseline (mean) | Candidate (mean) | Mean difference | Interval | Gate |"
-        divider = "|---|---|---|---|---|---|"
-        rows = []
-        tex_rows = []
-        for metric in sorted(analysis.proposed_metrics):
-            baseline = float(dict(analysis.baseline_metrics).get(metric, 0.0))
-            proposed = float(dict(analysis.proposed_metrics)[metric])
-            effect = float(dict(analysis.effect_size).get(metric, 0.0))
-            low, high = dict(analysis.confidence_intervals).get(metric, (0.0, 0.0))
-            gate = dict(analysis.decision_gates).get(f"{metric}_gate")
-            gate_text = "PASS" if gate else "FAIL" if gate is not None else "—"
-            rows.append(f"| {metric} | {baseline:.4f} | {proposed:.4f} | {effect:+.4f} | [{low:+.4f}, {high:+.4f}] | {gate_text} |")
-            tex_rows.append(f"{metric} & {baseline:.4f} & {proposed:.4f} & {effect:+.4f} & [{low:+.4f}, {high:+.4f}] & {gate_text} \\\\")
-        markdown = "\n".join([header, divider, *rows])
-        latex = (
-            "\\begin{table}[h]\\centering\\begin{tabular}{lccccc}\\toprule\n"
-            "Metric & Baseline & Candidate & Difference & Interval & Gate \\\\\n\\midrule\n"
-            + "\n".join(tex_rows) + "\n\\bottomrule\\end{tabular}\\caption{Measured per-seed statistics (deterministic analysis of raw observations).}\\end{table}"
-        )
-        return markdown, latex
+        # M1 upgrade (2026-10-16): mean±std / Cohen's d / exact p / n table
+        # engine; deterministic, derived only from the analysis record.
+        from autoresearch.application.tables import build_result_tables
+
+        return build_result_tables(analysis)
 
     @staticmethod
     def _bibtex(papers: list[dict[str, Any]], keys: dict[str, str]) -> str:

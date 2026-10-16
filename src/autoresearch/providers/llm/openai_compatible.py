@@ -64,8 +64,11 @@ class OpenAICompatibleProvider(HTTPProviderBase):
 
     async def complete(self, *, model: str, messages: list[dict[str, Any]], temperature: float = 0.2, max_tokens: int | None = None, response_format: dict[str, Any] | None = None, tools: list[dict[str, Any]] | None = None) -> CompletionResult:
         body: dict[str, Any] = {"model": model, "messages": messages, "temperature": temperature}
-        if max_tokens is not None:
-            body["max_tokens"] = max_tokens
+        # Unlimited call sites map to the provider's default output cap (the
+        # OpenAI protocol has no "unlimited"); the reported effective cap keeps
+        # the router's truncation self-heal able to double it. Mirrors the
+        # anthropic adapter's policy.
+        body["max_tokens"] = max_tokens if max_tokens is not None else int(getattr(self.config, "default_max_output_tokens", 65536))
         # Reasoning-budget cap (see _thinking_budget): config-first, env override.
         budget = _thinking_budget(self.config.thinking_budget)
         if budget is not None:
@@ -83,7 +86,7 @@ class OpenAICompatibleProvider(HTTPProviderBase):
             text = choice.get("content") or ""
         except (KeyError, IndexError, TypeError) as exc:
             raise ProviderError("Provider response omitted choices[0].message.", ErrorKind.SCHEMA, self.name) from exc
-        raw = {"tool_calls": choice.get("tool_calls") or [], "finish_reason": (payload.get("choices") or [{}])[0].get("finish_reason")}
+        raw = {"tool_calls": choice.get("tool_calls") or [], "finish_reason": (payload.get("choices") or [{}])[0].get("finish_reason"), "effective_max_tokens": body["max_tokens"]}
         return self.completion_result(text=str(text), model=str(payload.get("model") or model), usage=payload.get("usage") or {}, request_id=headers.get("x-request-id") or payload.get("id"), raw=raw)
 
     def stream(self, *, model: str, messages: list[dict[str, Any]], temperature: float = 0.2, max_tokens: int | None = None) -> AsyncIterator[str]:
