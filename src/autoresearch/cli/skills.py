@@ -262,7 +262,7 @@ def _selected_or_all(names: list[str]) -> list[str]:
 @skill_app.command("install")
 def skill_install(
     names: list[str] = typer.Argument(None, help="Skills to install (default: all)."),
-    target: str = typer.Option("claude", "--target", help="Install target: claude, opencode, or all."),
+    target: str = typer.Option("all", "--target", help="Install target: claude, opencode, or all (default: all installed targets)."),
     force: bool = typer.Option(False, "--force", help="Overwrite a colliding skill we did not install."),
 ) -> None:
     """Install canonical skills into the Claude Code and/or OpenCode skill directories."""
@@ -285,7 +285,7 @@ def skill_install(
 @skill_app.command("update")
 def skill_update(
     names: list[str] = typer.Argument(None, help="Skills to refresh (default: all)."),
-    target: str = typer.Option("claude", "--target", help="Update target: claude, opencode, or all."),
+    target: str = typer.Option("all", "--target", help="Update target: claude, opencode, or all (default: all installed targets)."),
 ) -> None:
     """Re-sync installed skills from the canonical package copies."""
     roots = _target_roots(target)
@@ -307,7 +307,7 @@ def skill_update(
 @skill_app.command("uninstall")
 def skill_uninstall(
     names: list[str] = typer.Argument(None, help="Skills to remove (default: all installed by this tool)."),
-    target: str = typer.Option("claude", "--target", help="Removal target: claude, opencode, or all."),
+    target: str = typer.Option("all", "--target", help="Removal target: claude, opencode, or all (default: all installed targets)."),
 ) -> None:
     """Remove only skill directories this tool installed (provenance-marked)."""
     import shutil
