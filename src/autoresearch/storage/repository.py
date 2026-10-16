@@ -596,13 +596,41 @@ class ResearchRepository:
                 (portfolio.id, portfolio.project_id, portfolio.run_id, portfolio.low_risk_candidate_id, portfolio.balanced_candidate_id, portfolio.high_risk_candidate_id, _json(portfolio.selection_reasons), _json_provenance(portfolio.provenance))
             )
 
+    def _portfolio_from_record(self, record: dict[str, Any]) -> NoveltyPortfolio:
+        members = {row["tier"]: row["candidate_id"] for row in self.rows("SELECT tier,candidate_id FROM novelty_portfolio_members WHERE portfolio_id=?", (record["id"],))}
+        return NoveltyPortfolio(record["id"], record["project_id"], record["run_id"], members.get("low_risk"), members.get("balanced"), members.get("high_risk"), _loads(record["selection_reasons_json"], {}), _provenance(record["provenance_json"]))
+
     def get_novelty_portfolio(self, run_id: str) -> NoveltyPortfolio | None:
         record = self.row("SELECT * FROM novelty_portfolio_records WHERE run_id=?", (run_id,))
         if record:
-            members = {row["tier"]: row["candidate_id"] for row in self.rows("SELECT tier,candidate_id FROM novelty_portfolio_members WHERE portfolio_id=?", (record["id"],))}
-            return NoveltyPortfolio(record["id"], record["project_id"], record["run_id"], members.get("low_risk"), members.get("balanced"), members.get("high_risk"), _loads(record["selection_reasons_json"], {}), _provenance(record["provenance_json"]))
+            return self._portfolio_from_record(record)
         row = self.row("SELECT * FROM novelty_portfolios WHERE run_id=?", (run_id,))
         return _novelty_portfolio(row) if row else None
+
+    def get_novelty_portfolio_by_id(self, portfolio_id: str) -> NoveltyPortfolio | None:
+        record = self.row("SELECT * FROM novelty_portfolio_records WHERE id=?", (portfolio_id,))
+        if record:
+            return self._portfolio_from_record(record)
+        row = self.row("SELECT * FROM novelty_portfolios WHERE id=?", (portfolio_id,))
+        return _novelty_portfolio(row) if row else None
+
+    def novelty_portfolios_for_project(self, project_id: str) -> list[NoveltyPortfolio]:
+        # Newest first. The record schema is authoritative; legacy rows are
+        # appended for back-compat. Three-tier portfolios are written to BOTH
+        # tables, so dedupe by id before returning.
+        seen: set[str] = set()
+        portfolios: list[NoveltyPortfolio] = []
+        for record in self.rows("SELECT * FROM novelty_portfolio_records WHERE project_id=? ORDER BY rowid DESC", (project_id,)):
+            portfolios.append(self._portfolio_from_record(record))
+            seen.add(str(record["id"]))
+        for row in self.rows("SELECT * FROM novelty_portfolios WHERE project_id=? ORDER BY rowid DESC", (project_id,)):
+            if str(row["id"]) not in seen:
+                portfolios.append(_novelty_portfolio(row))
+        return portfolios
+
+    def latest_novelty_portfolio(self, project_id: str) -> NoveltyPortfolio | None:
+        portfolios = self.novelty_portfolios_for_project(project_id)
+        return portfolios[0] if portfolios else None
 
     def save_novelty_claim_ledger(self, ledger: NoveltyClaimLedger) -> None:
         self.execute(

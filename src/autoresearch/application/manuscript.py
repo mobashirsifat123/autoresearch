@@ -114,10 +114,8 @@ class ManuscriptService:
             return {"project_id": project_id}, gaps
 
         portfolio = None
-        for row in self.repository.rows(
-            "SELECT * FROM novelty_portfolios WHERE project_id=? ORDER BY rowid DESC", (project_id,)
-        ):
-            candidate_id = row["low_risk_candidate_id"] or row["balanced_candidate_id"] or row["high_risk_candidate_id"]
+        for row in self.repository.novelty_portfolios_for_project(project_id):
+            candidate_id = row.low_risk_candidate_id or row.balanced_candidate_id or row.high_risk_candidate_id
             candidate = self.repository.get_novelty_candidate(str(candidate_id)) if candidate_id else None
             if candidate and str(candidate.gap_id) == str(gap_row["id"]):
                 portfolio = row
@@ -159,7 +157,7 @@ class ManuscriptService:
             "project_id": project_id,
             "gap_id": str(gap_row["id"]),
             "review_run_id": str(gap_row["run_id"]),
-            "portfolio_id": str(portfolio["id"]) if portfolio else None,
+            "portfolio_id": str(portfolio.id) if portfolio else None,
             "candidate_id": freeze.candidate_id if freeze else None,
             "methodology_freeze_id": freeze.id if freeze else None,
             "methodology_version": freeze.version if freeze else None,

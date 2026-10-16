@@ -24,6 +24,12 @@ class ProviderConfig:
     # Fallback deadlines used when the config leaves read/total at zero.
     default_read_timeout: float = 3600.0
     default_total_timeout: float = 7200.0
+    # Output-cap default used when a call site requests UNLIMITED output but
+    # the wire protocol REQUIRES a finite cap (Anthropic /v1/messages).
+    # Reasoning models spend hidden thinking against the same budget, so this
+    # must be model-family maximum class — the old 8192 default silently
+    # truncated structured outputs and stalled every skill.
+    default_max_output_tokens: int = 65536
     max_retries: int = 2
     concurrency: int = 4
     max_concurrency: int | None = None

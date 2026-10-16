@@ -115,28 +115,28 @@ class WorkflowService:
             return self._result(project, dispositions, stopped_at=until)
 
         # ---- Stage 2: hypotheses (novelty portfolio for THIS question) ----
-        portfolio_row = self.repository.row(
-            "SELECT * FROM novelty_portfolios WHERE project_id=? ORDER BY rowid DESC LIMIT 1", (project,)
-        )
+        portfolio_row = self.repository.latest_novelty_portfolio(project)
         if portfolio_row is not None:
             # Coherence: a portfolio generated for a different gap must not be
             # reused for the question this run reports.
             portfolio_gap = self.repository.row(
                 "SELECT gap_id FROM novelty_candidates WHERE id=?",
-                (portfolio_row["low_risk_candidate_id"] or portfolio_row["balanced_candidate_id"] or portfolio_row["high_risk_candidate_id"],),
+                (portfolio_row.low_risk_candidate_id or portfolio_row.balanced_candidate_id or portfolio_row.high_risk_candidate_id,),
             )
             if portfolio_gap and str(portfolio_gap["gap_id"]) != str(gap["id"]):
                 record("hypotheses", "regenerated", reason="existing portfolio targets a different question",
-                       previous_portfolio_id=portfolio_row["id"])
+                       previous_portfolio_id=portfolio_row.id)
                 portfolio_row = None
         if portfolio_row is not None:
-            record("hypotheses", "reused", portfolio_id=portfolio_row["id"],
-                   candidates=[portfolio_row["low_risk_candidate_id"], portfolio_row["balanced_candidate_id"], portfolio_row["high_risk_candidate_id"]])
+            record("hypotheses", "reused", portfolio_id=portfolio_row.id,
+                   candidates=[portfolio_row.low_risk_candidate_id, portfolio_row.balanced_candidate_id, portfolio_row.high_risk_candidate_id])
         else:
             portfolio_id = await self.novelty.generate_portfolio(project, gap_id=str(gap["id"]))
-            portfolio_row = self.repository.row("SELECT * FROM novelty_portfolios WHERE id=?", (portfolio_id,))
-            record("hypotheses", "completed", portfolio_id=portfolio_id,
-                   candidates=[portfolio_row["low_risk_candidate_id"], portfolio_row["balanced_candidate_id"], portfolio_row["high_risk_candidate_id"]])
+            portfolio_row = self.repository.get_novelty_portfolio_by_id(str(portfolio_id))
+            if portfolio_row is None:
+                raise RuntimeError(f"portfolio_missing_after_generation: {portfolio_id}")
+            record("hypotheses", "completed", portfolio_id=portfolio_row.id,
+                   candidates=[portfolio_row.low_risk_candidate_id, portfolio_row.balanced_candidate_id, portfolio_row.high_risk_candidate_id])
         if _STAGE_ORDER[until] <= _STAGE_ORDER["hypotheses"]:
             return self._result(project, dispositions, stopped_at=until)
 
@@ -146,7 +146,7 @@ class WorkflowService:
             record("methodology", "reused", methodology_freeze_id=freeze.id, version=freeze.version,
                    candidate_id=freeze.candidate_id, artifact=freeze.artifact_path)
         else:
-            candidate_id = portfolio_row["low_risk_candidate_id"] or portfolio_row["balanced_candidate_id"] or portfolio_row["high_risk_candidate_id"]
+            candidate_id = portfolio_row.low_risk_candidate_id or portfolio_row.balanced_candidate_id or portfolio_row.high_risk_candidate_id
             candidate = self.repository.get_novelty_candidate(str(candidate_id))
             if candidate is None:
                 raise RuntimeError(f"portfolio_candidate_missing: {candidate_id}")
@@ -158,7 +158,7 @@ class WorkflowService:
             # The freeze attaches to the candidate's own novelty run via its
             # provenance; no extra mislabeled run is created.
             freeze = await self.freezer.freeze(
-                candidate, selection_rationale=rationale, portfolio_id=str(portfolio_row["id"]),
+                candidate, selection_rationale=rationale, portfolio_id=str(portfolio_row.id),
             )
             record("methodology", "completed", methodology_freeze_id=freeze.id, version=freeze.version,
                    candidate_id=freeze.candidate_id, artifact=freeze.artifact_path)

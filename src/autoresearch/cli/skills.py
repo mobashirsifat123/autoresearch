@@ -555,11 +555,11 @@ def novelty(
         if not existing:
             raise ValueError(f"project_not_found: project '{project}' not found")
         portfolio_id = await c.novelty.generate_portfolio(project, gap_id=gap_id, max_runtime_seconds=max_runtime_seconds)
-        portfolio = c.repository.row("SELECT * FROM novelty_portfolios WHERE id=?", (portfolio_id,))
+        portfolio = c.repository.get_novelty_portfolio_by_id(portfolio_id)
         if not portfolio:
             raise ValueError(f"portfolio_not_found: novelty portfolio '{portfolio_id}' not found")
         candidate_ids = tuple(
-            value for value in (portfolio["low_risk_candidate_id"], portfolio["balanced_candidate_id"], portfolio["high_risk_candidate_id"])
+            value for value in (portfolio.low_risk_candidate_id, portfolio.balanced_candidate_id, portfolio.high_risk_candidate_id)
             if value
         )
         candidates = []
@@ -587,9 +587,9 @@ def novelty(
             "gap_id": resolved_gap_id,
             "candidate_ids": list(candidate_ids),
             "candidates": candidates,
-            "low_risk_candidate_id": portfolio["low_risk_candidate_id"],
-            "balanced_candidate_id": portfolio["balanced_candidate_id"],
-            "high_risk_candidate_id": portfolio["high_risk_candidate_id"],
+            "low_risk_candidate_id": portfolio.low_risk_candidate_id,
+            "balanced_candidate_id": portfolio.balanced_candidate_id,
+            "high_risk_candidate_id": portfolio.high_risk_candidate_id,
         }
 
     _invoke(operation, operation_name="novelty")

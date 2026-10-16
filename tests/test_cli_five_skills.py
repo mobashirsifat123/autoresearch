@@ -145,6 +145,49 @@ def test_install_targets_are_validated():
     assert "Traceback" not in result.output
 
 
+def test_anthropic_unlimited_calls_use_model_maximum_not_8192():
+    """Regression (owner-reported): the Anthropic protocol requires an explicit
+    output cap; the old default of 8192 was eaten by glm-5.3's hidden reasoning
+    and silently truncated every structured output — no skill could finish.
+    Unlimited call sites must now send the model-family maximum default, and a
+    rejected cap steps down to the largest accepted value."""
+    import asyncio
+    import json as _json
+
+    import httpx
+
+    from autoresearch.providers.capabilities import Capability
+    from autoresearch.providers.config import ProviderConfig
+    from autoresearch.providers.llm.anthropic import AnthropicProvider
+
+    config = ProviderConfig("reasoning", "anthropic", "https://api.z.ai/api/anthropic", "KEY_ENV", frozenset({Capability.TEXT}))
+    sent: list[dict] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        body = _json.loads(request.content.decode())
+        sent.append(body)
+        if body["max_tokens"] > 65536:  # endpoint rejects caps above its model maximum
+            return httpx.Response(400, json={"error": {"message": "max_tokens: maximum 65536 is allowed for this model"}})
+        return httpx.Response(200, json={
+            "content": [{"type": "text", "text": "ok"}],
+            "stop_reason": "end_turn", "model": "glm-5.3", "usage": {},
+        })
+
+    provider = AnthropicProvider(config, transport=httpx.MockTransport(respond))
+
+    async def run():
+        try:
+            result = await provider.complete(model="glm-5.3", messages=[{"role": "user", "content": "hi"}])
+            return result
+        finally:
+            await provider.close()
+
+    result = asyncio.run(run())
+    assert result.text == "ok"
+    assert sent, "no request captured"
+    assert sent[0]["max_tokens"] == 65536  # unlimited → model-family maximum, never 8192
+
+
 def test_zero_timeouts_yield_finite_deadlines():
     """Zero read/total timeouts must fall back to generous FINITE deadlines —
     a wedged connection may cost an hour, never a forever-hang (regression:
@@ -254,6 +297,6 @@ def test_genuine_tool_omission_still_fails_closed_with_reason(monkeypatch):
         result = loop.run_until_complete(respond({"content": [{"type": "text", "text": "partial"}], "stop_reason": "max_tokens"}))
         assert result.text == ""
         assert result.raw["finish_reason"] == "length"
-        assert result.raw["effective_max_tokens"] == 8192
+        assert result.raw["effective_max_tokens"] == 65536
     finally:
         loop.close()
