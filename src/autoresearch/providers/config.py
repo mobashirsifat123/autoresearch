@@ -16,9 +16,14 @@ class ProviderConfig:
     api_key_env: str
     capabilities: frozenset[Capability]
     connect_timeout: float = 5.0
-    # Zero means no read or total deadline. Connection failures still have a timeout.
+    # Zero means "no user-specified deadline": a generous FINITE default is
+    # applied instead (read 3600s, total 7200s) — slow reasoning still
+    # finishes, but a wedged connection can no longer stall a run forever.
     read_timeout: float = 0.0
     total_timeout: float = 0.0
+    # Fallback deadlines used when the config leaves read/total at zero.
+    default_read_timeout: float = 3600.0
+    default_total_timeout: float = 7200.0
     max_retries: int = 2
     concurrency: int = 4
     max_concurrency: int | None = None

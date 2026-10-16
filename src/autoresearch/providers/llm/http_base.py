@@ -101,7 +101,9 @@ class HTTPProviderBase:
         self._semaphore = asyncio.Semaphore(config.concurrency)
         self._gate = AdaptiveGate(concurrency=config.concurrency, ceiling=config.max_concurrency)
         self._limiter = AsyncRateLimiter(config.requests_per_second)
-        timeout = httpx.Timeout(config.total_timeout or None, connect=config.connect_timeout, read=config.read_timeout or None)
+        read_deadline = config.read_timeout or config.default_read_timeout
+        total_deadline = config.total_timeout or config.default_total_timeout
+        timeout = httpx.Timeout(total_deadline, connect=config.connect_timeout, read=read_deadline)
         self.client = httpx.AsyncClient(base_url=config.base_url.rstrip("/"), timeout=timeout, transport=transport)
         self._retry_count: ContextVar[int] = ContextVar(f"autoresearch_retry_count_{config.name}", default=0)
 
@@ -148,7 +150,7 @@ class HTTPProviderBase:
         try:
             # httpx timeouts apply to individual I/O phases, not total elapsed
             # time. Include queueing, rate limits, retries, and backoff here.
-            async with asyncio.timeout(self.config.total_timeout or None):
+            async with asyncio.timeout(self.config.total_timeout or self.config.default_total_timeout):
                 result = await with_retry(operation, attempts=self.config.max_retries + 1, on_retry=record_retry)
         except TimeoutError as exc:
             raise ProviderError("Provider total request deadline exceeded (including retries and queueing).", ErrorKind.TIMEOUT, self.name) from exc

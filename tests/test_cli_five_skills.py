@@ -143,3 +143,31 @@ def test_install_targets_are_validated():
     result = _invoke("skill", "install", "--target", "not-a-target")
     assert result.exit_code != 0
     assert "Traceback" not in result.output
+
+
+def test_zero_timeouts_yield_finite_deadlines():
+    """Zero read/total timeouts must fall back to generous FINITE deadlines —
+    a wedged connection may cost an hour, never a forever-hang (regression:
+    two live runs stalled ~1h on dead sockets with infinite deadlines)."""
+    import httpx
+
+    from autoresearch.providers.config import ProviderConfig
+    from autoresearch.providers.llm.http_base import HTTPProviderBase
+
+    config = ProviderConfig("reasoning", "openai_compatible", "https://api.example.com/v1", "KEY_ENV", frozenset())
+    provider = HTTPProviderBase.__new__(HTTPProviderBase)
+    provider.config = config
+    provider.client = httpx.AsyncClient(
+        timeout=httpx.Timeout(
+            config.total_timeout or config.default_total_timeout,
+            connect=config.connect_timeout,
+            read=config.read_timeout or config.default_read_timeout,
+        )
+    )
+    try:
+        assert provider.client.timeout.read == 3600.0
+        assert provider.client.timeout.connect == 5.0
+    finally:
+        import asyncio
+
+        asyncio.get_event_loop_policy().new_event_loop().run_until_complete(provider.client.aclose())
