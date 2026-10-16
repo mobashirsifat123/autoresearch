@@ -42,16 +42,42 @@ class AnthropicProvider(HTTPProviderBase):
             body["tools"] = [_anthropic_tool(tool) for tool in tools]
         payload, headers = await self.request_json("POST", "/v1/messages", headers=self.headers(), json_body=body)
         blocks = payload.get("content") or []
+        stop_reason = payload.get("stop_reason")
         if structured_tool_name:
             structured = next((block for block in blocks if block.get("type") == "tool_use" and block.get("name") == structured_tool_name), None)
             if not structured or not isinstance(structured.get("input"), dict):
-                raise ProviderError("Anthropic response omitted the required structured tool output.", ErrorKind.SCHEMA, self.name)
+                if stop_reason == "max_tokens":
+                    # The output cap cut the forced tool call mid-flight — a
+                    # reasoning model spends hidden thinking against the same
+                    # budget. Report truncation (not a schema error) so the
+                    # router's self-heal retries with the cap doubled.
+                    return self.completion_result(
+                        text="",
+                        model=str(payload.get("model") or model),
+                        usage=payload.get("usage") or {},
+                        request_id=headers.get("request-id") or payload.get("id"),
+                        raw={"tool_calls": [], "finish_reason": "length", "effective_max_tokens": effective_cap},
+                    )
+                raise ProviderError(
+                    "Anthropic response omitted the required structured tool output.",
+                    ErrorKind.SCHEMA,
+                    self.name,
+                    details={"stop_reason": stop_reason},
+                )
             text = json.dumps(structured["input"], ensure_ascii=False)
         else:
             text = "".join(str(block.get("text", "")) for block in blocks if block.get("type") == "text")
         if not text and not any(block.get("type") == "tool_use" for block in blocks):
             raise ProviderError("Anthropic response contained no text or tool call.", ErrorKind.SCHEMA, self.name)
-        raw = {"tool_calls": [block for block in blocks if block.get("type") == "tool_use"], "finish_reason": "max_tokens" if payload.get("stop_reason") == "max_tokens" else payload.get("stop_reason")}
+        # Normalize Anthropic's "max_tokens" to the provider-neutral "length"
+        # the router's truncation self-heal listens for, and report the cap
+        # actually applied so the router can double it even when the caller
+        # configured none (this adapter always sends an explicit max_tokens).
+        raw = {
+            "tool_calls": [block for block in blocks if block.get("type") == "tool_use"],
+            "finish_reason": "length" if stop_reason == "max_tokens" else stop_reason,
+            "effective_max_tokens": effective_cap,
+        }
         return self.completion_result(text=text, model=str(payload.get("model") or model), usage=payload.get("usage") or {}, request_id=headers.get("request-id") or payload.get("id"), raw=raw)
 
     def stream(self, *, model: str, messages: list[dict[str, Any]], temperature: float = 0.2, max_tokens: int | None = None) -> AsyncIterator[str]:

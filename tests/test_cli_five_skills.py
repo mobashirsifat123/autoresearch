@@ -171,3 +171,89 @@ def test_zero_timeouts_yield_finite_deadlines():
         import asyncio
 
         asyncio.get_event_loop_policy().new_event_loop().run_until_complete(provider.client.aclose())
+
+
+def test_truncated_structured_output_self_heals_by_doubling_cap():
+    """A structured call cut off by the output cap must self-heal — the cap is
+    doubled and the call retried — never die as a non-retryable schema error
+    (regression: a live novelty run lost its last surviving candidate when a
+    truncated forced-tool response raised SCHEMA, killing the whole run)."""
+    import asyncio
+
+    from autoresearch.providers.capabilities import ModelRole
+    from autoresearch.providers.config import ModelAssignment
+    from autoresearch.providers.llm.base import CompletionResult
+    from autoresearch.providers.router import ModelRouter
+
+    calls: list[int | None] = []
+
+    class TruncatingProvider:
+        name = "reasoning"
+
+        async def complete(self, *, model, messages, temperature=0.2, max_tokens=None, response_format=None, tools=None):
+            calls.append(max_tokens)
+            if len(calls) == 1:
+                # Adapter-imposed fallback cap, reported back to the router.
+                return CompletionResult(text="", model=model, raw={"finish_reason": "length", "effective_max_tokens": 8192})
+            return CompletionResult(text='{"ok": true}', model=model, raw={"finish_reason": "end_turn", "effective_max_tokens": max_tokens})
+
+    class Registry:
+        def __init__(self, provider):
+            self._provider = provider
+
+        def validate_assignment(self, assignment):
+            return None
+
+        def get(self, name):
+            return self._provider
+
+    assignment = ModelAssignment(ModelRole.RESEARCH_REASONING, "reasoning", "glm-5.3")
+    router = ModelRouter(Registry(TruncatingProvider()), {ModelRole.RESEARCH_REASONING: assignment})
+    result = asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
+        router.complete("research_reasoning", messages=[{"role": "user", "content": "x"}])
+    )
+    # Unconfigured cap -> the adapter's reported 8192 is doubled for the retry.
+    assert calls == [None, 16384]
+    assert result.text == '{"ok": true}'
+
+
+def test_genuine_tool_omission_still_fails_closed_with_reason(monkeypatch):
+    """A response that ends cleanly without the forced tool call is real model
+    misbehavior: it must stay a schema error — now carrying stop_reason — and
+    only cap-truncation takes the self-heal path."""
+    import asyncio
+    from contextvars import ContextVar
+
+    from autoresearch.providers.config import ProviderConfig
+    from autoresearch.providers.errors import ErrorKind, ProviderError
+    from autoresearch.providers.llm.anthropic import AnthropicProvider
+
+    provider = AnthropicProvider.__new__(AnthropicProvider)
+    provider.config = ProviderConfig("reasoning", "anthropic", "https://api.example.com", "TEST_KEY_ENV", frozenset())
+    provider.name = "reasoning"
+    provider._retry_count = ContextVar("test_retry_count", default=0)
+    monkeypatch.setenv("TEST_KEY_ENV", "test-key")
+
+    async def respond(payload):
+        async def fake_request_json(method, path, headers=None, json_body=None):
+            return payload, {}
+        provider.request_json = fake_request_json
+        return await provider.complete(model="glm-5.3", messages=[{"role": "user", "content": "x"}], response_format={"json_schema": {"name": "out", "schema": {"type": "object"}}})
+
+    loop = asyncio.get_event_loop_policy().new_event_loop()
+    try:
+        # Clean end_turn without the tool call: fail closed, with the reason.
+        try:
+            loop.run_until_complete(respond({"content": [{"type": "text", "text": "no tool"}], "stop_reason": "end_turn"}))
+            raise AssertionError("expected ProviderError")
+        except ProviderError as exc:
+            assert exc.kind is ErrorKind.SCHEMA
+            assert exc.details == {"stop_reason": "end_turn"}
+
+        # Truncated forced-tool call: a self-healable result, not an error.
+        result = loop.run_until_complete(respond({"content": [{"type": "text", "text": "partial"}], "stop_reason": "max_tokens"}))
+        assert result.text == ""
+        assert result.raw["finish_reason"] == "length"
+        assert result.raw["effective_max_tokens"] == 8192
+    finally:
+        loop.close()
