@@ -75,7 +75,7 @@ Thumbs.db
 # Research workspace content that predates the tool release; retained locally.
 /.gitmodules
 /.agents/
-/.autoresearch/
+/.autoresearch/*
 !/.autoresearch/config.example.toml
 /.cbl_remote_stage/
 /.commandcode/
