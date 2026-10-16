@@ -80,7 +80,7 @@ SKILLS = {
         name="review",
         version="1.0.0",
         description="Evidence-backed deep literature review: discover papers, extract evidence, rank by relevance, and surface a cited research gap. Primary skill — run first.",
-        entry='autoresearch skill review --project <id>  # or: autoresearch skill deep-research --seed-paper <pdf|doi|url>',
+        entry='autoresearch skill review --project <id>  # or: autoresearch skill workflow --seed-paper <pdf|doi|url>',
     ),
     "novelty": SkillMeta(
         name="novelty",
@@ -94,29 +94,11 @@ SKILLS = {
         description="Plan, approve, execute, inspect, and report a falsifiable experiment from a novelty candidate. Run after novelty.",
         entry='autoresearch skill experiment plan --candidate-id <id>',
     ),
-    "reinvention": SkillMeta(
-        name="reinvention",
-        version="1.0.0",
-        description="Result-conditioned research iteration: perform root-cause analysis on experiment results and synthesize Cycle N+1 hypothesis and candidate. Run after experiment.",
-        entry='autoresearch skill reinvention --candidate-id <id>',
-    ),
-    "deep-research": SkillMeta(
-        name="deep-research",
-        version="1.0.0",
-        description="Legacy combined skill: discover + review + gap in one shot. Prefer the 'review' skill for new workflows.",
-        entry='autoresearch skill deep-research --seed-paper <pdf|doi|url>',
-    ),
     "workflow": SkillMeta(
         name="workflow",
         version="1.0.0",
-        description="One durable cycle: seed → review → question → hypotheses → versioned methodology → design → approved execution. Reuses completed stages; stops where asked.",
-        entry='autoresearch skill workflow --seed-paper <pdf|doi|url> --until design  # resume: autoresearch skill workflow --project <id> --until experiment',
-    ),
-    "status": SkillMeta(
-        name="status",
-        version="1.0.0",
-        description="Read-only progress snapshot: per-project active runs, current stage, and latest durable artifacts. Use when the user asks whether research is still running or how far it got.",
-        entry='autoresearch skill status --project <id>',
+        description="One durable cycle: seed → review → question → hypotheses → versioned methodology → design → approved execution → manuscript. Reuses completed stages; stops where asked.",
+        entry='autoresearch skill workflow --seed-paper <pdf|doi|url> --until design  # resume: autoresearch skill workflow --project <id> --until manuscript',
     ),
     "manuscript": SkillMeta(
         name="manuscript",
@@ -533,124 +515,6 @@ def _manifest_summary(manifest: EnvironmentManifest | None) -> dict[str, Any] | 
         "dependency_lock_checksum": manifest.dependency_lock_checksum,
         "dataset_paths": list(manifest.dataset_paths),
     }
-
-
-@skill_app.command("status")
-def skill_status(
-    project: str | None = typer.Option(None, "--project", help="Project ID to summarize."),
-) -> None:
-    """Summarize the durable research state for a project (or all projects)."""
-
-    async def operation(c: ApplicationContainer) -> dict[str, Any]:
-        if project:
-            return {"projects": [_project_status(c, project)]}
-        rows = c.repository.rows("SELECT id,title,created_at FROM projects ORDER BY created_at DESC")
-        return {"projects": [_project_status(c, str(row["id"])) for row in rows[:20]]}
-
-    _invoke(operation, operation_name="skill/status")
-
-
-def _project_status(c: ApplicationContainer, project_id: str) -> dict[str, Any]:
-    project = c.repository.get_project(project_id)
-    if not project:
-        raise ValueError(f"project_not_found: project '{project_id}' not found")
-    papers = c.repository.list_papers(project_id)
-    latest_gap = c.repository.row(
-        "SELECT id,statement,classification FROM research_gaps WHERE project_id=? ORDER BY confidence DESC LIMIT 1",
-        (project_id,),
-    )
-    latest_portfolio = c.repository.row(
-        "SELECT id,low_risk_candidate_id,balanced_candidate_id,high_risk_candidate_id FROM novelty_portfolios WHERE project_id=? ORDER BY rowid DESC LIMIT 1",
-        (project_id,),
-    )
-    latest_spec = c.repository.row(
-        "SELECT id,candidate_id,hypothesis FROM experiment_specs WHERE project_id=? ORDER BY rowid DESC LIMIT 1",
-        (project_id,),
-    )
-    runs = c.repository.rows(
-        "SELECT id,kind,status FROM pipeline_runs WHERE project_id=? ORDER BY started_at DESC",
-        (project_id,),
-    )
-    return {
-        "project_id": project.id,
-        "title": project.title,
-        "paper_count": len(papers),
-        "runs": [{"id": row["id"], "kind": row["kind"], "status": row["status"]} for row in runs],
-        "latest_gap": _db_gap_summary(latest_gap) if latest_gap else None,
-        "latest_novelty_portfolio": dict(latest_portfolio) if latest_portfolio else None,
-        "latest_experiment_spec": dict(latest_spec) if latest_spec else None,
-        "latest_manuscript": (
-            {"id": manuscript.id, "status": manuscript.status, "decision": manuscript.decision, "created_at": manuscript.created_at}
-            if (manuscript := c.repository.latest_manuscript(project_id)) else None
-        ),
-        "findings_memory": _findings_summary(c.repository, project_id),
-    }
-
-
-def _findings_summary(repository, project_id: str) -> dict[str, Any]:
-    """Counts by epistemic status + the heuristic next actions (labeled)."""
-    try:
-        findings = repository.findings_for_project(project_id, limit=200)
-    except Exception:
-        return {"total": 0, "by_status": {}, "next_actions": []}
-    by_status: dict[str, int] = {}
-    for finding in findings:
-        by_status[finding.status.value] = by_status.get(finding.status.value, 0) + 1
-    from autoresearch.application.findings import FindingsMemory
-    actions = FindingsMemory(repository).next_actions(project_id, limit=3)
-    return {"total": len(findings), "by_status": by_status, "next_actions": actions}
-
-
-def _db_gap_summary(row: dict[str, Any]) -> dict[str, Any]:
-    return {"id": row["id"], "statement": row["statement"], "classification": row["classification"]}
-
-
-@skill_app.command("deep-research")
-def deep_research(
-    seed_paper: str = typer.Option("", "--seed-paper", help="Seed PDF path, DOI, or HTTPS URL."),
-    from_catalog: Path | None = typer.Option(None, "--from-catalog", help="Local JSON paper catalog."),
-    project: str | None = typer.Option(None, "--project", help="Existing project ID; review its corpus."),
-    limit: int = typer.Option(20, "--limit", min=1, max=100),
-    since_year: int = typer.Option(datetime.now(timezone.utc).year - 3, "--since-year", min=1900),
-    top_k: int = typer.Option(5, "--top-k", min=1, max=15),
-    hierarchical: bool = typer.Option(False, "--hierarchical/--flat", help="Chunk-level hierarchical review for long PDFs."),
-) -> None:
-    """Discover related papers, run a deep review, and surface one cited gap."""
-
-    async def operation(c: ApplicationContainer) -> dict[str, Any]:
-        project_id: str | None = project
-        if project_id:
-            existing = c.repository.get_project(project_id)
-            if not existing:
-                raise ValueError(f"project_not_found: project '{project_id}' not found")
-            discovery_summary: dict[str, Any] = {"project_id": project_id, "used_existing": True}
-        elif from_catalog:
-            outcome = await c.discovery.import_catalog(from_catalog)
-            project_id = outcome.project_id
-            discovery_summary = _discovery_summary(outcome)
-        elif seed_paper:
-            outcome = await c.discovery.discover(seed_paper, limit=limit, since_year=since_year)
-            project_id = outcome.project_id
-            discovery_summary = _discovery_summary(outcome)
-        else:
-            raise ValueError("usage: provide --seed-paper, --from-catalog, or --project")
-        assert project_id is not None
-        review = await c.review.review(project_id, top_k=top_k, hierarchical=hierarchical)
-        return {
-            "project_id": review.project_id,
-            "discovery": discovery_summary,
-            "review_run_id": review.run_id,
-            "reviewed": review.reviewed,
-            "failed_reviews": review.failed,
-            "top_paper_ids": list(review.top_paper_ids),
-            "gap": _gap_summary(review.gap),
-            "json_report": review.json_report,
-            "markdown_report": review.markdown_report,
-        }
-
-    _invoke(operation, operation_name="deep-research")
-
-
 @skill_app.command("review")
 def review(
     project: str = typer.Option(..., "--project", help="Project ID returned by discover."),
@@ -741,7 +605,6 @@ def workflow(
     top_k: int = typer.Option(5, "--top-k", min=1, max=15),
     max_cost_usd: float | None = typer.Option(None, "--max-cost-usd", min=0.0, help="Cumulative project provider-cost hard stop (applies to this and later invocations)."),
     max_tokens: int | None = typer.Option(None, "--max-tokens", min=1, help="Project total-token ceiling (prompt+completion) across all provider calls."),
-    max_revisions: int = typer.Option(0, "--max-revisions", min=0, max=5, help="Bounded adaptive revision cycles after an analyzed experiment (0 = off; experimental)."),
 ) -> None:
     """Advance one project through the full durable research cycle, reusing completed stages."""
 
@@ -759,29 +622,11 @@ def workflow(
         result = await c.workflow.run(
             seed=seed, project_id=project_id, until=until,
             limit=limit, top_k=top_k, max_cost_usd=max_cost_usd,
-            max_total_tokens=max_tokens, max_revisions=max_revisions,
+            max_total_tokens=max_tokens,
         )
         return result
 
     _invoke(operation, operation_name="workflow")
-
-
-@skill_app.command("reinvention")
-def reinvention(
-    candidate_id: str = typer.Option(..., "--candidate-id", help="Novelty candidate ID of completed experiment to reinvent from."),
-) -> None:
-    """Analyze experiment report, perform root-cause analysis, and generate Cycle N+1 candidate."""
-
-    async def operation(c: ApplicationContainer) -> dict[str, Any]:
-        return await c.reinvention.reinvent(candidate_id)
-
-    _invoke(operation, operation_name="reinvention")
-
-
-# --------------------------------------------------------------------------
-# Experiment lifecycle sub-command
-# --------------------------------------------------------------------------
-
 experiment_app = typer.Typer(
     name="experiment",
     help="Falsifiable experiment lifecycle from a novelty candidate. Planning never executes code.",

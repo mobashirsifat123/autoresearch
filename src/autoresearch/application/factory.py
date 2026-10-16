@@ -1,19 +1,16 @@
-"""Production composition root for CLI workflows."""
+"""Production composition root for the five research skills."""
 
 from __future__ import annotations
-
-from pathlib import Path
 
 from autoresearch.papers.metadata_sources import ArxivSource, CrossrefSource, MetadataSource, OpenAlexSource, OpenReviewSource, SemanticScholarSource
 from autoresearch.papers.pdf_resolver import LegalPdfResolver
 from autoresearch.papers.search_pipeline import StudySearchPipeline
-from autoresearch.agent.runtime import AgentRuntime
 from autoresearch.providers.budget import ProviderBudgetGuard
 from autoresearch.providers.factory import build_router
 from autoresearch.storage.repository import ResearchRepository
 from autoresearch.workers.local_typed import LocalTypedWorker
 
-from .services import DiscoveryService, LiteratureReviewService, NoveltyService, ExperimentService, ReinventionService
+from .services import DiscoveryService, LiteratureReviewService, NoveltyService, ExperimentService
 from .manuscript import ManuscriptService
 from .workflow import WorkflowService
 
@@ -31,15 +28,13 @@ class ApplicationContainer:
         self.novelty = NoveltyService(self.repository, self.router, self.search_pipeline)
         self.worker = LocalTypedWorker(self.repository, settings.data_root / "workspace")
         self.experiment = ExperimentService(self.repository, self.router, settings.data_root / "workspace", worker=self.worker)
-        self.reinvention = ReinventionService(self.repository, self.router)
         self.manuscript = ManuscriptService(self.repository, self.router, writer_mode=settings.manuscript_writer)
         self.workflow = WorkflowService(
             self.repository, self.router,
             discovery=self.discovery, review=self.review, novelty=self.novelty,
-            experiment=self.experiment, reinvention=self.reinvention,
+            experiment=self.experiment,
             manuscript=self.manuscript,
         )
-        self.agent = AgentRuntime(self, allowed_roots=settings.agent_roots or (Path.cwd(),))
 
     async def close(self) -> None:
         await self.search_pipeline.close()

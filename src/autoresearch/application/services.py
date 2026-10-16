@@ -94,7 +94,6 @@ from autoresearch.experiments.executor import DurableExperimentExecutor
 from autoresearch.experiments.result_analysis import StatisticalAnalyzer
 from autoresearch.experiments.report_writer import ScientificReportWriter
 from autoresearch.experiments.policy import ActionType, ExecutionAction, specification_checksum
-from autoresearch.reinvention.pipeline import ReinventionPipeline
 from autoresearch.workers.local_typed import LocalTypedWorker
 
 SEARCH_PROMPT_VERSION = "search-strategies-v1"
@@ -1139,36 +1138,4 @@ class ExperimentService:
                     self.repository.finish_run(run.id, error=redact_text(error))
             if isinstance(exc, TimeoutError):
                 raise TimeoutError(error) from exc
-            raise
-
-
-class ReinventionService:
-    def __init__(self, repository: ResearchRepository, router: ModelRouter) -> None:
-        self.repository = repository
-        self.router = router
-        self.pipeline = ReinventionPipeline(repository, router)
-
-    async def reinvent(self, candidate_id: str) -> dict[str, Any]:
-        candidate = self.repository.get_novelty_candidate(candidate_id)
-        if not candidate:
-            raise ValueError(f"Novelty candidate '{candidate_id}' not found.")
-        require_provider_credentials(self.router, ModelRole.RESEARCH_REASONING)
-
-        run = self.repository.create_run(candidate.project_id, PipelineKind.REINVENTION, input_data={"candidate_id": candidate_id})
-        try:
-            analysis, next_candidate = await self.pipeline.analyze_and_reinvent(candidate.id, run_id=run.id)
-            self.repository.finish_run(run.id)
-            return {
-                "project_id": candidate.project_id,
-                "run_id": run.id,
-                "reinvention_id": analysis.id,
-                "action": analysis.action.value,
-                "root_cause_diagnosis": analysis.root_cause_diagnosis,
-                "empirical_lessons": list(analysis.empirical_lessons),
-                "next_generation_hypothesis": analysis.next_generation_hypothesis,
-                "next_candidate_id": next_candidate.id if next_candidate else None,
-                "next_candidate_method": next_candidate.method if next_candidate else None,
-            }
-        except Exception as exc:
-            self.repository.finish_run(run.id, error=f"{type(exc).__name__}: {exc}")
             raise

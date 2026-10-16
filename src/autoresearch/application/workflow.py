@@ -4,7 +4,7 @@ Advances a project through review → question → hypotheses → methodology �
 design → (authorized) execution, reusing completed durable state instead of
 re-running stages. Not a second orchestrator: every stage delegates to the
 existing services (DiscoveryService, LiteratureReviewService, NoveltyService,
-MethodologyFreezer, ExperimentService, ReinventionService), which persist all
+MethodologyFreezer, ExperimentService), which persist all
 runs and artifacts. The stage dispositions returned here are a per-invocation
 report over that durable state, not themselves persisted.
 """
@@ -21,7 +21,6 @@ from autoresearch.application.services import (
     ExperimentService,
     LiteratureReviewService,
     NoveltyService,
-    ReinventionService,
 )
 from autoresearch.domain.models import PipelineKind, RunStatus
 from autoresearch.novelty.methodology import MethodologyFreezer
@@ -33,8 +32,9 @@ logger = logging.getLogger(__name__)
 STOP_STAGES = ("review", "question", "hypotheses", "methodology", "design", "experiment", "manuscript")
 _STAGE_ORDER = {name: index for index, name in enumerate(STOP_STAGES)}
 
-# Only these report decisions justify an adaptive revision cycle; supported
-# or partially-supported outcomes stop the loop.
+# Only these report decisions would justify a follow-up research cycle;
+# retained as documentation of the loop policy (the automated revision cycle
+# itself was removed with the minimal five-skill distribution).
 _REVISION_WORTHY_DECISIONS = {
     "refuted", "insufficient_evidence", "no_effect",
     "implementation_failure", "optimization_failure", "data_limitation",
@@ -51,7 +51,6 @@ class WorkflowService:
         review: LiteratureReviewService,
         novelty: NoveltyService,
         experiment: ExperimentService,
-        reinvention: ReinventionService,
         manuscript: "ManuscriptService | None" = None,
     ) -> None:
         self.repository = repository
@@ -60,7 +59,6 @@ class WorkflowService:
         self.review = review
         self.novelty = novelty
         self.experiment = experiment
-        self.reinvention = reinvention
         self.manuscript = manuscript
         self.freezer = MethodologyFreezer(repository, router)
 
@@ -74,7 +72,6 @@ class WorkflowService:
         top_k: int = 5,
         max_cost_usd: float | None = None,
         max_total_tokens: int | None = None,
-        max_revisions: int = 0,
     ) -> dict[str, Any]:
         if until not in _STAGE_ORDER:
             raise ValueError(f"until must be one of {STOP_STAGES}")
@@ -251,54 +248,6 @@ class WorkflowService:
         else:
             record("experiment", "completed", spec_id=spec.id, report_id=report_row["id"],
                    decision=report_row["decision"])
-
-        # ---- Stage 6: bounded revision (opt-in, evidence-conditioned) ----
-        if max_revisions > 0:
-            revisions = 0
-            parent = candidate_id
-            while revisions < max_revisions:
-                current = self._latest_report_for_candidate(parent)
-                if current is None:
-                    # No analyzed report exists: the automated artifact
-                    # ingestion/analysis step is not wired into the CLI yet, so
-                    # revision stays unavailable rather than silently skipping.
-                    record("revision", "unavailable",
-                           reason="no analyzed experiment report for this candidate; "
-                                  "artifact ingestion and statistical analysis are required first "
-                                  "(see docs/user_guide.md, 'Execution and results')")
-                    break
-                if current["decision"] not in _REVISION_WORTHY_DECISIONS:
-                    record("revision", "not_justified", decision=current["decision"])
-                    break
-                outcome = await self.reinvention.reinvent(parent)
-                next_id = outcome.get("next_candidate_id")
-                if not next_id:
-                    record("revision", "stopped", reason=f"reinvention action '{outcome.get('action')}' produced no next candidate")
-                    break
-                next_freeze = await self.freezer.freeze(
-                    self.repository.get_novelty_candidate(str(next_id)),
-                    selection_rationale=f"Revision {revisions + 1} after decision '{current['decision']}': {str(outcome.get('root_cause_diagnosis', ''))[:300]}",
-                )
-                await self.experiment.execute_candidate(str(next_id), mode="plan")
-                next_package = self.experiment.approval_preview_for_candidate(str(next_id))
-                next_approval = self.repository.approval_by_checksum(str(next_package["checksum"]))
-                if not next_approval or next_approval.get("status") != "approved":
-                    record("revision", "awaiting_approval", revision=revisions + 1,
-                           candidate_id=next_id, methodology_freeze_id=next_freeze.id,
-                           checksum=next_package["checksum"],
-                           missing_requirement="Approval for the revised specification.")
-                    break
-                await self.experiment.execute_candidate(str(next_id), mode="execute")
-                next_report = self._latest_report_for_candidate(str(next_id))
-                record("revision", "completed" if next_report else "executed_analysis_pending",
-                       revision=revisions + 1, candidate_id=next_id,
-                       methodology_freeze_id=next_freeze.id,
-                       report_id=next_report["id"] if next_report else None,
-                       decision=next_report["decision"] if next_report else None)
-                parent = str(next_id)
-                revisions += 1
-            else:
-                record("revision", "budget_exhausted", revisions=revisions)
 
         # ---- Stage 7: manuscript (consumes the exact validated lineage) ----
         if until == "manuscript":

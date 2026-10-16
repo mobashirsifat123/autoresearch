@@ -76,6 +76,7 @@ Thumbs.db
 /.gitmodules
 /.agents/
 /.autoresearch/
+!/.autoresearch/config.example.toml
 /.cbl_remote_stage/
 /.commandcode/
 /.serena/
