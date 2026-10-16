@@ -129,37 +129,53 @@ class MethodologyFreezer:
         from autoresearch.review.evidence_context import format_evidence_context
         grounding = format_evidence_context(evidence_context)
 
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You convert a selected research candidate into a frozen, versioned experimental "
+                    "methodology. Be concrete: algorithmic steps, equations or pseudocode, inputs/outputs, "
+                    "and resource demands. Freezing does not certify novelty: the uncertainty_statement "
+                    "must state what remains unverified."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Prompt version: {PROMPT_VERSION}\n"
+                    f"Candidate strategy: {candidate.strategy}\n"
+                    f"Candidate method: {candidate.method}\n"
+                    f"Causal mechanism: {candidate.causal_mechanism}\n"
+                    f"Difference from existing: {candidate.difference_from_existing}\n"
+                    f"Falsification condition: {candidate.falsification_condition}\n"
+                    f"Expected effect: {candidate.expected_effect}\n\n{grounding}\n\n{_FIELD_CONTRACT}"
+                ),
+            },
+        ]
+        # One bounded repair round: a live model occasionally omits a field;
+        # feeding the exact validation error back once is far cheaper than
+        # failing the whole workflow run (owner-reported live stall on
+        # 'expected_resource_demands').
         payload = await self.router.structured_output(
-            ModelRole.RESEARCH_REASONING,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You convert a selected research candidate into a frozen, versioned experimental "
-                        "methodology. Be concrete: algorithmic steps, equations or pseudocode, inputs/outputs, "
-                        "and resource demands. Freezing does not certify novelty: the uncertainty_statement "
-                        "must state what remains unverified."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": (
-                        f"Prompt version: {PROMPT_VERSION}\n"
-                        f"Candidate strategy: {candidate.strategy}\n"
-                        f"Candidate method: {candidate.method}\n"
-                        f"Causal mechanism: {candidate.causal_mechanism}\n"
-                        f"Difference from existing: {candidate.difference_from_existing}\n"
-                        f"Falsification condition: {candidate.falsification_condition}\n"
-                        f"Expected effect: {candidate.expected_effect}\n\n{grounding}\n\n{_FIELD_CONTRACT}"
-                    ),
-                },
-            ],
+            ModelRole.RESEARCH_REASONING, messages=messages,
             schema={"name": "methodology", "schema": METHODOLOGY_SCHEMA},
-            project_id=candidate.project_id,
-            run_id=candidate.run_id,
+            project_id=candidate.project_id, run_id=candidate.run_id,
             operation="methodology_freeze",
         )
-        payload = _validate(payload, evidence_context)
+        try:
+            payload = _validate(payload, evidence_context)
+        except ValueError as exc:
+            repair_messages = messages + [
+                {"role": "assistant", "content": json.dumps(payload, default=str)[:8000]},
+                {"role": "user", "content": f"VALIDATION FAILED: {exc}\nReturn the corrected FULL JSON object with every required key."},
+            ]
+            payload = await self.router.structured_output(
+                ModelRole.RESEARCH_REASONING, messages=repair_messages,
+                schema={"name": "methodology", "schema": METHODOLOGY_SCHEMA},
+                project_id=candidate.project_id, run_id=candidate.run_id,
+                operation="methodology_freeze_repair",
+            )
+            payload = _validate(payload, evidence_context)
 
         previous = self.repository.latest_methodology_freeze_for_candidate(candidate.id)
         version = (previous.version + 1) if previous else 1
@@ -218,6 +234,17 @@ class MethodologyFreezer:
 def _validate(payload: dict, evidence_context: dict) -> dict:
     """Deterministic schema/enforcement checks — prompt instructions alone do
     not enforce this contract. Raises ValueError on malformed output."""
+    # Logistics fields may be filled with explicit, honest defaults when the
+    # model omits them: they are planning details, never scientific content.
+    # The scientific core (hypothesis, predictions, mechanism, falsification,
+    # algorithm, procedure, uncertainty) must come from the model.
+    _LOGISTICS_DEFAULTS = {
+        "implementation_requirements": "not specified at freeze time; verify against the experiment environment before execution",
+        "expected_resource_demands": "not specified at freeze time; estimate before execution approval",
+    }
+    for field, default in _LOGISTICS_DEFAULTS.items():
+        if not payload.get(field):
+            payload[field] = default
     required = METHODOLOGY_SCHEMA["required"]
     missing = [key for key in required if not payload.get(key)]
     if missing:
