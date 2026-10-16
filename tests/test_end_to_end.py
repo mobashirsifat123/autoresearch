@@ -323,14 +323,14 @@ async def test_interrupted_review_reuses_reviews_and_cached_embeddings(tmp_path)
         await review_service.review(discovery.project_id, top_k=5)
     run_id = repository.row("SELECT id FROM pipeline_runs WHERE kind='deep_literature_review'")["id"]
     paper_calls = sum("paper-review" in str(call["messages"][-1]["content"]) for call in llm.calls)
-    assert paper_calls == 20 * 3  # multi-perspective review: 3 perspectives per paper
+    assert paper_calls == 20  # one integrated extraction per paper
     assert len(repository.reviews(discovery.project_id, run_id)) == 20
     assert embeddings.calls == 1
 
     resumed = await review_service.resume(run_id)
     assert resumed.reviewed == 20
     assert embeddings.calls == 1
-    assert sum("paper-review" in str(call["messages"][-1]["content"]) for call in llm.calls) == 20 * 3
+    assert sum("paper-review" in str(call["messages"][-1]["content"]) for call in llm.calls) == 20
 
     llm_count = len(llm.calls)
     repeated = await review_service.resume(run_id)

@@ -1,4 +1,4 @@
-"""Approval-bound local worker for deterministic, workspace-contained jobs."""
+"""Purpose: Executes approved experiment scripts without arbitrary shell execution."""
 from __future__ import annotations
 
 import asyncio

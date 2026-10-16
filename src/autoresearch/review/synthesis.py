@@ -1,4 +1,4 @@
-"""Write deterministic JSON and Markdown milestone artifacts."""
+"""Purpose: Compiles all verified evidence claims, paper reviews, and the validated gap into structured JSON and human-readable Markdown reports."""
 
 from __future__ import annotations
 

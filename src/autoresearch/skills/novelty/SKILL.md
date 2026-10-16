@@ -1,6 +1,9 @@
 ---
 name: novelty
 description: Run the AutoResearch novelty pipeline — generate candidate methods, check them against prior art, and adversarially critique each one using an ensemble of reviewer perspectives. Requires a completed review run (project_id and gap_id). Use when the user wants to invent novel approaches to a research gap, assess method novelty, or produce a portfolio of risk-tiered candidate methods. Outputs candidate_ids consumed by the experiment skill.
+metadata:
+  opencode/autoinvoke: "false"  # hidden from model auto-selection; explicit invocation only
+  opencode/slash: "true"        # expose as an explicit /<name> command in the OpenCode TUI
 ---
 
 # Novelty (AutoResearch backend)
@@ -12,6 +15,10 @@ claim novelty — it surfaces evidence of overlap and preserves ambiguity.
 
 ## When to use
 
+- The full cycle is being driven by `autoresearch skill workflow` — you do not
+  need this skill separately; the workflow freezes a versioned methodology
+  (`methodology_freeze_id`, artifact `methodology-v{N}.json`) and records it on
+  the experiment spec.
 - A completed `review` skill run produced a `project_id` and a `gap.id`.
 - The user asks to invent approaches to the research gap, assess novelty,
   or produce candidate methods for experimentation.
@@ -46,20 +53,20 @@ claim novelty — it surfaces evidence of overlap and preserves ambiguity.
    - External search results from scholarly APIs
 
 3. **Adversarial ensemble critique** — 3 reviewer perspectives (area chair,
-   skeptic, enthusiast) score each surviving candidate on 10 dimensions:
+   skeptic, enthusiast) run concurrently, using the retrieved prior-art
+   assessment, and score each surviving candidate on 10 dimensions:
    novelty, significance, falsifiability, feasibility, and more.
 
 4. **Iterative refinement** — candidates with `partial_overlap` are revised
-   up to 2 rounds to reduce documented overlap.
+   at most once, then reassessed. Unresolved overlap stays explicit.
 
-5. **Diversity-aware portfolio selection** — the best 3 candidates are
-   selected as low-risk, balanced, and high-risk tiers.
+5. **Diversity-aware portfolio selection** — up to 3 candidates that pass
+   the scientific gates are selected as low-risk, balanced, and high-risk tiers.
 
 ## Usage
 
 ```bash
-"${AUTORESEARCH_ROOT:-/Users/mobashirsifat/autoresearch}/.venv/bin/python" \
-  -m autoresearch.cli.app skill novelty \
+"${AUTORESEARCH_BIN:-autoresearch}" skill novelty \
   --project "<project_id>" \
   [--gap-id "<gap_id>"]
 ```
@@ -73,6 +80,9 @@ Exit codes: `0` success · `1` internal · `2` usage · `4` not found · `5` ins
 - `portfolio_id` — the durable novelty portfolio (for reference only).
 - `gap_id` — the gap this portfolio addresses.
 - `candidate_ids` — all candidate IDs in the portfolio.
+- `candidates` — method, closest-method difference, overlap status, unresolved
+  overlap, falsification condition, minimum experiment, objections, and failure
+  scenarios. Use these fields to explain the result without another model run.
 - `low_risk_candidate_id` — highest feasibility + compute efficiency.
   **Use this for the experiment skill by default.**
 - `balanced_candidate_id` — strong publication potential + feasibility,
@@ -82,7 +92,7 @@ Exit codes: `0` success · `1` internal · `2` usage · `4` not found · `5` ins
 
 ### What to tell the user after novelty runs
 
-1. Summarize the portfolio: *"3 candidates were selected across risk tiers."*
+1. Report the actual number selected; fewer than three tiers can pass the gates.
 2. For each tier, state the method name and overlap status.
 3. **Never present any candidate as "novel"** — use the backend's language:
    - `potentially_novel` → "appears distinct under retrieved evidence"
@@ -95,6 +105,11 @@ Exit codes: `0` success · `1` internal · `2` usage · `4` not found · `5` ins
 
 ## Quality rules
 
+- The stage has no default runtime limit. Let generation, retrieval, critique,
+  and reassessment finish. Do not impose token, reasoning, or runtime caps unless
+  the user requests them; `--max-runtime-seconds N` is opt-in. Never launch a
+  duplicate while a run is active. Record candidate failures; only candidates
+  passing the scientific gates qualify for selection.
 - **Never present a candidate as definitively novel** — the backend explicitly
   prohibits the wording "proven novel", "definitively novel", "first-ever".
 - If `low_risk_candidate_id` is null (all candidates failed gates), report
@@ -105,3 +120,13 @@ Exit codes: `0` success · `1` internal · `2` usage · `4` not found · `5` ins
   information to decide whether to proceed to the experiment skill.
 - The `low_risk_candidate_id` (or whichever the user chooses) is the
   **required input** for the `experiment` skill. Always surface it clearly.
+
+## Findings Memory (feedback loop)
+
+Before generating, the backend retrieves prior findings for this question —
+**including failures and refutations** — and conditions generation on them
+(do not re-propose a refuted mechanism without an explicit mechanism change).
+Cheap deterministic rejections run before any critic call:
+- `unfalsifiable` — no falsification condition or no minimal experiment;
+- `refuted_finding:<id>` — lexical match to a refuted method for this question.
+Rejections are recorded (`novelty.candidate_rejected_cheap` events), never silent.

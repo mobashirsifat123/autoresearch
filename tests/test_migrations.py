@@ -8,10 +8,10 @@ def test_empty_database_migrates_idempotently(tmp_path):
     first = ResearchRepository(path, tmp_path / "artifacts")
     second = ResearchRepository(path, tmp_path / "artifacts")
     assert first.integrity_check() == "ok"
-    assert second.row("SELECT MAX(version) AS version FROM schema_migrations")["version"] == 8
+    assert second.row("SELECT MAX(version) AS version FROM schema_migrations")["version"] == 14
     assert second.row("SELECT name FROM sqlite_master WHERE type='table' AND name='api_events'") is not None
     tables = {row["name"] for row in second.rows("SELECT name FROM sqlite_master WHERE type='table'")}
-    assert {"projects", "pipeline_runs", "pipeline_checkpoints", "papers", "paper_reviews", "evidence_claims", "research_gaps", "provider_usage", "artifacts", "novelty_candidates", "experiment_specs", "api_project_idempotency", "agent_sessions", "agent_messages", "agent_turns", "agent_tool_calls", "agent_permissions", "agent_events", "agent_artifact_refs"} <= tables
+    assert {"projects", "pipeline_runs", "pipeline_checkpoints", "papers", "paper_reviews", "evidence_claims", "research_gaps", "provider_usage", "artifacts", "novelty_candidates", "experiment_specs", "api_project_idempotency", "agent_sessions", "agent_messages", "agent_turns", "agent_tool_calls", "agent_permissions", "agent_events", "agent_artifact_refs", "reinvention_analyses"} <= tables
 
 
 def test_existing_empty_file_migrates_without_data_loss(tmp_path):
@@ -36,7 +36,56 @@ def test_upgrade_from_v1_and_v2_and_v3(tmp_path):
 
     repo = ResearchRepository(path, tmp_path / "artifacts")
     assert repo.integrity_check() == "ok"
-    assert repo.row("SELECT MAX(version) AS version FROM schema_migrations")["version"] == 8
+    assert repo.row("SELECT MAX(version) AS version FROM schema_migrations")["version"] == 14
     tables = {row["name"] for row in repo.rows("SELECT name FROM sqlite_master WHERE type='table'")}
     assert "novelty_candidates" in tables
     assert "api_project_idempotency" in tables
+    assert "reinvention_analyses" in tables
+
+
+def test_upgrade_from_v9_to_latest(tmp_path):
+    """Realistic upgrade path: an existing v9 database must gain the
+    methodology_freezes table and the new experiment_specs columns."""
+    import sqlite3
+
+    database = tmp_path / "v9.sqlite3"
+    from autoresearch.storage.repository import ResearchRepository, _SCHEMA_V9
+
+    fresh = ResearchRepository(tmp_path / "seed.sqlite3", tmp_path / "artifacts")
+    fresh.migrate()
+    # Build a v9 database by cloning the migrated schema minus v10 objects.
+    connection = sqlite3.connect(database)
+    connection.executescript("".join(
+        line for line in sqlite3.connect(tmp_path / "seed.sqlite3").iterdump()
+        if "methodology_freezes" not in line
+    ))
+    connection.execute("DROP TABLE IF EXISTS methodology_freezes")
+    connection.execute("ALTER TABLE experiment_specs DROP COLUMN gap_id")
+    connection.execute("ALTER TABLE experiment_specs DROP COLUMN methodology_freeze_id")
+    connection.execute("ALTER TABLE experiment_specs DROP COLUMN interpretation_rules_json")
+    connection.execute("DROP TABLE IF EXISTS project_budgets_v11_marker")
+    connection.execute("ALTER TABLE project_budgets DROP COLUMN token_ceiling")
+    connection.execute("DROP TABLE IF EXISTS manuscripts")
+    connection.execute("DROP TABLE IF EXISTS research_findings")
+    connection.execute("ALTER TABLE statistical_analyses DROP COLUMN decision_gates_json")
+    connection.execute("ALTER TABLE statistical_analyses DROP COLUMN statistical_tests_json")
+    connection.execute("ALTER TABLE statistical_analyses DROP COLUMN evidence_status")
+    connection.execute("DELETE FROM schema_migrations WHERE version >= 10")
+    connection.commit()
+    connection.close()
+
+    upgraded = ResearchRepository(database, tmp_path / "artifacts")
+    upgraded.migrate()
+    version = upgraded.row("SELECT MAX(version) AS version FROM schema_migrations")["version"]
+    assert version == 14
+    tables = {row["name"] for row in upgraded.rows("SELECT name FROM sqlite_master WHERE type='table'")}
+    assert "methodology_freezes" in tables
+    assert "manuscripts" in tables
+    assert "research_findings" in tables
+    columns = {row["name"] for row in upgraded.rows("PRAGMA table_info(experiment_specs)")}
+    assert {"gap_id", "methodology_freeze_id", "interpretation_rules_json"} <= columns
+    budget_columns = {row["name"] for row in upgraded.rows("PRAGMA table_info(project_budgets)")}
+    assert "token_ceiling" in budget_columns
+    analysis_columns = {row["name"] for row in upgraded.rows("PRAGMA table_info(statistical_analyses)")}
+    assert {"decision_gates_json", "statistical_tests_json", "evidence_status"} <= analysis_columns
+    assert upgraded.integrity_check() == "ok"

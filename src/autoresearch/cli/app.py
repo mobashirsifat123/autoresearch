@@ -319,6 +319,7 @@ def discover(
     limit: int = typer.Option(20, "--limit", min=1, max=100),
     since_year: int = typer.Option(datetime.now(timezone.utc).year - 3, "--since-year", min=1900),
     max_cost_usd: float | None = typer.Option(None, "--max-cost-usd", min=0.0, help="Cumulative project provider-cost hard stop."),
+    max_tokens: int | None = typer.Option(None, "--max-tokens", min=1, help="Project total-token ceiling (prompt+completion) across all provider calls."),
     max_runtime_seconds: float | None = typer.Option(None, "--max-runtime-seconds", min=1.0, help="Runtime limit for this invocation."),
 ) -> None:
     """Retrieve recent related papers and legally accessible PDFs. Use --from-catalog to import local papers."""
@@ -337,9 +338,40 @@ def review(
     hierarchical: bool = typer.Option(False, "--hierarchical/--flat", help="Use chunk-level hierarchical review for long legal PDFs."),
     max_cost_usd: float | None = typer.Option(None, "--max-cost-usd", min=0.0, help="Cumulative project provider-cost hard stop."),
     max_runtime_seconds: float | None = typer.Option(None, "--max-runtime-seconds", min=1.0, help="Runtime limit for this invocation."),
+    fresh: bool = typer.Option(False, "--fresh", help="Re-extract every paper review even when a verified one is reusable."),
 ) -> None:
-    """Review the corpus, rank top papers, and write one cited gap report."""
-    _run(lambda container: container.review.review(project, top_k=top_k, hierarchical=hierarchical, max_cost_usd=max_cost_usd, max_runtime_seconds=max_runtime_seconds))
+    """Review the corpus, rank top papers, and write one cited gap report. Reuses verified reviews by default."""
+    _run(lambda container: container.review.review(project, top_k=top_k, hierarchical=hierarchical, max_cost_usd=max_cost_usd, max_runtime_seconds=max_runtime_seconds, fresh=fresh))
+
+
+@app.command()
+def workflow(
+    seed: str = typer.Option("", "--seed", help="Seed PDF path, DOI, or HTTPS URL for a new project."),
+    project: str = typer.Option("", "--project", help="Existing project ID to resume/extend."),
+    until: str = typer.Option("design", "--until", help="Stop after: review, question, hypotheses, methodology, design, experiment, or manuscript."),
+    limit: int = typer.Option(20, "--limit", min=1, max=100),
+    top_k: int = typer.Option(5, "--top-k", min=1, max=15),
+    max_cost_usd: float | None = typer.Option(None, "--max-cost-usd", min=0.0, help="Cumulative project provider-cost hard stop."),
+    max_revisions: int = typer.Option(0, "--max-revisions", min=0, max=5, help="Bounded adaptive revision cycles after an authorized experiment (0 = off)."),
+) -> None:
+    """Advance one project through review → question → hypotheses → methodology → design → experiment.
+
+    Completed stages are reused, not repeated: re-invoke with --project to
+    resume. Execution still requires an exact-specification approval; without
+    one the command emits the execution package and the missing requirement.
+    """
+    if not seed and not project:
+        raise typer.BadParameter("Provide --seed for a new project or --project to resume.")
+    _run(lambda container: container.workflow.run(
+        seed=seed or None,
+        project_id=project or None,
+        until=until,
+        limit=limit,
+        top_k=top_k,
+        max_cost_usd=max_cost_usd,
+        max_total_tokens=max_tokens,
+        max_revisions=max_revisions,
+    ))
 
 
 @app.command()
@@ -365,7 +397,9 @@ def audit_project(
     run: str | None = typer.Option(None, "--run", help="Optional run ID to associate with the validation artifact."),
 ) -> None:
     """Validate provenance, evidence, usage, recovery, and secret redaction."""
-    _run(lambda container: {"project": project, "validation_path": str(write_audit(container.repository, project, run_id=run))})
+    async def _operation(container) -> dict[str, Any]:
+        return {"project": project, "validation_path": str(write_audit(container.repository, project, run_id=run))}
+    _run(_operation)
 
 
 @audit_app.command("run")

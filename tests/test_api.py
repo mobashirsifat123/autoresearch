@@ -22,7 +22,7 @@ def test_api_contract_capabilities_and_idempotent_mutation(tmp_path: Path):
     with TestClient(create_app(settings)) as client:
         assert client.get("/v1/health").json()["status"] == "ready"
         capabilities = client.get("/v1/capabilities").json()["pipelines"]
-        assert {item["key"] for item in capabilities if item["enabled"]} == {"study_search", "deep_literature_review", "novelty_generation", "experiment_design_execution"}
+        assert {item["key"] for item in capabilities if item["enabled"]} == {"study_search", "deep_literature_review", "novelty_generation", "experiment_design_execution", "result_conditioned_reinvention"}
         assert all(item["reason"] for item in capabilities if not item["enabled"])
 
         project = client.post("/v1/projects", json={"title": "API contract"}).json()

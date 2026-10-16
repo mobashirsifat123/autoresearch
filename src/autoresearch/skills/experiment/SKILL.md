@@ -1,6 +1,9 @@
 ---
 name: experiment
 description: Run the AutoResearch experiment lifecycle — design a falsifiable experiment from a novelty candidate, validate the environment, require explicit user approval of the exact action plan, then (only with approval) execute it through the policy-controlled worker, and write a scientific report with Bayesian analysis. Requires a candidate_id from the novelty skill. Use when the user wants to design, approve, and run a controlled experiment for a proposed method.
+metadata:
+  opencode/autoinvoke: "false"  # hidden from model auto-selection; explicit invocation only
+  opencode/slash: "true"        # expose as an explicit /<name> command in the OpenCode TUI
 ---
 
 # Experiment (AutoResearch backend)
@@ -12,6 +15,11 @@ step under any circumstances.
 
 ## When to use
 
+- The full cycle is being driven by `autoresearch skill workflow` — the
+  workflow's design stage consumes the frozen methodology automatically
+  (the spec carries `gap_id`, `methodology_freeze_id`, and pre-registered
+  `interpretation_rules`). Use this skill directly only for manual control
+  of one candidate's lifecycle.
 - A `novelty` skill run produced candidate IDs (`low_risk_candidate_id`
   is the recommended default).
 - The user wants to design, validate, approve, and/or run a falsifiable
@@ -39,12 +47,13 @@ The experiment skill has 5 ordered steps. Always follow them in order.
 
 ### Step 1 — Plan (no code runs)
 
-Translates the novelty candidate into a complete, reproducible experiment
-specification with adversarial falsification analysis and power analysis.
+Produces one concise experiment specification for the smallest decisive test,
+then runs one independent adversarial check. That check feeds the final
+falsification condition, confounders, and interpretation rules. Power estimates
+require a standardized effect-size assumption; missing variance is explicit.
 
 ```bash
-"${AUTORESEARCH_ROOT:-/Users/mobashirsifat/autoresearch}/.venv/bin/python" \
-  -m autoresearch.cli.app skill experiment plan \
+"${AUTORESEARCH_BIN:-autoresearch}" skill experiment plan \
   --candidate-id "<candidate_id>"
 ```
 
@@ -52,14 +61,38 @@ specification with adversarial falsification analysis and power analysis.
 statistical_plan, ablations) + `approval` (worker, actions, checksum, budget).
 **Show this to the user verbatim before any approval.**
 
-### Step 2 — Validate (no code runs)
+### Step 1b — Implement (research code generation; no execution)
 
-Checks that the execution environment (Python version, dependencies, datasets)
-is ready. Does not execute experiment code.
+If no `scripts/run_experiment.py` exists in the planned repository, the
+backend generates the implementation from the frozen methodology through the
+model router and statically verifies it — deterministically:
+
+- syntax + stdlib-only imports (worker policy),
+- exact `IDENTITY` block, declared seeds, required artifact types,
+- measurement-contract emission (`json.dumps` document with `seeds`),
+- **mechanism coverage**: methodology components mapped to named code
+  symbols; coverage < 75% stays `MECHANISM_PARTIAL`, never rounded up.
+
+Bounded repair loop (≤3 attempts) feeds verification failures back. The
+workflow's design stage runs this automatically; manual:
 
 ```bash
-"${AUTORESEARCH_ROOT:-/Users/mobashirsifat/autoresearch}/.venv/bin/python" \
-  -m autoresearch.cli.app skill experiment validate \
+"${AUTORESEARCH_BIN:-autoresearch}" skill experiment implement \
+  --candidate-id "<candidate_id>"
+```
+
+Fidelity is labelled (`STATIC_VERIFIED` here; `SMOKE`/`EXPLORATORY`/
+`CONFIRMATORY` attach at execution). A failed verification is recorded as an
+`implementation_failure` finding — never masked by silently degrading.
+
+### Step 2 — Validate (no code runs)
+Checks that the execution environment (Python version, dependencies, datasets)
+is ready. Does not execute experiment code.
+Reuses the saved specification and environment snapshot; it never replans or
+changes the approved checksum. Request a new plan explicitly when inputs change.
+
+```bash
+"${AUTORESEARCH_BIN:-autoresearch}" skill experiment validate \
   --candidate-id "<candidate_id>"
 ```
 
@@ -69,8 +102,7 @@ First show the exact action plan preview **without** `--accept`:
 
 ```bash
 # Preview only — writes nothing
-"${AUTORESEARCH_ROOT:-/Users/mobashirsifat/autoresearch}/.venv/bin/python" \
-  -m autoresearch.cli.app skill experiment approve \
+"${AUTORESEARCH_BIN:-autoresearch}" skill experiment approve \
   --candidate-id "<candidate_id>"
 ```
 
@@ -81,8 +113,7 @@ Only after the user explicitly confirms, record the approval:
 
 ```bash
 # Records approval — only after explicit user confirmation
-"${AUTORESEARCH_ROOT:-/Users/mobashirsifat/autoresearch}/.venv/bin/python" \
-  -m autoresearch.cli.app skill experiment approve \
+"${AUTORESEARCH_BIN:-autoresearch}" skill experiment approve \
   --candidate-id "<candidate_id>" --accept
 ```
 
@@ -92,8 +123,7 @@ Runs the approved exact-spec plan through the policy-controlled worker.
 Only valid after Step 3 `--accept` has been recorded.
 
 ```bash
-"${AUTORESEARCH_ROOT:-/Users/mobashirsifat/autoresearch}/.venv/bin/python" \
-  -m autoresearch.cli.app skill experiment execute \
+"${AUTORESEARCH_BIN:-autoresearch}" skill experiment execute \
   --candidate-id "<candidate_id>"
 ```
 
@@ -104,9 +134,15 @@ Only valid after Step 3 `--accept` has been recorded.
 Writes the scientific report: frequentist + Bayesian analysis, validity
 assessment, and final decision.
 
+Analysis runs automatically after an approved execution completes: the
+worker's measured artifacts are ingested, identity-validated, and analyzed
+deterministically before this step. If integrity validation rejected the
+measurements (e.g. FIXTURE-labelled artifacts, missing identity, incomplete
+seeds), this command refuses with `insufficient_evidence` and the recorded
+reason — never a fabricated decision.
+
 ```bash
-"${AUTORESEARCH_ROOT:-/Users/mobashirsifat/autoresearch}/.venv/bin/python" \
-  -m autoresearch.cli.app skill experiment report \
+"${AUTORESEARCH_BIN:-autoresearch}" skill experiment report \
   --candidate-id "<candidate_id>"
 ```
 
@@ -114,18 +150,27 @@ assessment, and final decision.
 
 ```bash
 # Inspect the environment manifest
-"${AUTORESEARCH_ROOT:-/Users/mobashirsifat/autoresearch}/.venv/bin/python" \
-  -m autoresearch.cli.app skill experiment inspect \
+"${AUTORESEARCH_BIN:-autoresearch}" skill experiment inspect \
   --candidate-id "<candidate_id>"
 
 # Cancel a running experiment
-"${AUTORESEARCH_ROOT:-/Users/mobashirsifat/autoresearch}/.venv/bin/python" \
-  -m autoresearch.cli.app skill experiment cancel \
+"${AUTORESEARCH_BIN:-autoresearch}" skill experiment cancel \
   --run-id "<run_id>"
 ```
 
 Exit codes: `0` success · `1` internal · `2` usage · `3` approval required ·
 `4` not found · `5` insufficient evidence · `6` worker unavailable.
+
+## Progress reporting
+
+- The 5 steps are the progress bar. Announce `[k/5] <step>` before running
+  each step's command (e.g. `[3/5] approve`) and report the outcome before
+  moving on.
+- While `execute` (step 4) is in flight — and whenever the user asks — poll
+  `"${AUTORESEARCH_BIN:-autoresearch}" skill status` (read-only; narrow with
+  `--project "<project_id>"`) instead of guessing from elapsed time.
+- The user can invoke `/status` in any session at any time; it never
+  interferes with a running step.
 
 ## Interpreting the JSON results
 
@@ -160,13 +205,17 @@ Exit codes: `0` success · `1` internal · `2` usage · `3` approval required ·
 
 ## Quality rules
 
+- Planning has no default runtime limit. Let the design and adversarial check
+  finish; do not impose token, reasoning, or runtime caps unless the user asks.
+  `--max-runtime-seconds N` is opt-in. Never duplicate an active run. Execution
+  still requires approval of the exact specification and compute budget.
 - **NEVER run `execute` without a recorded `--accept` approval and without
   the user's explicit confirmation of the exact action plan.**
 - **NEVER pass the checksum from one candidate's spec to a different candidate's
   execution** — the backend rejects mismatches.
 - If the worker is unavailable (exit code `6`), report that execution is
   disabled rather than faking results.
-- If the plan exit code is `3` (approval required), the spec changed since
+- If execute exits with `3` (approval required), the spec changed since
   the last approval — re-run the approve step before executing.
 - If `decision` is `implementation_failure` or `evaluation_artifact`, do NOT
   claim the experiment succeeded — report the failure honestly.

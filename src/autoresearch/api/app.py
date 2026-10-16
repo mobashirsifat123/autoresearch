@@ -301,7 +301,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
              "remote_execution_allowed": False, "worker_types": ["local_typed"] if getattr(c, "worker", None) else [], "isolation_strength": "workspace-only",
              "network_enforcement": "policy-only", "max_concurrency": 1,
              "reason": "Local execution is workspace-contained and approval-gated; it is not an OS sandbox."}},
-            {"key": PipelineKind.REINVENTION.value, "name": "Result-Conditioned Reinvention", "enabled": False, "reason": "Reinvention pipeline is not implemented in the Python backend."},
+            {"key": PipelineKind.REINVENTION.value, "name": "Result-Conditioned Reinvention", "enabled": True, "reason": None},
         ]
         return {"pipelines": pipelines, "capabilities": c.agent.capabilities.payload(), "tools": [{"id": item.id, "description": item.description, "permission": item.permission, "mutating": item.mutating, "schema": item.schema} for item in c.agent.tools.definitions()]}
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -16,11 +17,40 @@ class Settings:
     provider_config: Path
     search_sources: tuple[str, ...]
     agent_roots: tuple[Path, ...] = ()
+    # Project-budget defaults applied by the guard when a project has no
+    # explicit --max-tokens / --max-cost-usd. None leaves that dimension uncapped.
+    default_max_tokens: int | None = None
+    default_max_cost_usd: float | None = None
+    # "deterministic" (default): manuscripts are field-assembled, zero model
+    # calls. "model": model-assisted scientific argument gated by the
+    # deterministic numeric/citation/overclaim audit (falls back on any
+    # surviving violation).
+    manuscript_writer: str = "deterministic"
+
+
+def _positive_int(value: str | int | None) -> int | None:
+    try:
+        parsed = int(str(value or "").strip())
+        return parsed if parsed > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _positive_float(value: str | None) -> float | None:
+    try:
+        parsed = float(str(value or "").strip())
+        return parsed if parsed > 0 else None
+    except (TypeError, ValueError):
+        return None
 
 
 def load_settings() -> Settings:
     data_root = Path(os.getenv("AUTORESEARCH_DATA_ROOT", ".autoresearch/data")).expanduser().resolve()
     config = Path(os.getenv("AUTORESEARCH_PROVIDER_CONFIG", ".autoresearch/config.toml")).expanduser().resolve()
+    research = {}
+    if config.is_file():
+        with config.open("rb") as handle:
+            research = tomllib.load(handle).get("research", {})
     sources = tuple(item.strip().lower() for item in os.getenv("AUTORESEARCH_SEARCH_SOURCES", "semantic_scholar,openalex,crossref,arxiv,openreview").split(",") if item.strip())
     return Settings(
         data_root=data_root,
@@ -30,4 +60,9 @@ def load_settings() -> Settings:
         provider_config=config,
         search_sources=sources,
         agent_roots=tuple(Path(item).expanduser().resolve() for item in os.getenv("AUTORESEARCH_AGENT_ROOTS", str(Path.cwd())).split(os.pathsep) if item.strip()),
+        # A project config can explicitly request no token ceiling (0), even
+        # when the launching shell inherited a finite global default.
+        default_max_tokens=_positive_int(research.get("max_tokens", os.getenv("AUTORESEARCH_DEFAULT_MAX_TOKENS"))),
+        default_max_cost_usd=_positive_float(os.getenv("AUTORESEARCH_DEFAULT_MAX_COST_USD")),
+        manuscript_writer=str(research.get("manuscript_writer", os.getenv("AUTORESEARCH_MANUSCRIPT_WRITER", "deterministic"))).strip().lower() or "deterministic",
     )

@@ -358,7 +358,14 @@ class AgentRuntime:
             return run.id, {"spec_id": spec_id, "candidate_id": candidate_id, "mode": mode, "approval": preview if mode == "plan" else {"checksum": preview["checksum"], "executed": True}}
 
         if capability_id == "result_conditioned_reinvention":
-            raise ValueError("capability_unavailable: Reinvention pipeline is not implemented in the Python backend")
+            candidate_id = payload.get("candidate_id")
+            if not candidate_id:
+                latest_cand = repository.row("SELECT id FROM novelty_candidates WHERE project_id=? ORDER BY rowid DESC LIMIT 1", (session.project_id,))
+                candidate_id = str(latest_cand["id"]) if latest_cand else None
+            if not candidate_id:
+                raise ValueError("reinvention_requires_candidate: a candidate with a completed experiment report is required for reinvention")
+            res = await self.container.reinvention.reinvent(candidate_id)
+            return res["run_id"], res
         raise ValueError(f"capability_unavailable: unsupported scientific capability '{capability_id}'")
 
     def _passthrough_review(self, session: AgentSession, run, papers, top_k: int, message: str) -> tuple[str, dict[str, Any]]:

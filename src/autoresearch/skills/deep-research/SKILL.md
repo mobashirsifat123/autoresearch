@@ -1,6 +1,9 @@
 ---
 name: deep-research
 description: Run the AutoResearch deep-research pipeline — discover related papers, run an evidence-backed review, and surface one cited research gap. Use when the user wants a literature review, prior-art survey, or research-gap analysis on a topic, paper, or question.
+metadata:
+  opencode/autoinvoke: "false"  # hidden from model auto-selection; explicit invocation only
+  opencode/slash: "true"        # expose as an explicit /<name> command in the OpenCode TUI
 ---
 
 # Deep Research (AutoResearch backend)
@@ -26,8 +29,7 @@ agent for this work — call the stable skill CLI and interpret its JSON.
 Provide exactly one of `--seed-paper`, `--from-catalog`, or `--project`:
 
 ```bash
-"${AUTORESEARCH_ROOT:-/Users/mobashirsifat/autoresearch}/.venv/bin/python" \
-  -m autoresearch.cli.app skill deep-research \
+"${AUTORESEARCH_BIN:-autoresearch}" skill deep-research \
   --seed-paper "<pdf path | doi | https url>" \
   [--limit 20] [--top-k 5]
 ```

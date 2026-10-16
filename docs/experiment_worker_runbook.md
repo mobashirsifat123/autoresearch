@@ -5,7 +5,7 @@ The local worker is an approval-gated, typed-action executor. It is workspace-co
 ## Start
 
 ```bash
-cd /Users/mobashirsifat/autoresearch
+cd /path/to/autoresearch
 source .venv/bin/activate
 export AUTORESEARCH_DATA_ROOT=$PWD/.autoresearch/data
 export AUTORESEARCH_PROVIDER_CONFIG=$PWD/docs/live_config.example.toml
@@ -15,7 +15,7 @@ uvicorn autoresearch.api.app:create_app --factory --host 127.0.0.1 --port 8000
 The local worker is composed into the API application and uses the workspace at `$AUTORESEARCH_DATA_ROOT/workspace`. The CLI is a separate process:
 
 ```bash
-cd /Users/mobashirsifat/autoresearch-cli
+cd <companion-terminal-client-dir>
 npx --yes bun@1.3.14 run --cwd packages/autoresearch-cli dev
 ```
 

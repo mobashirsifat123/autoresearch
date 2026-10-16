@@ -13,7 +13,7 @@ def _spec(tmp_path: Path, *, seeds: int = 5) -> ExperimentSpec:
 
 
 def _identity(seed: int | None = None) -> dict[str, object]:
-    value: dict[str, object] = {"candidate_id": "candidate", "method_id": "sgkh", "repository_commit": "commit", "implementation_hash": "impl", "config_hash": "config", "dataset_checksum": "dataset-sum", "split_checksum": "split-sum", "metric_version": "v1"}
+    value: dict[str, object] = {"candidate_id": "candidate", "method_id": "example_method", "repository_commit": "commit", "implementation_hash": "impl", "config_hash": "config", "dataset_checksum": "dataset-sum", "split_checksum": "split-sum", "metric_version": "v1"}
     if seed is not None:
         value["seed"] = seed
     return value
@@ -62,7 +62,7 @@ async def test_fixture_values_are_rejected_from_production_analysis(tmp_path: Pa
 
 
 @pytest.mark.anyio
-async def test_audited_sgkh_gates_refute_not_support(tmp_path: Path):
+async def test_audited_gates_refute_not_support(tmp_path: Path):
     spec = _spec(tmp_path)
     # +1.83% mAP does not clear a +5% gate.  The old system reported this as supported.
     analysis = await StatisticalAnalyzer().analyze(spec, _result(spec))

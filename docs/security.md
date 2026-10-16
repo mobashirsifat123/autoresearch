@@ -29,11 +29,11 @@ controls are not applicable to the product surface.
 Security QA commands:
 
 ```bash
-cd /Users/mobashirsifat/autoresearch
+cd /path/to/autoresearch
 rg -n 'shell\s*=\s*True|os\.system|eval\(|exec\(|Popen' src tests
 .venv/bin/python -m pytest -q tests/qa/test_security_boundaries.py tests/test_provider_contract.py
 
-cd /Users/mobashirsifat/autoresearch-cli
+cd <companion-terminal-client-dir>
 rg -n 'localStorage|sessionStorage|dangerouslySetInnerHTML|innerHTML|API_KEY' packages/autoresearch-cli/src packages/autoresearch-cli/test
 ```
 

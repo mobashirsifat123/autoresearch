@@ -1,4 +1,4 @@
-"""Evidence-backed prior art checking with external search integration."""
+"""Purpose: Compares candidate methods against prior literature to detect overlap."""
 
 from __future__ import annotations
 

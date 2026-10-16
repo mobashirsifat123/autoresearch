@@ -1,5 +1,4 @@
-"""Portfolio selection mapping risk profiles to candidates.
-Now with diversity-aware selection to avoid methodological overlap."""
+"""Purpose: Selects 3 candidates (Low-Risk, Balanced, High-Risk) from the evaluated candidates."""
 
 from __future__ import annotations
 

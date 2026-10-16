@@ -1,9 +1,4 @@
-"""Fail-closed scientific evidence contracts.
-
-This module intentionally has no provider dependency.  A model may propose a
-plan or prediction, but only an observed, identity-bound artifact may enter a
-scientific decision or report.
-"""
+"""Purpose: Enforces type-checked dataflow between measurement artifacts and conclusions."""
 from __future__ import annotations
 
 from dataclasses import dataclass

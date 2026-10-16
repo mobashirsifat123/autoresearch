@@ -1,4 +1,4 @@
-"""Typed experiment actions and approval binding."""
+"""Purpose: Enforces human-in-the-loop safety."""
 from __future__ import annotations
 
 import hashlib

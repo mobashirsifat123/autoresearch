@@ -1,8 +1,4 @@
-"""Fail-closed experiment report rendering.
-
-The writer consumes only validated analysis.  It does not ask a model to choose
-a scientific conclusion, and it cannot manufacture ablation contributions.
-"""
+"""Purpose: Synthesizes the final ExperimentReport."""
 from __future__ import annotations
 
 from uuid import uuid4

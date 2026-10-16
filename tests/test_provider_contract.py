@@ -278,3 +278,127 @@ def test_redaction_removes_url_credentials_and_sensitive_query_values():
     assert "password" not in redacted
     assert "secret-value" not in redacted
     assert redacted == "https://[REDACTED]example.test/v1?token=[REDACTED]&safe=yes"
+
+
+# --------------------------------------------------------------------------
+# Permanent throughput knobs: thinking_budget, adaptive concurrency (AIMD)
+# --------------------------------------------------------------------------
+
+def test_provider_config_parses_throughput_and_thinking_knobs():
+    from autoresearch.providers.factory import provider_config
+
+    config = provider_config("fast", {
+        "kind": "openai_compatible",
+        "base_url": "https://provider.example/v1",
+        "api_key_env": "TEST_PROVIDER_KEY",
+        "concurrency": 2,
+        "max_concurrency": 8,
+        "thinking_budget": 2048,
+    })
+    assert (config.concurrency, config.max_concurrency, config.thinking_budget) == (2, 8, 2048)
+
+
+def test_provider_config_rejects_inverted_concurrency_range():
+    with pytest.raises(ValueError, match="max_concurrency"):
+        ProviderConfig("x", "openai_compatible", "https://x.example/v1", "TEST_PROVIDER_KEY", frozenset({Capability.TEXT}), concurrency=4, max_concurrency=2)
+
+
+def test_provider_config_rejects_non_positive_thinking_budget():
+    with pytest.raises(ValueError, match="thinking_budget"):
+        ProviderConfig("x", "openai_compatible", "https://x.example/v1", "TEST_PROVIDER_KEY", frozenset({Capability.TEXT}), thinking_budget=0)
+
+
+@pytest.mark.asyncio
+async def test_adaptive_gate_grows_on_success_and_halves_on_throttle():
+    from autoresearch.providers.llm.http_base import AdaptiveGate
+
+    gate = AdaptiveGate(concurrency=2, ceiling=8)
+    assert gate.limit == 2
+    for _ in range(2):  # one full success window at limit 2 grows it to 3
+        await gate.acquire()
+        await gate.release()
+    assert gate.limit == 3
+    await gate.acquire()
+    await gate.release(throttled=True, retry_after=0.05)
+    assert gate.limit == 1, "a throttle must halve the limit with a floor of one"
+    started = asyncio.get_running_loop().time()
+    await gate.acquire()  # must wait out the 0.05s global cooldown
+    assert asyncio.get_running_loop().time() - started >= 0.04
+    await gate.release()
+
+
+@pytest.mark.asyncio
+async def test_adaptive_gate_fixed_mode_keeps_limit_and_still_cools_down():
+    from autoresearch.providers.llm.http_base import AdaptiveGate
+
+    gate = AdaptiveGate(concurrency=2)
+    for _ in range(10):
+        await gate.acquire()
+        await gate.release()
+    assert gate.limit == 2, "without a ceiling the configured concurrency is respected exactly"
+    await gate.acquire()
+    await gate.release(throttled=True, retry_after=0.02)
+    assert gate.limit == 2, "fixed mode never shrinks below the configured concurrency"
+    started = asyncio.get_running_loop().time()
+    await gate.acquire()
+    assert asyncio.get_running_loop().time() - started >= 0.015, "the global 429 cooldown still applies"
+    await gate.release()
+
+
+@pytest.mark.asyncio
+async def test_openai_compatible_sends_configured_thinking_budget(monkeypatch):
+    monkeypatch.delenv("AUTORESEARCH_THINKING_BUDGET", raising=False)
+    monkeypatch.setenv("TEST_PROVIDER_KEY", "not-a-real-secret")
+    seen: dict[str, object] = {}
+
+    def handler(request: httpx.Request):
+        seen.update(json.loads(request.content))
+        return httpx.Response(200, json={"id": "req-t1", "model": "external-model", "choices": [{"message": {"content": '{"ok":true}'}}], "usage": {"prompt_tokens": 5, "completion_tokens": 2}})
+
+    config = ProviderConfig("external", "openai_compatible", "https://provider.example/v1", "TEST_PROVIDER_KEY", frozenset({Capability.TEXT}), thinking_budget=2048)
+    provider = OpenAICompatibleProvider(config, transport=httpx.MockTransport(handler))
+    await provider.complete(model="external-model", messages=[{"role": "user", "content": "hello"}])
+    assert seen["thinking"] == {"type": "enabled", "budget_tokens": 2048}
+
+    monkeypatch.setenv("AUTORESEARCH_THINKING_BUDGET", "128")  # env overrides config
+    seen.clear()
+    await provider.complete(model="external-model", messages=[{"role": "user", "content": "hello"}])
+    assert seen["thinking"] == {"type": "enabled", "budget_tokens": 128}
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_openai_compatible_omits_thinking_when_unset(monkeypatch):
+    monkeypatch.delenv("AUTORESEARCH_THINKING_BUDGET", raising=False)
+    monkeypatch.setenv("TEST_PROVIDER_KEY", "not-a-real-secret")
+    seen: dict[str, object] = {}
+
+    def handler(request: httpx.Request):
+        seen.update(json.loads(request.content))
+        return httpx.Response(200, json={"id": "req-t2", "model": "external-model", "choices": [{"message": {"content": '{"ok":true}'}}], "usage": {"prompt_tokens": 5, "completion_tokens": 2}})
+
+    config = ProviderConfig("external", "openai_compatible", "https://provider.example/v1", "TEST_PROVIDER_KEY", frozenset({Capability.TEXT}))
+    provider = OpenAICompatibleProvider(config, transport=httpx.MockTransport(handler))
+    await provider.complete(model="external-model", messages=[{"role": "user", "content": "hello"}])
+    assert "thinking" not in seen
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_storm_is_absorbed_by_cooldown_and_retry(monkeypatch):
+    monkeypatch.delenv("AUTORESEARCH_THINKING_BUDGET", raising=False)
+    monkeypatch.setenv("TEST_PROVIDER_KEY", "not-a-real-secret")
+    calls = 0
+
+    def handler(request: httpx.Request):
+        nonlocal calls
+        calls += 1
+        if calls <= 2:  # a burst of throttles, as the token plan produces
+            return httpx.Response(429, headers={"retry-after": "0.02"}, json={"error": {"message": "slow down"}})
+        return httpx.Response(200, json={"id": "req-t3", "model": "external-model", "choices": [{"message": {"content": '{"ok":true}'}}], "usage": {"prompt_tokens": 1, "completion_tokens": 1}})
+
+    config = ProviderConfig("external", "openai_compatible", "https://provider.example/v1", "TEST_PROVIDER_KEY", frozenset({Capability.TEXT, Capability.STRUCTURED_OUTPUT}), max_retries=4)
+    provider = OpenAICompatibleProvider(config, transport=httpx.MockTransport(handler))
+    result = await provider.complete(model="external-model", messages=[{"role": "user", "content": "hello"}])
+    assert calls == 3 and json.loads(result.text) == {"ok": True}
+    await provider.close()

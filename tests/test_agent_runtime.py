@@ -104,7 +104,10 @@ def test_agent_api_session_mode_sse_and_reinvention_fallback(tmp_path: Path):
         assert invalid_cursor.json()["detail"]["code"] == "invalid_event_cursor"
         response = client.post(f"/v1/agent/sessions/{session_id}/turns", json={"message": "Reinvent a replacement after the failed experiment", "time_budget_seconds": 30})
         assert response.status_code == 202
-        import time
-        time.sleep(0.05)
-        body = client.get(f"/v1/agent/sessions/{session_id}").json()
-        assert any("not implemented" in str(item["content"]).lower() for item in body["messages"])
+        for _ in range(20):
+            if client.get(f"/v1/agent/sessions/{session_id}").json()["turns"][-1]["status"] in {"completed", "failed"}:
+                break
+            import time
+            time.sleep(0.05)
+        turn_data = client.get(f"/v1/agent/sessions/{session_id}").json()["turns"][-1]
+        assert turn_data["status"] in {"awaiting_confirmation", "completed", "failed"}

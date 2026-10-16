@@ -13,15 +13,16 @@ from autoresearch.providers.factory import build_router
 from autoresearch.storage.repository import ResearchRepository
 from autoresearch.workers.local_typed import LocalTypedWorker
 
-from .config import Settings
-from .services import DiscoveryService, LiteratureReviewService, NoveltyService, ExperimentService
+from .services import DiscoveryService, LiteratureReviewService, NoveltyService, ExperimentService, ReinventionService
+from .manuscript import ManuscriptService
+from .workflow import WorkflowService
 
 
 class ApplicationContainer:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.repository = ResearchRepository(settings.database_path, settings.artifact_root)
-        self.router = build_router(settings.provider_config, usage_sink=self.repository.record_provider_usage, budget_guard=ProviderBudgetGuard(self.repository))
+        self.router = build_router(settings.provider_config, usage_sink=self.repository.record_provider_usage, budget_guard=ProviderBudgetGuard(self.repository, default_token_ceiling=settings.default_max_tokens, default_hard_stop=settings.default_max_cost_usd))
         self.sources = _sources(settings.search_sources)
         self.pdf_resolver = LegalPdfResolver()
         self.search_pipeline = StudySearchPipeline(self.repository, self.sources, self.pdf_resolver, settings.download_root)
@@ -30,6 +31,14 @@ class ApplicationContainer:
         self.novelty = NoveltyService(self.repository, self.router, self.search_pipeline)
         self.worker = LocalTypedWorker(self.repository, settings.data_root / "workspace")
         self.experiment = ExperimentService(self.repository, self.router, settings.data_root / "workspace", worker=self.worker)
+        self.reinvention = ReinventionService(self.repository, self.router)
+        self.manuscript = ManuscriptService(self.repository, self.router, writer_mode=settings.manuscript_writer)
+        self.workflow = WorkflowService(
+            self.repository, self.router,
+            discovery=self.discovery, review=self.review, novelty=self.novelty,
+            experiment=self.experiment, reinvention=self.reinvention,
+            manuscript=self.manuscript,
+        )
         self.agent = AgentRuntime(self, allowed_roots=settings.agent_roots or (Path.cwd(),))
 
     async def close(self) -> None:

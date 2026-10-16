@@ -1,4 +1,4 @@
-"""Transparent top-k review ranking with router-only embeddings."""
+"""Purpose: Ranks papers in a database relative to the project's core research question."""
 
 from __future__ import annotations
 

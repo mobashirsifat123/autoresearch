@@ -1,4 +1,4 @@
-"""Deterministic, artifact-bound experiment analysis."""
+"""Purpose: Computes rigorous frequentist and Bayesian statistics on raw seed metric logs."""
 from __future__ import annotations
 
 import itertools

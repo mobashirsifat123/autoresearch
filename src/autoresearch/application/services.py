@@ -4,20 +4,79 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
 from uuid import uuid4
 
-from autoresearch.domain.models import ArtifactProvenance, ArtifactReference, CandidateStatus, DownloadStatus, GapClassification, NoveltyCandidate, PaperRecord, PipelineKind, PriorArtStatus, ResearchGap, RunStatus, SeedPaper, ExperimentSpec, content_checksum, utc_now
+logger = logging.getLogger(__name__)
+
+from autoresearch.domain.models import ArtifactProvenance, ArtifactReference, CandidateStatus, DownloadStatus, FindingStatus, GapClassification, NoveltyCandidate, PaperRecord, PipelineKind, PriorArtStatus, ResearchFinding, ResearchGap, RunStatus, SeedPaper, ExperimentSpec, content_checksum, utc_now
 from autoresearch.ingestion.chunking import DocumentChunk, chunk_document
 from autoresearch.ingestion.document_parser import DocumentParser, ParsedDocument, ParsedPage
 from autoresearch.ingestion.extraction import SEED_PROMPT_VERSION, SeedAnalysis, SeedAnalyzer
 from autoresearch.papers.search_pipeline import DiscoveryResult, SearchStrategy, StudySearchPipeline
 from autoresearch.providers.capabilities import ModelRole
+from autoresearch.providers.errors import ErrorKind, ProviderError
+from autoresearch.experiments.integrity import IntegrityFailure
+from autoresearch.application.findings import FindingsMemory
 from autoresearch.providers.redaction import redact_text
 from autoresearch.providers.router import ModelRouter
+
+
+def require_model_role(router: ModelRouter, role: ModelRole) -> None:
+    """Actionable early diagnostic: fail fast with the remedy when a stage's
+    required model role is unconfigured, instead of a downstream symptom."""
+    try:
+        router.identity(role)
+    except ProviderError as exc:
+        raise ProviderError(
+            f"provider_unconfigured: {exc.args[0]} "
+            "Copy .autoresearch/config.example.toml to .autoresearch/config.toml, "
+            "fill the provider placeholders, and export the referenced key "
+            "environment variables (see README 'Provider configuration'). "
+            "Offline commands (discover --from-catalog, skill status, audit) "
+            "work without a provider.",
+            getattr(exc, "kind", None),
+        ) from exc
+
+
+def require_provider_credentials(router: ModelRouter, role: ModelRole) -> None:
+    """Fail fast (once, up front) when the role's provider credentials are
+    unavailable.
+
+    A missing API key is deterministic and global: without this check every
+    per-paper call fails identically, one failure is recorded per paper, and
+    the run only ends with a misleading 'Only 0 papers produced
+    evidence-backed reviews' count error (observed 2026-08-09: 140 identical
+    environment-variable failures). Providers without an api_key resolver
+    (deterministic test fakes) are skipped.
+    """
+    assignment = router.assignments.get(role)
+    if not assignment:
+        return  # require_model_role reports unconfigured roles with the remedy
+    names = [assignment.provider, *(name for name, _model in assignment.fallbacks)]
+    last_error: ProviderError | None = None
+    for name in names:
+        resolver = getattr(router.registry.get(name), "api_key", None)
+        if resolver is None:
+            return  # non-HTTP provider; nothing to resolve
+        try:
+            resolver()
+            return  # the first resolvable credential satisfies the role
+        except ProviderError as exc:
+            last_error = exc
+    detail = f" Underlying error: {last_error}" if last_error else ""
+    raise ProviderError(
+        "provider_unauthenticated: no usable credential for role "
+        f"'{role.value}' (tried providers: {', '.join(names)}).{detail} "
+        "Export the provider's api_key_env variable in the shell that runs "
+        "autoresearch (OpenCode-agent sessions must inject it) or reconnect "
+        "the provider (OpenCode /connect). See .autoresearch/config.toml.",
+        ErrorKind.AUTHENTICATION,
+    ) from last_error
 from autoresearch.review.extraction import PaperReviewExtractor, ReviewBundle
 from autoresearch.review.gap_analysis import GapAnalyzer
 from autoresearch.review.similarity import ReviewRanker
@@ -35,6 +94,7 @@ from autoresearch.experiments.executor import DurableExperimentExecutor
 from autoresearch.experiments.result_analysis import StatisticalAnalyzer
 from autoresearch.experiments.report_writer import ScientificReportWriter
 from autoresearch.experiments.policy import ActionType, ExecutionAction, specification_checksum
+from autoresearch.reinvention.pipeline import ReinventionPipeline
 from autoresearch.workers.local_typed import LocalTypedWorker
 
 SEARCH_PROMPT_VERSION = "search-strategies-v1"
@@ -79,6 +139,7 @@ class ReviewOutcome:
     gap: ResearchGap
     json_report: str
     markdown_report: str
+    reused: int = 0
 
 
 class SearchStrategyGenerator:
@@ -188,7 +249,13 @@ class DiscoveryService:
         imported = self.repository.import_papers_batch(papers)
         if papers:
             p0 = papers[0]
-            extraction_provider, extraction_model = self.router.identity(ModelRole.LITERATURE_EXTRACTION)
+            # Provenance label only — catalog import makes no model call. With
+            # no provider configured, record the deterministic local origin
+            # instead of failing an otherwise fully offline import.
+            try:
+                extraction_provider, extraction_model = self.router.identity(ModelRole.LITERATURE_EXTRACTION)
+            except ProviderError:
+                extraction_provider, extraction_model = "local", "catalog_import"
             seed_prov = ArtifactProvenance.create(
                 project_id=project.id, run_id=run.id,
                 source_evidence=(f"catalog-checksum:{p0.checksum}",),
@@ -376,6 +443,23 @@ class DiscoveryService:
         return artifact
 
 
+def _review_fanout(router: ModelRouter) -> int:
+    """Size the review fan-out from the extraction provider's throughput ceiling.
+
+    The provider's own gate enforces the real request limit; this outer
+    semaphore only bounds concurrent review tasks and must not silently
+    strangle a faster provider configuration. Falls back to 4 when the
+    provider exposes no config (e.g. test fakes).
+    """
+    assignment = router.assignments.get(ModelRole.LITERATURE_EXTRACTION)
+    provider = router.registry.get(assignment.provider) if assignment else None
+    config = getattr(provider, "config", None)
+    if config is None:
+        return 4
+    ceiling = getattr(config, "max_concurrency", None) or getattr(config, "concurrency", 4)
+    return max(4, int(ceiling))
+
+
 class LiteratureReviewService:
     def __init__(self, repository: ResearchRepository, router: ModelRouter, *, parser: DocumentParser | None = None) -> None:
         self.repository = repository
@@ -385,7 +469,7 @@ class LiteratureReviewService:
         self.ranker = ReviewRanker(router)
         self.gap_analyzer = GapAnalyzer(router)
         self.writer = ReviewSynthesisWriter(repository)
-        self.review_semaphore = asyncio.Semaphore(4)
+        self.review_semaphore = asyncio.Semaphore(_review_fanout(router))
 
     async def review(
         self,
@@ -395,7 +479,9 @@ class LiteratureReviewService:
         hierarchical: bool = False,
         max_cost_usd: float | None = None,
         max_runtime_seconds: float | None = None,
+        fresh: bool = False,
     ) -> ReviewOutcome:
+        require_model_role(self.router, ModelRole.LITERATURE_EXTRACTION)
         if not 1 <= top_k <= 15:
             raise ValueError("top_k must be between 1 and 15.")
         project = self.repository.get_project(project_id)
@@ -411,7 +497,7 @@ class LiteratureReviewService:
         })
         if max_cost_usd is not None:
             self.repository.set_project_budget(project_id, hard_stop=max_cost_usd)
-        return await self._execute(run.id, project_id, top_k=top_k, hierarchical=hierarchical, max_runtime_seconds=max_runtime_seconds)
+        return await self._execute(run.id, project_id, top_k=top_k, hierarchical=hierarchical, max_runtime_seconds=max_runtime_seconds, fresh=fresh)
 
     async def resume(self, run_id: str) -> ReviewOutcome:
         run = self.repository.get_run(run_id)
@@ -432,7 +518,25 @@ class LiteratureReviewService:
             max_runtime_seconds=float(data["max_runtime_seconds"]) if data.get("max_runtime_seconds") is not None else None,
         )
 
-    async def _execute(self, run_id: str, project_id: str, *, top_k: int, hierarchical: bool, max_runtime_seconds: float | None) -> ReviewOutcome:
+    async def _execute(self, run_id: str, project_id: str, *, top_k: int, hierarchical: bool, max_runtime_seconds: float | None, fresh: bool = False) -> ReviewOutcome:
+        limit = max_runtime_seconds
+        if limit is not None and limit <= 0:
+            raise ValueError("max_runtime_seconds must be positive.")
+        deadline = asyncio.timeout(limit)
+        try:
+            async with deadline:
+                return await self._execute_review(
+                    run_id, project_id, top_k=top_k, hierarchical=hierarchical,
+                    max_runtime_seconds=limit, fresh=fresh,
+                )
+        except TimeoutError as exc:
+            if not deadline.expired():
+                raise
+            message = f"runtime_limit: review exceeded {limit:g}s; completed paper checkpoints are reusable."
+            self.repository.finish_run(run_id, error=message)
+            raise TimeoutError(message) from exc
+
+    async def _execute_review(self, run_id: str, project_id: str, *, top_k: int, hierarchical: bool, max_runtime_seconds: float | None, fresh: bool = False) -> ReviewOutcome:
         guard = _ExecutionGuard(max_runtime_seconds)
         project = self.repository.get_project(project_id)
         seed = self.repository.get_seed(project_id)
@@ -441,16 +545,23 @@ class LiteratureReviewService:
             raise ValueError("Project discovery state is incomplete.")
         try:
             guard.require_allowed("paper review")
-            results = await asyncio.gather(*(self._review_one(paper, run_id, hierarchical=hierarchical) for paper in papers), return_exceptions=True)
+            require_provider_credentials(self.router, ModelRole.LITERATURE_EXTRACTION)
+            results = await asyncio.gather(*(self._review_one(paper, run_id, hierarchical=hierarchical, allow_reuse=not fresh) for paper in papers), return_exceptions=True)
             bundles: list[ReviewBundle] = []
+            failure_reasons: list[str] = []
             for paper, result in zip(papers, results):
                 if isinstance(result, Exception):
                     reason = redact_text(f"{type(result).__name__}: {result}")
+                    failure_reasons.append(reason)
                     self.repository.record_review_failure(project_id=project_id, run_id=run_id, paper_id=paper.id, reason=reason)
                 else:
                     bundles.append(result)
             if len(bundles) < top_k:
-                raise RuntimeError(f"Only {len(bundles)} papers produced evidence-backed reviews; {top_k} are required.")
+                # Surface the actual dominant cause, not just the count: the
+                # 2026-08-09 failure looked like a review-quality problem but
+                # was 140 identical missing-credential errors.
+                detail = f" First failure: {failure_reasons[0][:200]}" if failure_reasons else ""
+                raise RuntimeError(f"Only {len(bundles)} papers produced evidence-backed reviews; {top_k} are required.{detail}")
             reviews = [bundle.review for bundle in bundles]
             claims = [claim for bundle in bundles for claim in bundle.claims]
             reviewed_papers = [paper for paper in papers if paper.id in {review.paper_id for review in reviews}]
@@ -494,17 +605,30 @@ class LiteratureReviewService:
                     raise
             json_artifact, markdown_artifact = self.writer.write(project_id=project_id, run_id=run_id, papers=top_papers, reviews=top_reviews, scores=top_scores, claims=top_claims, gap=gap)
             self.repository.complete_checkpoint(run_id, "review_artifacts", payload={"json": json_artifact.path, "markdown": markdown_artifact.path})
+            # Decision-useful evidence matrix + coverage record (deterministic
+            # assembly; failures never block the review itself).
+            try:
+                from autoresearch.review.matrix import save_evidence_matrix
+                matrix_artifact = save_evidence_matrix(self.repository, project_id=project_id, run_id=run_id)
+                self.repository.complete_checkpoint(run_id, "evidence_matrix", payload={"path": matrix_artifact.path, "checksum": matrix_artifact.checksum})
+            except Exception:
+                logger.warning("Evidence-matrix persistence failed for run %s", run_id, exc_info=True)
             self.repository.finish_run(run_id)
-            return ReviewOutcome(project_id, run_id, len(reviews), len(results) - len(reviews), tuple(score.paper_id for score in top_scores), gap, json_artifact.path, markdown_artifact.path)
+            reused = sum(1 for review in reviews if review.run_id != run_id)
+            return ReviewOutcome(project_id, run_id, len(reviews), len(results) - len(reviews), tuple(score.paper_id for score in top_scores), gap, json_artifact.path, markdown_artifact.path, reused)
         except BaseException as exc:
-            self.repository.finish_run(run_id, error=redact_text(f"{type(exc).__name__}: {exc}"))
+            if isinstance(exc, asyncio.CancelledError):
+                self.repository.cancel_run(run_id)
+            else:
+                self.repository.finish_run(run_id, error=redact_text(f"{type(exc).__name__}: {exc}"))
             raise
 
-    async def _review_one(self, paper, run_id: str, *, hierarchical: bool) -> ReviewBundle:
+    async def _review_one(self, paper, run_id: str, *, hierarchical: bool, allow_reuse: bool = True) -> ReviewBundle:
         checkpoint = self.repository.checkpoint(run_id, "paper_review", paper.id)
         existing = self.repository.review_for_paper(run_id, paper.id)
         if checkpoint and checkpoint["status"] == "completed" and existing:
             return ReviewBundle(existing, tuple(self.repository.claims(paper.project_id, ids=existing.evidence_claim_ids)))
+        cached = self.repository.latest_reusable_review(paper, hierarchical=hierarchical) if allow_reuse else None
         self.repository.begin_checkpoint(run_id, "paper_review", paper.id)
         try:
             async with self.review_semaphore:
@@ -512,17 +636,26 @@ class LiteratureReviewService:
                 download = self.repository.download_for_paper(paper.id)
                 if download and download.status is DownloadStatus.DOWNLOADED and download.path:
                     try:
-                        chunks = chunk_document(self.parser.parse_seed(download.path))
+                        chunks = await asyncio.to_thread(lambda: chunk_document(self.parser.parse_seed(download.path)))
                     except Exception:
                         chunks = ()
-                bundle = await self.extractor.extract(paper, run_id=run_id, chunks=chunks, fallback_text=paper.abstract, hierarchical=hierarchical)
+                bundle = None
+                if cached is not None:
+                    cached_claims = tuple(self.repository.claims(paper.project_id, ids=cached.evidence_claim_ids)) if cached.evidence_claim_ids else ()
+                    source = " ".join(("\n\n".join(chunk.text for chunk in chunks) or paper.abstract).split())
+                    # Older releases accepted approximate excerpts. Verify cached
+                    # quotes against today's source before avoiding a model call.
+                    if cached_claims and all(" ".join(claim.excerpt.split()) in source for claim in cached_claims):
+                        bundle = ReviewBundle(cached, cached_claims)
+                if bundle is None:
+                    bundle = await self.extractor.extract(paper, run_id=run_id, chunks=chunks, fallback_text=paper.abstract, hierarchical=hierarchical)
             for claim in bundle.claims:
                 self.repository.save_claim(claim)
             self.repository.save_review(bundle.review)
             self.repository.clear_review_failures(run_id, paper.id)
-            self.repository.complete_checkpoint(run_id, "paper_review", paper.id, payload={"review_id": bundle.review.id, "claim_ids": bundle.review.evidence_claim_ids, "hierarchical": bundle.review.provenance.prompt_version == "paper-review-hierarchical-v1"})
+            self.repository.complete_checkpoint(run_id, "paper_review", paper.id, payload={"review_id": bundle.review.id, "claim_ids": bundle.review.evidence_claim_ids, "hierarchical": hierarchical, "reused_from_run": bundle.review.run_id if bundle.review.run_id != run_id else None})
             return bundle
-        except Exception as exc:
+        except BaseException as exc:
             self.repository.fail_checkpoint(run_id, "paper_review", paper.id, error=redact_text(f"{type(exc).__name__}: {exc}"))
             raise
 
@@ -597,6 +730,7 @@ class NoveltyService:
     def __init__(self, repository: ResearchRepository, router: ModelRouter, search_pipeline: StudySearchPipeline) -> None:
         self.repository = repository
         self.router = router
+        self.findings = FindingsMemory(repository)
         self.pipeline = NoveltyPipeline(
             repository=repository,
             generator=LLMCandidateGenerator(router),
@@ -606,7 +740,12 @@ class NoveltyService:
         )
 
     async def import_gap(self, project_id: str, gap_data: dict[str, Any]) -> ResearchGap:
-        """Import a research gap from external data (e.g., from a prior literature review)."""
+        """Import a research gap from external data (e.g., from a prior literature review).
+
+        The gap row references pipeline_runs, so the import gets its own
+        completed run instead of a dangling run_id that would violate the
+        foreign key (research_gaps.run_id REFERENCES pipeline_runs(id)).
+        """
         statement = " ".join(str(gap_data.get("statement") or gap_data.get("gap_statement") or "").split())
         if not statement:
             raise ValueError("Gap data must include a 'statement' or 'gap_statement' field.")
@@ -615,8 +754,10 @@ class NoveltyService:
         falsification_test = " ".join(str(gap_data.get("falsification_test") or "").split())
         confidence = float(gap_data.get("confidence", 0.5))
         classification = GapClassification.EVIDENCE_SUPPORTED if gap_data.get("supporting_paper_ids") else GapClassification.HYPOTHESIS
+        run = self.repository.create_run(project_id, PipelineKind.REVIEW, {"kind": "gap_import"})
+        self.repository.finish_run(run.id)
         provenance = ArtifactProvenance.create(
-            project_id=project_id, run_id="imported",
+            project_id=project_id, run_id=run.id,
             source_evidence=(), provider="manual_import", model="user",
             prompt_version="imported-gap-v1",
             content={"statement": statement, "why_unsolved": why_unsolved,
@@ -624,7 +765,7 @@ class NoveltyService:
                      "falsification_test": falsification_test},
         )
         gap = ResearchGap(
-            id=uuid4().hex, project_id=project_id, run_id="imported",
+            id=uuid4().hex, project_id=project_id, run_id=run.id,
             statement=statement,
             supporting_paper_ids=tuple(str(p) for p in (gap_data.get("supporting_paper_ids") or [])),
             supporting_claim_ids=tuple(str(c) for c in (gap_data.get("supporting_claim_ids") or [])),
@@ -636,7 +777,11 @@ class NoveltyService:
         self.repository.save_gap(gap)
         return gap
 
-    async def generate_portfolio(self, project_id: str, *, gap_id: str | None = None, run_id: str | None = None) -> str:
+    async def generate_portfolio(self, project_id: str, *, gap_id: str | None = None, run_id: str | None = None, max_runtime_seconds: float | None = None) -> str:
+        if max_runtime_seconds is not None and max_runtime_seconds <= 0:
+            raise ValueError("max_runtime_seconds must be positive.")
+        require_model_role(self.router, ModelRole.RESEARCH_REASONING)
+        require_provider_credentials(self.router, ModelRole.RESEARCH_REASONING)
         gap = self.repository.row("SELECT * FROM research_gaps WHERE project_id=? AND (? IS NULL OR id=?) ORDER BY confidence DESC LIMIT 1", (project_id, gap_id, gap_id))
         if not gap:
             raise ValueError(f"No research gap found for project {project_id}.")
@@ -653,13 +798,26 @@ class NoveltyService:
         try:
             # We mock the run_id inside gap so provenance links to this run.
             run_gap = ResearchGap(gap_obj.id, project_id, run.id, gap_obj.statement, gap_obj.supporting_paper_ids, gap_obj.supporting_claim_ids, gap_obj.why_unsolved, gap_obj.missing_experiment, gap_obj.falsification_test, gap_obj.confidence, gap_obj.counter_evidence_claim_ids, gap_obj.classification, gap_obj.provenance)
-            portfolio = await self.pipeline.generate_portfolio(run_gap)
+            async with asyncio.timeout(max_runtime_seconds):
+                # Findings Memory (DeepScientist mechanism, adapted): the
+                # generator also sees prior outcomes for this question —
+                # including refutations and implementation failures — so it
+                # does not repropose what already failed under the same
+                # conditions.
+                findings = self.findings.context_block(project_id, gap_obj.statement, question_id=gap_obj.id)
+                portfolio = await self.pipeline.generate_portfolio(run_gap, findings=findings)
             if owns_run:
                 self.repository.finish_run(run.id)
             return portfolio.id
-        except Exception as exc:
+        except BaseException as exc:
+            error = f"runtime_limit: novelty exceeded {max_runtime_seconds:g}s" if isinstance(exc, TimeoutError) and max_runtime_seconds is not None else f"{type(exc).__name__}: {exc}"
             if owns_run:
-                self.repository.finish_run(run.id, error=f"{type(exc).__name__}: {exc}")
+                if isinstance(exc, asyncio.CancelledError):
+                    self.repository.cancel_run(run.id)
+                else:
+                    self.repository.finish_run(run.id, error=redact_text(error))
+            if isinstance(exc, TimeoutError):
+                raise TimeoutError(error) from exc
             raise
 
 
@@ -667,6 +825,7 @@ class ExperimentService:
     def __init__(self, repository: ResearchRepository, router: ModelRouter, workspace_root: Path, worker: LocalTypedWorker | None = None) -> None:
         self.repository = repository
         self.router = router
+        self.findings = FindingsMemory(repository)
         self.pipeline = ExperimentPipeline(
             repository=repository,
             planner=ExperimentSpecGenerator(router),
@@ -679,25 +838,54 @@ class ExperimentService:
 
     async def import_candidate(self, candidate_data: dict[str, Any]) -> NoveltyCandidate:
         """Import a novelty candidate from external data (e.g., from a prior analysis)."""
-        from dataclasses import replace
         method = " ".join(str(candidate_data.get("method") or candidate_data.get("title") or "").split())
         if not method:
             raise ValueError("Candidate data must include a 'method' or 'title' field.")
         project_id = str(candidate_data.get("project_id") or "")
         if not project_id:
             raise ValueError("Candidate data must include a 'project_id' field.")
+        # The candidate row references pipeline_runs; a dangling run_id would
+        # violate the foreign key, so imports get their own completed run.
+        # A supplied run must belong to the same project and be a novelty run,
+        # otherwise the candidate would silently attach to a foreign scope.
+        supplied_run_id = str(candidate_data.get("run_id") or "")
+        supplied_run = self.repository.get_run(supplied_run_id) if supplied_run_id else None
+        if supplied_run is not None and (supplied_run.project_id != project_id or supplied_run.kind is not PipelineKind.NOVELTY):
+            raise ValueError(
+                "run_mismatch: supplied run_id must reference a novelty run of the same project."
+            )
+        owns_run = supplied_run is None
+        run_id = supplied_run_id if supplied_run is not None else self.repository.create_run(
+            project_id, PipelineKind.NOVELTY, {"kind": "candidate_import"},
+        ).id
+        try:
+            return self._save_imported_candidate(candidate_data, project_id, run_id)
+        finally:
+            if owns_run:
+                self.repository.finish_run(run_id)
+
+    def _save_imported_candidate(self, candidate_data: dict[str, Any], project_id: str, run_id: str) -> NoveltyCandidate:
+        method = " ".join(str(candidate_data.get("method") or candidate_data.get("title") or "").split())
+        if not method:
+            raise ValueError("Candidate data must include a 'method' or 'title' field.")
         candidate = NoveltyCandidate(
-            id=uuid4().hex, project_id=project_id, run_id=candidate_data.get("run_id", "imported"),
+            id=uuid4().hex, project_id=project_id, run_id=run_id,
+            gap_id=str(candidate_data.get("gap_id") or ""),
+            strategy=str(candidate_data.get("strategy") or "imported"),
             method=method,
-            description=str(candidate_data.get("description") or ""),
-            mechanism=str(candidate_data.get("mechanism") or ""),
-            prior_art_status=PriorArtStatus.UNCHECKED,
-            status=CandidateStatus.PROPOSED,
-            prior_art_assessment=None, novelty_critique=None,
-            revisions=(), claim_ledger=None, portfolio_id=None,
-            evidence_claim_ids=(), gap_id=str(candidate_data.get("gap_id") or ""),
+            causal_mechanism=" ".join(str(candidate_data.get("causal_mechanism") or candidate_data.get("mechanism") or "").split()),
+            target_limitation=" ".join(str(candidate_data.get("target_limitation") or "").split()),
+            difference_from_existing=" ".join(str(candidate_data.get("difference_from_existing") or "").split()),
+            expected_effect=str(candidate_data.get("expected_effect") or ""),
+            falsification_condition=" ".join(str(candidate_data.get("falsification_condition") or "").split()),
+            minimum_validating_experiment=" ".join(str(candidate_data.get("minimum_validating_experiment") or "").split()),
+            required_ablations=tuple(str(item) for item in candidate_data.get("required_ablations") or []),
+            implementation_complexity=str(candidate_data.get("implementation_complexity") or "unknown"),
+            expected_compute=str(candidate_data.get("expected_compute") or "unknown"),
+            risks_and_objections=tuple(str(item) for item in candidate_data.get("risks_and_objections") or []),
+            status=CandidateStatus.GENERATED,
             provenance=ArtifactProvenance.create(
-                project_id=project_id, run_id="imported",
+                project_id=project_id, run_id=run_id,
                 source_evidence=(), provider="manual_import", model="user",
                 prompt_version="imported-candidate-v1",
                 content={"method": method},
@@ -707,14 +895,12 @@ class ExperimentService:
         return candidate
 
     def action_plan(self, spec: ExperimentSpec) -> tuple[ExecutionAction, ...]:
+        if not spec.expected_outputs:
+            raise ValueError("experiment_action_missing: expected_outputs is empty")
         scripts = [item for item in spec.expected_outputs if str(item).endswith(".py")]
         if scripts:
             return (ExecutionAction(ActionType.RUN_PYTHON_SCRIPT, str(scripts[0]), ()),)
-        # A test suite validates an environment; it is never an experiment.
-        # Refuse execution unless the immutable spec names an actual experiment
-        # entry point.  This prevents ``pytest .`` from being mislabelled as
-        # model training or evaluation.
-        raise ValueError("experiment_action_missing: spec must declare an explicit scientific Python entry point")
+        return (ExecutionAction(ActionType.RUN_PYTHON_SCRIPT, "scripts/run_experiment.py", ()),)
 
     def _execution_worker(self, spec: ExperimentSpec) -> str:
         """Bind approval to the worker that will actually execute.
@@ -750,7 +936,113 @@ class ExperimentService:
         checksum = specification_checksum(spec, actions, worker)
         return {"run_id": spec.run_id, "spec_id": spec.id, "candidate_id": candidate_id, "checksum": checksum, "worker": worker, "actions": [{"kind": action.kind.value, "target": action.target, "arguments": list(action.arguments)} for action in actions], "budget": 3600.0, "expires_at": None}
 
-    async def execute_candidate(self, candidate_id: str, *, run_id: str | None = None, mode: str = "plan") -> str:
+    def _methodology_for_spec(self, spec: ExperimentSpec) -> dict[str, Any] | None:
+        """The frozen methodology record when it belongs to this spec's candidate."""
+        freeze = self.repository.latest_methodology_freeze(spec.project_id)
+        if freeze is None or freeze.candidate_id != spec.candidate_id:
+            return None
+        try:
+            return json.loads(Path(freeze.artifact_path).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+
+    async def implement_candidate(self, candidate_id: str) -> dict[str, Any]:
+        """Generate and statically verify the experiment implementation for a
+        planned spec (research code generation, AI-Researcher mechanism
+        adapted). Reuses an existing script; no execution happens here — the
+        approval gate is untouched."""
+        from autoresearch.experiments.implementation import ImplementationGenerator
+
+        spec = self.repository.get_experiment_spec(candidate_id)
+        if not spec:
+            raise ValueError(f"no_experiment_spec: plan the experiment for candidate {candidate_id} first")
+        require_provider_credentials(self.router, ModelRole.RESEARCH_REASONING)
+        freeze = self.repository.latest_methodology_freeze(spec.project_id)
+        methodology = self._methodology_for_spec(spec)
+        findings = self.findings.context_block(spec.project_id, spec.hypothesis)
+        generator = ImplementationGenerator(self.repository, self.router)
+        record = await generator.implement(spec, methodology=methodology, findings=findings, freeze=freeze)
+
+        already = any(
+            f.spec_id == spec.id and f.status is FindingStatus.IMPLEMENTED_METHOD
+            for f in self.repository.findings_for_project(spec.project_id, limit=200)
+        )
+        if record["fidelity"] == "STATIC_VERIFIED" and not already:
+            self.repository.save_finding(self._implementation_finding(spec, record))
+        elif record["status"] == "failed":
+            self.findings.record_failure(
+                spec,
+                "implementation generation failed static verification: " + "; ".join(record["verification"]["reasons"][:3]),
+                fidelity="STATIC",
+            )
+        self.repository.append_api_event(spec.run_id, "experiment.implementation", {
+            "spec_id": spec.id, "status": record["status"], "fidelity": record["fidelity"],
+            "mechanism_coverage": record["verification"]["mechanism_coverage"],
+        })
+        return record
+
+    def _implementation_finding(self, spec: ExperimentSpec, record: dict[str, Any]) -> ResearchFinding:
+        return ResearchFinding(
+            id=uuid4().hex, project_id=spec.project_id, run_id=spec.run_id,
+            status=FindingStatus.IMPLEMENTED_METHOD,
+            question_id=str(spec.gap_id), candidate_id=spec.candidate_id,
+            methodology_freeze_id=str(spec.methodology_freeze_id), spec_id=spec.id,
+            analysis_id="", report_id="",
+            hypothesis=spec.hypothesis, expected_observation="",
+            implementation_digest=str(record.get("script_path") or ""),
+            observed_outcome_json=json.dumps({
+                "verification": record.get("verification", {}),
+            }),
+            interpretation="", uncertainty="static verification only; not yet executed",
+            fidelity="STATIC_VERIFIED",
+            failure_classification="none",
+            lesson=f"Implementation generated and statically verified for spec {spec.id} "
+                   f"(mechanism coverage {record['verification']['mechanism_coverage']:.0%}); "
+                   f"awaiting authorized execution.",
+            applicability=f"dataset={spec.dataset_identity}; split={spec.split_definition}",
+            open_questions_json="[]",
+            next_action="Execute under the existing approval gate; then analysis updates this finding's status.",
+            keywords_json=json.dumps(record["verification"].get("matched_components", [])[:8]),
+            provenance=ArtifactProvenance.create(
+                project_id=spec.project_id, run_id=spec.run_id, source_evidence=[spec.id],
+                provider="model", model="implementation-generator",
+                prompt_version="findings-memory-v1",
+                content={"status": "implemented_method", "spec": spec.id},
+            ),
+        )
+
+    async def report_for_candidate(self, candidate_id: str) -> dict[str, Any]:
+        """Complete the result path for an executed candidate: reuse the
+        validated statistical analysis and write (or reuse) the deterministic
+        report. Fails with insufficient_evidence when no validated analysis
+        exists — never fabricates a decision from exit codes."""
+        spec = self.repository.get_experiment_spec(candidate_id)
+        if not spec:
+            raise ValueError("insufficient_evidence: no experiment spec exists for this candidate")
+        existing = self.repository.row(
+            "SELECT * FROM experiment_reports WHERE run_id=? ORDER BY rowid DESC LIMIT 1", (spec.run_id,)
+        )
+        if existing:
+            return {"report_id": existing["id"], "decision": existing["decision"],
+                    "decision_evidence": existing["decision_evidence"], "analysis_id": existing["analysis_id"],
+                    "spec_id": spec.id, "candidate_id": candidate_id}
+        analysis = self.repository.get_statistical_analysis(spec.id)
+        if not analysis:
+            raise ValueError(
+                "insufficient_evidence: no validated statistical analysis exists for this candidate; "
+                "execute the approved experiment (measurement ingestion and analysis run automatically) "
+                "or inspect the recorded integrity failure"
+            )
+        report = await self.pipeline.report_writer.write(spec, analysis)
+        self.repository.save_experiment_report(report)
+        return {"report_id": report.id, "decision": report.decision.value,
+                "decision_evidence": report.decision_evidence, "analysis_id": analysis.id,
+                "spec_id": spec.id, "candidate_id": candidate_id}
+
+    async def execute_candidate(self, candidate_id: str, *, run_id: str | None = None, mode: str = "plan", max_runtime_seconds: float | None = None) -> str:
+        if max_runtime_seconds is not None and max_runtime_seconds <= 0:
+            raise ValueError("max_runtime_seconds must be positive.")
+        require_model_role(self.router, ModelRole.RESEARCH_REASONING)
         candidate_row = self.repository.row("SELECT * FROM novelty_candidates WHERE id=?", (candidate_id,))
         if not candidate_row:
             raise ValueError(f"Candidate {candidate_id} not found.")
@@ -766,15 +1058,22 @@ class ExperimentService:
             # mock candidate to use this run_id for tracking
             from dataclasses import replace
             run_candidate = replace(candidate, run_id=run.id)
-            spec = self.repository.get_experiment_spec(candidate_id) if mode == "execute" else None
+            if mode == "report":
+                outcome = await self.report_for_candidate(candidate_id)
+                if owns_run:
+                    self.repository.finish_run(run.id)
+                return str(outcome["spec_id"])
+            # Inspection/validation must not generate a new plan or invalidate an approval.
+            spec = self.repository.get_experiment_spec(candidate_id) if mode in {"execute", "inspect", "validate"} else None
             if spec is None:
-                spec = await self.pipeline.planner.plan(run_candidate)
+                async with asyncio.timeout(max_runtime_seconds):
+                    spec = await self.pipeline.plan_for_candidate(run_candidate)
                 self.repository.save_experiment_spec(spec)
             if mode in {"inspect", "validate"}:
-                manifest = await self.pipeline.environment_builder.prepare(spec)
-                self.repository.save_environment_manifest(manifest)
-            if mode == "report":
-                raise ValueError("insufficient_evidence: no completed statistical analysis exists for this candidate")
+                manifest = self.repository.get_environment_manifest(spec.id)
+                if manifest is None:
+                    manifest = await self.pipeline.environment_builder.prepare(spec)
+                    self.repository.save_environment_manifest(manifest)
             if mode == "execute":
                 if not self.worker:
                     raise RuntimeError("worker_unavailable: no policy-controlled execution worker is configured")
@@ -788,17 +1087,88 @@ class ExperimentService:
                 result = await self.worker.run(spec, self.action_plan(spec), approved_checksum=str(preview["checksum"]), timeout_seconds=int(approval.get("approved_budget") or 3600))
                 if result.get("state") != "COMPLETED":
                     raise RuntimeError("execution_failed: worker did not complete the approved scientific action")
-                # Completion only proves that a command ended successfully.  It
-                # deliberately creates no scientific result: artifact ingestion
-                # and identity validation are required before analysis.
-                self.repository.append_api_event(run.id, "experiment.execution_completed", {
-                    "job_id": result.get("job_id"), "scientific_result": "INSUFFICIENT_EVIDENCE",
-                    "reason": "no validated measurement artifact ingested",
-                })
+                # Complete the result path: ingest the measured artifacts the
+                # implementation emitted, run the deterministic statistical
+                # analysis, and write the fail-closed report. Any integrity
+                # failure is recorded and leaves the honest pending state —
+                # a completed command never implies a scientific result.
+                try:
+                    analysis = self.repository.get_statistical_analysis(spec.id)
+                    if analysis is None:
+                        from autoresearch.experiments.ingestion import MeasurementIngester
+                        ingested = MeasurementIngester(self.repository).ingest(spec, result, job_id=str(result.get("job_id")))
+                        analysis = await self.pipeline.analyzer.analyze(spec, ingested)
+                        self.repository.save_statistical_analysis(analysis)
+                    report = await self.report_for_candidate(candidate_id)
+                    self.repository.append_api_event(run.id, "experiment.analyzed", {
+                        "job_id": result.get("job_id"), "analysis_id": analysis.id,
+                        "report_id": report.get("report_id"), "decision": report.get("decision"),
+                    })
+                    # Persist the outcome to the shared Findings Memory so later
+                    # novelty/review stages retrieve it (incl. failures). Bookkeeping
+                    # must not fail the scientific path.
+                    try:
+                        report_row = self.repository.row(
+                            "SELECT * FROM experiment_reports WHERE id=?", (str(report.get("report_id")),)
+                        ) or {}
+                        methodology = self._methodology_for_spec(spec)
+                        finding = self.findings.record_from_analysis(spec, analysis, report_row, methodology=methodology)
+                        self.repository.append_api_event(run.id, "findings.recorded", {
+                            "finding_id": finding.id, "status": finding.status.value,
+                        })
+                    except Exception as exc:  # noqa: BLE001 — memory bookkeeping only
+                        logger.warning("Findings recording failed for spec %s: %s", spec.id, exc)
+                except (IntegrityFailure, ValueError) as exc:
+                    self.repository.append_api_event(run.id, "experiment.execution_completed", {
+                        "job_id": result.get("job_id"), "scientific_result": "INSUFFICIENT_EVIDENCE",
+                        "reason": redact_text(f"{type(exc).__name__}: {exc}"),
+                    })
+                    try:
+                        self.findings.record_failure(spec, f"{type(exc).__name__}: {exc}")
+                    except Exception:  # noqa: BLE001 — memory bookkeeping only
+                        logger.warning("Failure-finding recording failed for spec %s", spec.id, exc_info=True)
             if owns_run:
                 self.repository.finish_run(run.id)
             return spec.id
-        except Exception as exc:
+        except BaseException as exc:
+            error = f"runtime_limit: experiment planning exceeded {max_runtime_seconds:g}s" if isinstance(exc, TimeoutError) and max_runtime_seconds is not None else f"{type(exc).__name__}: {exc}"
             if owns_run:
-                self.repository.finish_run(run.id, error=f"{type(exc).__name__}: {exc}")
+                if isinstance(exc, asyncio.CancelledError):
+                    self.repository.cancel_run(run.id)
+                else:
+                    self.repository.finish_run(run.id, error=redact_text(error))
+            if isinstance(exc, TimeoutError):
+                raise TimeoutError(error) from exc
+            raise
+
+
+class ReinventionService:
+    def __init__(self, repository: ResearchRepository, router: ModelRouter) -> None:
+        self.repository = repository
+        self.router = router
+        self.pipeline = ReinventionPipeline(repository, router)
+
+    async def reinvent(self, candidate_id: str) -> dict[str, Any]:
+        candidate = self.repository.get_novelty_candidate(candidate_id)
+        if not candidate:
+            raise ValueError(f"Novelty candidate '{candidate_id}' not found.")
+        require_provider_credentials(self.router, ModelRole.RESEARCH_REASONING)
+
+        run = self.repository.create_run(candidate.project_id, PipelineKind.REINVENTION, input_data={"candidate_id": candidate_id})
+        try:
+            analysis, next_candidate = await self.pipeline.analyze_and_reinvent(candidate.id, run_id=run.id)
+            self.repository.finish_run(run.id)
+            return {
+                "project_id": candidate.project_id,
+                "run_id": run.id,
+                "reinvention_id": analysis.id,
+                "action": analysis.action.value,
+                "root_cause_diagnosis": analysis.root_cause_diagnosis,
+                "empirical_lessons": list(analysis.empirical_lessons),
+                "next_generation_hypothesis": analysis.next_generation_hypothesis,
+                "next_candidate_id": next_candidate.id if next_candidate else None,
+                "next_candidate_method": next_candidate.method if next_candidate else None,
+            }
+        except Exception as exc:
+            self.repository.finish_run(run.id, error=f"{type(exc).__name__}: {exc}")
             raise

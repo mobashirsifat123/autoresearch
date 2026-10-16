@@ -7,6 +7,7 @@ name = "provider-first-autoresearch"
 version = "0.1.0a1"
 description = "AutoResearch evidence-first research discovery and review platform"
 requires-python = ">=3.11"
+license = { text = "MIT" }
 dependencies = [
   "httpx>=0.28,<1",
   "pypdf>=6.0,<7",
@@ -24,6 +25,9 @@ autoresearch-api = "autoresearch.api.app:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+autoresearch = ["skills/**/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

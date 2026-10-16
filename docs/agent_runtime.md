@@ -11,8 +11,8 @@ The backend must be started with the provider configuration and the directories
 that the agent may inspect:
 
 ```bash
-cd /Users/mobashirsifat/autoresearch
-export AUTORESEARCH_AGENT_ROOTS=/Users/mobashirsifat/autoresearch:/Users/mobashirsifat/autoresearch-cli
+cd /path/to/autoresearch
+export AUTORESEARCH_AGENT_ROOTS=/path/to/autoresearch:<companion-terminal-client-dir>
 autoresearch-api
 ```
 

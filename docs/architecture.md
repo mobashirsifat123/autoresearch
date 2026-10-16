@@ -191,7 +191,7 @@ navigation. Neither is implemented in milestone one.
 ## Rollback
 
 The project is an independent Git repository and does not mutate
-`/Users/mobashirsifat/qwen-ui`. Rollback is the Git parent of the milestone
+any sibling checkouts. Rollback is the Git parent of the milestone
 commit. SQLite migration v1 is creation-only; restoring the pre-migration
 database means restoring its backup or deleting only a newly created milestone
 database after verifying its exact path.
@@ -200,8 +200,8 @@ database after verifying its exact path.
 
 The system executes a fully verified, evidence-grounded Orchestrator pattern for novelty and experiments:
 
-- **Novelty Pipeline:** Takes a validated research gap and proposes mechanism-level candidates through `ModelRouter`. Known methods cannot be promoted; incremental candidates remain eligible; explicit scientific gates precede score-based ranking. Claim ledgers preserve safe wording, closest evidence and unresolved uncertainty. Portfolio tiers are optional.
-- **Experiment Pipeline:** Transforms a selected candidate into a declarative `ExperimentSpec`. Typed execution actions are resolved by policy to argument arrays; arbitrary model-generated shell text is not executable. Statistical summaries are deterministic and seed-aware. Execution remains conditional until a policy-controlled worker and exact-spec approval are configured.
+- **Novelty Pipeline:** Takes a validated research gap and proposes mechanism-level candidates through `ModelRouter`. Known methods cannot be promoted; incremental candidates remain eligible; explicit scientific gates precede score-based ranking. Claim ledgers preserve safe wording, closest evidence and unresolved uncertainty. Portfolio tiers are optional. Candidate generation is literature-grounded (prompt `candidate-gen-v3`, mechanism adapted from HKUDS/AI-Researcher `idea_agent.py` @ `f9a6f8480860c193afff600eeffe3defcee8a978`, no upstream code copied): the generator receives the gap's verified claim excerpts, reviewed paper methods, and counter-evidence, is instructed to name the closest prior method by `paper_id` in `difference_from_existing` (recorded, not enforced), and a checksummed `novelty-grounding.json` artifact records which supplied papers each candidate of the run — including revised and rejected ones — actually cited.
+- **Experiment Pipeline:** Transforms a selected candidate into a declarative `ExperimentSpec`. Typed execution actions are resolved by policy to argument arrays; arbitrary model-generated shell text is not executable. Statistical summaries are deterministic and seed-aware. Execution remains conditional until a policy-controlled worker and exact-spec approval are configured. Planning is literature-grounded (prompt `experiment-planner-v3`): designs receive the gap's falsification test, reviewed paper methods, verified claims, and the closest-prior-methods comparison from the stored prior-art assessment, and `baseline_configuration` is instructed to name a supplied corpus method or an explicitly named standard baseline.
 
 ## Safety Protocols
 

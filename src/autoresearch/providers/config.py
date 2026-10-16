@@ -16,11 +16,14 @@ class ProviderConfig:
     api_key_env: str
     capabilities: frozenset[Capability]
     connect_timeout: float = 5.0
-    read_timeout: float = 120.0
-    total_timeout: float = 180.0
+    # Zero means no read or total deadline. Connection failures still have a timeout.
+    read_timeout: float = 0.0
+    total_timeout: float = 0.0
     max_retries: int = 2
     concurrency: int = 4
+    max_concurrency: int | None = None
     requests_per_second: float | None = None
+    thinking_budget: int | None = None
     embedding_dimension: int | None = None
     embedding_batch_size: int = 64
     structured_output_mode: str = "json_schema"
@@ -33,6 +36,10 @@ class ProviderConfig:
             raise ValueError("Provider api_key_env is required; inline secrets are forbidden.")
         if self.concurrency < 1:
             raise ValueError("Provider concurrency must be at least one.")
+        if self.max_concurrency is not None and self.max_concurrency < self.concurrency:
+            raise ValueError("Provider max_concurrency must be greater than or equal to concurrency when set.")
+        if self.thinking_budget is not None and self.thinking_budget < 1:
+            raise ValueError("Provider thinking_budget must be a positive token count.")
         if self.requests_per_second is not None and self.requests_per_second <= 0:
             raise ValueError("requests_per_second must be positive.")
         if self.structured_output_mode not in ("json_schema", "json_object"):

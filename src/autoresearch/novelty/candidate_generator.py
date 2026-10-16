@@ -1,8 +1,11 @@
-"""Novelty candidate generation using structured LLM output."""
+"""Purpose: Generates innovative candidate solutions targeting a specific research gap."""
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
+import re
 from uuid import uuid4
 
 from autoresearch.domain.models import (
@@ -16,6 +19,9 @@ from autoresearch.domain.models import (
 )
 from autoresearch.providers.capabilities import ModelRole
 from autoresearch.providers.router import ModelRouter
+
+logger = logging.getLogger(__name__)
+from autoresearch.review.evidence_context import format_evidence_context
 
 CANDIDATE_SCHEMA = {
     "type": "object",
@@ -42,7 +48,25 @@ CANDIDATE_SCHEMA = {
     "additionalProperties": False,
 }
 
-PROMPT_VERSION = "candidate-gen-v2"
+PROMPT_VERSION = "candidate-gen-v3"
+
+# Literature grounding adapted from HKUDS/AI-Researcher @ f9a6f8480860c193afff600eeffe3defcee8a978
+# (research_agent/inno/agents/inno_agent/idea_agent.py): the Idea Generation
+# Agent must summarize existing methods from the actual papers before
+# proposing, and tie its proposal to them. Mechanism reused; no upstream code
+# copied (the upstream repository carries no license file).
+_GROUNDING_CONTRACT = (
+    "Before proposing, ground yourself in the reviewed literature supplied below: "
+    "the papers' methods and the verified claim excerpts. "
+    "Do not invent papers or claims that are not supplied."
+)
+# The citation clause is appended only when the context actually supplies
+# papers; demanding a [paper_id] reference with no papers in the prompt would
+# force either a contract violation or a hallucinated ID.
+_CITATION_CONTRACT = (
+    "difference_from_existing MUST name the closest prior method by its paper_id "
+    "(format [paper_id]) and state the mechanism-level difference."
+)
 
 # json_object mode drops the schema, so the prompt must carry the contract:
 # every expected key, enumerated. Without this the model returns renamed keys
@@ -63,13 +87,6 @@ _FIELD_CONTRACT = (
     "- risks_and_objections: array of strings\n"
     "Every key must be present with non-empty values. No other keys."
 )
-
-
-class LLMCandidateGenerator:
-    def __init__(self, router: ModelRouter) -> None:
-        self.router = router
-
-import asyncio
 
 _STRATEGY_SYSTEM_PROMPTS = {
     "limitation root cause elimination": (
@@ -101,7 +118,14 @@ class LLMCandidateGenerator:
     def __init__(self, router: ModelRouter) -> None:
         self.router = router
 
-    async def generate(self, gap: ResearchGap, count: int = 5) -> tuple[NoveltyCandidate, ...]:
+    async def generate(self, gap: ResearchGap, count: int = 5, *, evidence_context: dict | None = None, on_candidate=None) -> tuple[NoveltyCandidate, ...]:
+        """Generate candidates concurrently.
+
+        ``on_candidate`` (optional) is invoked with each candidate the moment
+        its model call completes — the pipeline uses it to persist partial
+        progress at this expensive boundary, so an interrupted run leaves
+        recoverable state instead of losing every finished generation.
+        """
         strategies = [
             "limitation root cause elimination",
             "cross-domain mechanism transfer",
@@ -110,21 +134,59 @@ class LLMCandidateGenerator:
             "computational bottleneck bypass",
         ]
         selected_strategies = strategies[:min(count, len(strategies))]
-        tasks = [
-            self._generate_single(gap, strategy)
+        grounding_block = format_evidence_context(evidence_context)
+        candidates: list[NoveltyCandidate] = []
+        saved: set[str] = set()
+        for coro in asyncio.as_completed([
+            self._generate_single(gap, strategy, grounding_block, evidence_context)
             for strategy in selected_strategies
-        ]
-        candidates = await asyncio.gather(*tasks)
-        return tuple(candidates)
+        ]):
+            candidate = await coro
+            candidates.append(candidate)
+            if on_candidate is not None:
+                try:
+                    on_candidate(candidate)
+                    saved.add(candidate.id)
+                except Exception:  # noqa: BLE001 — persistence must not kill generation
+                    logger.exception("on_candidate persistence failed for %s", candidate.id)
+        # Deterministic strategy order (as_completed yields in completion
+        # order; downstream dedup/selection must not depend on it).
+        order = {strategy: index for index, strategy in enumerate(selected_strategies)}
+        ordered = sorted(candidates, key=lambda c: order.get(c.strategy, len(order)))
+        for candidate in ordered:
+            if candidate.id not in saved and on_candidate is not None:
+                try:
+                    on_candidate(candidate)
+                except Exception:  # noqa: BLE001
+                    logger.exception("candidate persistence failed for %s", candidate.id)
+        return tuple(ordered)
 
-    async def _generate_single(self, gap: ResearchGap, strategy: str) -> NoveltyCandidate:
+    async def _generate_single(
+        self, gap: ResearchGap, strategy: str, grounding_block: str = "", evidence_context: dict | None = None,
+    ) -> NoveltyCandidate:
         system_prompt = _STRATEGY_SYSTEM_PROMPTS.get(
             strategy,
             "You are a world-class AI researcher proposing a novel method to address a validated research gap. Return a precise, highly-detailed structured specification of your proposed method. Reject vague claims."
         )
+        literature_section = f"\n\n{grounding_block}\n" if grounding_block else ""
+        grounding_contract = ""
+        if grounding_block:
+            grounding_contract = " " + _GROUNDING_CONTRACT
+            if evidence_context and evidence_context.get("papers"):
+                grounding_contract += " " + _CITATION_CONTRACT
         messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"Prompt version: {PROMPT_VERSION}\nResearch Gap:\n{gap.statement}\nWhy Unsolved: {gap.why_unsolved}\n\nGenerate a candidate using strategy: {strategy}.\n\n{_FIELD_CONTRACT}"}
+            {
+                "role": "system",
+                "content": system_prompt + grounding_contract,
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Prompt version: {PROMPT_VERSION}\nResearch Gap:\n{gap.statement}\n"
+                    f"Why Unsolved: {gap.why_unsolved}\n{literature_section}\n"
+                    f"Generate a candidate using strategy: {strategy}.\n\n{_FIELD_CONTRACT}"
+                ),
+            },
         ]
 
         payload = await self.router.structured_output(
@@ -144,7 +206,12 @@ class LLMCandidateGenerator:
             provider=provider,
             model=model,
             prompt_version=PROMPT_VERSION,
-            content=payload,
+            content={
+                **payload,
+                "evidence_linked_paper_ids": cited_paper_ids(
+                    payload.get("difference_from_existing", ""), evidence_context,
+                ),
+            },
         )
 
         return NoveltyCandidate(
@@ -168,7 +235,7 @@ class LLMCandidateGenerator:
             provenance=provenance,
         )
 
-    async def revise(self, candidate: NoveltyCandidate, assessment: PriorArtAssessment, critique: NoveltyCritique, revision_count: int = 1) -> tuple[NoveltyCandidate, CandidateRevision]:
+    async def revise(self, candidate: NoveltyCandidate, assessment: PriorArtAssessment, critique: NoveltyCritique, revision_count: int = 1, *, evidence_context: dict | None = None) -> tuple[NoveltyCandidate, CandidateRevision]:
         if revision_count not in (1, 2):
             raise ValueError("Candidate revision is bounded to two rounds")
 
@@ -194,7 +261,8 @@ class LLMCandidateGenerator:
         provider, model = self.router.identity(ModelRole.RESEARCH_REASONING)
         provenance = ArtifactProvenance.create(project_id=candidate.project_id, run_id=candidate.run_id,
             source_evidence=[candidate.id, assessment.id, critique.id], provider=provider, model=model,
-            prompt_version="candidate-revision-v2", content=payload)
+            prompt_version="candidate-revision-v2",
+            content={**payload, "evidence_linked_paper_ids": cited_paper_ids(payload.get("difference_from_existing", ""), evidence_context)})
         revised = NoveltyCandidate(
             uuid4().hex, candidate.project_id, candidate.run_id, candidate.gap_id,
             payload.get("strategy", candidate.strategy), payload.get("method", ""), payload.get("causal_mechanism", ""),
@@ -206,6 +274,21 @@ class LLMCandidateGenerator:
         revision = CandidateRevision(uuid4().hex, candidate.project_id, candidate.run_id, candidate.id, revised.id,
             critique.id, revision_count, assessment.mechanism_comparison or "Revised to reduce documented overlap.", provenance)
         return revised, revision
+
+
+def cited_paper_ids(text: str, evidence_context: dict | None) -> list[str]:
+    """Record which supplied paper IDs the model actually referenced.
+
+    This is provenance bookkeeping, not a validation gate: an empty list means
+    the model did not cite the corpus, which reviewers can see in the stored
+    provenance content and the novelty-grounding artifact instead of trusting
+    a difference_from_existing claim.
+    """
+    if not evidence_context:
+        return []
+    supplied = {str(p.get("paper_id")) for p in evidence_context.get("papers", [])}
+    cited = set(re.findall(r"\[([A-Za-z0-9_-]+)\]", str(text or "")))
+    return sorted(cited & supplied)
 
 
 def _model_hypothesis(value: object) -> str:

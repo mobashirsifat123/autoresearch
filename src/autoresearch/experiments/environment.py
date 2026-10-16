@@ -1,4 +1,4 @@
-"""Reproducible, isolated environment preparation."""
+"""Purpose: Audits system readiness before any experiment execution."""
 
 from __future__ import annotations
 

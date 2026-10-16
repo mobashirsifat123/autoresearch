@@ -8,7 +8,7 @@ import threading
 from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, Sequence
 from uuid import uuid4
 
 from autoresearch.domain.models import (
@@ -17,7 +17,10 @@ from autoresearch.domain.models import (
     DownloadRecord,
     DownloadStatus,
     EvidenceClaim,
+    FindingStatus,
     GapClassification,
+    ManuscriptRecord,
+    ResearchFinding,
     PaperRecord,
     PaperReview,
     PipelineKind,
@@ -46,10 +49,12 @@ from autoresearch.domain.models import (
     ExecutionResult,
     StatisticalAnalysis,
     ExperimentReport,
+    ReinventionAction,
+    ReinventionAnalysis,
 )
 
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 14
 
 
 class ResearchRepository:
@@ -104,6 +109,24 @@ class ResearchRepository:
             if current < 8:
                 connection.executescript(_SCHEMA_V8)
                 connection.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(?,?)", (8, utc_now()))
+            if current < 9:
+                connection.executescript(_SCHEMA_V9)
+                connection.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(?,?)", (9, utc_now()))
+            if current < 10:
+                connection.executescript(_SCHEMA_V10)
+                connection.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(?,?)", (10, utc_now()))
+            if current < 11:
+                connection.executescript(_SCHEMA_V11)
+                connection.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(?,?)", (11, utc_now()))
+            if current < 12:
+                connection.executescript(_SCHEMA_V12)
+                connection.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(?,?)", (12, utc_now()))
+            if current < 13:
+                connection.executescript(_SCHEMA_V13)
+                connection.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(?,?)", (13, utc_now()))
+            if current < 14:
+                connection.executescript(_SCHEMA_V14)
+                connection.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(?,?)", (14, utc_now()))
             latest = int(connection.execute("SELECT COALESCE(MAX(version), 0) FROM schema_migrations").fetchone()[0])
             if latest != SCHEMA_VERSION:
                 raise RuntimeError(f"Unsupported database schema v{latest}; expected v{SCHEMA_VERSION}.")
@@ -356,6 +379,24 @@ class ResearchRepository:
             params = (project_id, run_id)
         return [_review(row) for row in self.rows(sql + " ORDER BY paper_id", params)]
 
+    def latest_reusable_review(self, paper: "PaperRecord", *, hierarchical: bool) -> PaperReview | None:
+        """Latest completed paper checkpoint from any run of the same
+        project whose prompt version matches the requested review mode.
+        Reviews are verbatim-verified evidence for an immutable paper under a
+        fixed prompt version, so reuse is sound; a version bump or --fresh
+        forces re-extraction."""
+        version_prefix = "paper-review-hierarchical-v1" if hierarchical else "paper-review-v2"
+        row = self.row(
+            "SELECT pr.* FROM paper_reviews pr"
+            " JOIN pipeline_checkpoints cp ON cp.run_id=pr.run_id"
+            " AND cp.stage='paper_review' AND cp.item_key=pr.paper_id AND cp.status='completed'"
+            " WHERE pr.project_id = ? AND pr.paper_id = ?"
+            "   AND pr.provenance_json LIKE ?"
+            " ORDER BY pr.rowid DESC LIMIT 1",
+            (paper.project_id, paper.id, f'%"prompt_version": "{version_prefix}%'),
+        )
+        return _review(row) if row else None
+
     def review_for_paper(self, run_id: str, paper_id: str) -> PaperReview | None:
         row = self.row(
             "SELECT * FROM paper_reviews WHERE run_id=? AND paper_id=?",
@@ -410,8 +451,26 @@ class ResearchRepository:
         row = self.row("SELECT COALESCE(SUM(estimated_cost),0) AS total FROM provider_usage WHERE project_id=?", (project_id,))
         return float(row["total"] if row else 0.0)
 
-    def set_project_budget(self, project_id: str, *, hard_stop: float | None, currency: str = "USD") -> None:
-        self.execute("INSERT INTO project_budgets(project_id,hard_stop,currency,updated_at) VALUES(?,?,?,?) ON CONFLICT(project_id) DO UPDATE SET hard_stop=excluded.hard_stop,currency=excluded.currency,updated_at=excluded.updated_at", (project_id, hard_stop, currency, utc_now()))
+    def provider_tokens(self, project_id: str) -> int:
+        row = self.row(
+            "SELECT COALESCE(SUM(COALESCE(prompt_tokens,0)+COALESCE(completion_tokens,0)),0) AS tokens"
+            " FROM provider_usage WHERE project_id=?",
+            (project_id,),
+        )
+        return int(row["tokens"] if row else 0)
+
+    def set_project_budget(self, project_id: str, *, hard_stop: float | None = None, currency: str = "USD", token_ceiling: int | None = None) -> None:
+        """Set the durable project budget. A ``None`` value PRESERVES the
+        existing setting (so a cost-only invocation does not wipe a token
+        ceiling, and vice versa); pass an explicit value to change it."""
+        existing = self.get_project_budget(project_id) or {}
+        effective_hard_stop = hard_stop if hard_stop is not None else existing.get("hard_stop")
+        effective_ceiling = token_ceiling if token_ceiling is not None else existing.get("token_ceiling")
+        self.execute(
+            "INSERT INTO project_budgets(project_id,hard_stop,currency,token_ceiling,updated_at) VALUES(?,?,?,?,?)"
+            " ON CONFLICT(project_id) DO UPDATE SET hard_stop=excluded.hard_stop,currency=excluded.currency,token_ceiling=excluded.token_ceiling,updated_at=excluded.updated_at",
+            (project_id, effective_hard_stop, currency, effective_ceiling, utc_now()),
+        )
 
     def get_project_budget(self, project_id: str) -> dict[str, Any] | None:
         return self.row("SELECT * FROM project_budgets WHERE project_id=?", (project_id,))
@@ -557,8 +616,8 @@ class ResearchRepository:
     # Experiment methods
     def save_experiment_spec(self, spec: ExperimentSpec) -> None:
         self.execute(
-            "INSERT OR REPLACE INTO experiment_specs(id,project_id,run_id,candidate_id,hypothesis,causal_mechanism,falsification_condition,repository,baseline_commit,dataset_identity,dataset_checksum,split_definition,baseline_configuration,proposed_change,independent_variables_json,controlled_variables_json,metrics_json,random_seeds_json,ablations_json,robustness_tests_json,statistical_plan,compute_budget,stopping_conditions_json,expected_outputs_json,artifact_contract,provenance_json,metric_direction_json,minimum_meaningful_effect_json,required_seed_count,network_policy,target_worker,approval_required) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (spec.id, spec.project_id, spec.run_id, spec.candidate_id, spec.hypothesis, spec.causal_mechanism, spec.falsification_condition, spec.repository, spec.baseline_commit, spec.dataset_identity, spec.dataset_checksum, spec.split_definition, spec.baseline_configuration, spec.proposed_change, _json(spec.independent_variables), _json(spec.controlled_variables), _json(spec.metrics), _json(spec.random_seeds), _json(spec.ablations), _json(spec.robustness_tests), spec.statistical_plan, spec.compute_budget, _json(spec.stopping_conditions), _json(spec.expected_outputs), spec.artifact_contract, _json_provenance(spec.provenance), _json(spec.metric_direction), _json(spec.minimum_meaningful_effect), spec.required_seed_count, spec.network_policy, spec.target_worker, int(spec.approval_required))
+            "INSERT OR REPLACE INTO experiment_specs(id,project_id,run_id,candidate_id,hypothesis,causal_mechanism,falsification_condition,repository,baseline_commit,dataset_identity,dataset_checksum,split_definition,baseline_configuration,proposed_change,independent_variables_json,controlled_variables_json,metrics_json,random_seeds_json,ablations_json,robustness_tests_json,statistical_plan,compute_budget,stopping_conditions_json,expected_outputs_json,artifact_contract,provenance_json,metric_direction_json,minimum_meaningful_effect_json,required_seed_count,network_policy,target_worker,approval_required,gap_id,methodology_freeze_id,interpretation_rules_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (spec.id, spec.project_id, spec.run_id, spec.candidate_id, spec.hypothesis, spec.causal_mechanism, spec.falsification_condition, spec.repository, spec.baseline_commit, spec.dataset_identity, spec.dataset_checksum, spec.split_definition, spec.baseline_configuration, spec.proposed_change, _json(spec.independent_variables), _json(spec.controlled_variables), _json(spec.metrics), _json(spec.random_seeds), _json(spec.ablations), _json(spec.robustness_tests), spec.statistical_plan, spec.compute_budget, _json(spec.stopping_conditions), _json(spec.expected_outputs), spec.artifact_contract, _json_provenance(spec.provenance), _json(spec.metric_direction), _json(spec.minimum_meaningful_effect), spec.required_seed_count, spec.network_policy, spec.target_worker, int(spec.approval_required), spec.gap_id, spec.methodology_freeze_id, _json(spec.interpretation_rules))
         )
 
     def get_experiment_spec(self, candidate_id: str) -> ExperimentSpec | None:
@@ -614,8 +673,8 @@ class ResearchRepository:
 
     def save_statistical_analysis(self, analysis: StatisticalAnalysis) -> None:
         self.execute(
-            "INSERT INTO statistical_analyses(id,project_id,run_id,spec_id,baseline_metrics_json,proposed_metrics_json,effect_size_json,confidence_intervals_json,seed_level_results_json,ablation_contributions_json,parameter_count_diff,flops_latency_diff,training_inference_cost,failure_case_analysis,hypothesis_support_assessment,provenance_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (analysis.id, analysis.project_id, analysis.run_id, analysis.spec_id, _json(analysis.baseline_metrics), _json(analysis.proposed_metrics), _json(analysis.effect_size), _json(analysis.confidence_intervals), _json(analysis.seed_level_results), _json(analysis.ablation_contributions), analysis.parameter_count_diff, analysis.flops_latency_diff, analysis.training_inference_cost, analysis.failure_case_analysis, analysis.hypothesis_support_assessment, _json_provenance(analysis.provenance))
+            "INSERT INTO statistical_analyses(id,project_id,run_id,spec_id,baseline_metrics_json,proposed_metrics_json,effect_size_json,confidence_intervals_json,seed_level_results_json,ablation_contributions_json,parameter_count_diff,flops_latency_diff,training_inference_cost,failure_case_analysis,hypothesis_support_assessment,provenance_json,decision_gates_json,statistical_tests_json,evidence_status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (analysis.id, analysis.project_id, analysis.run_id, analysis.spec_id, _json(analysis.baseline_metrics), _json(analysis.proposed_metrics), _json(analysis.effect_size), _json(analysis.confidence_intervals), _json(analysis.seed_level_results), _json(analysis.ablation_contributions), analysis.parameter_count_diff, analysis.flops_latency_diff, analysis.training_inference_cost, analysis.failure_case_analysis, analysis.hypothesis_support_assessment, _json_provenance(analysis.provenance), _json(dict(analysis.decision_gates)), _json(dict(analysis.statistical_tests)), analysis.evidence_status)
         )
 
     def get_statistical_analysis(self, spec_id: str) -> StatisticalAnalysis | None:
@@ -631,6 +690,95 @@ class ResearchRepository:
     def get_experiment_report(self, analysis_id: str) -> ExperimentReport | None:
         row = self.row("SELECT * FROM experiment_reports WHERE analysis_id=?", (analysis_id,))
         return _experiment_report(row) if row else None
+
+    def save_manuscript(self, manuscript: ManuscriptRecord) -> None:
+        self.execute(
+            "INSERT INTO manuscripts(id,project_id,run_id,title,status,decision,lineage_json,evidence_bundle_path,markdown_path,latex_path,bibtex_path,manifest_path,pdf_path,gaps_json,provenance_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (manuscript.id, manuscript.project_id, manuscript.run_id, manuscript.title, manuscript.status, manuscript.decision, manuscript.lineage_json, manuscript.evidence_bundle_path, manuscript.markdown_path, manuscript.latex_path, manuscript.bibtex_path, manuscript.manifest_path, manuscript.pdf_path, manuscript.gaps_json, _json_provenance(manuscript.provenance), manuscript.created_at)
+        )
+
+    def latest_manuscript(self, project_id: str) -> ManuscriptRecord | None:
+        row = self.row("SELECT * FROM manuscripts WHERE project_id=? ORDER BY rowid DESC LIMIT 1", (project_id,))
+        if not row:
+            return None
+        return ManuscriptRecord(
+            id=row["id"], project_id=row["project_id"], run_id=row["run_id"], title=row["title"],
+            status=row["status"], decision=row["decision"], lineage_json=row["lineage_json"],
+            evidence_bundle_path=row["evidence_bundle_path"], markdown_path=row["markdown_path"],
+            latex_path=row["latex_path"], bibtex_path=row["bibtex_path"], manifest_path=row["manifest_path"],
+            pdf_path=row["pdf_path"], gaps_json=row["gaps_json"],
+            provenance=ArtifactProvenance(**json.loads(row["provenance_json"])), created_at=row["created_at"],
+        )
+
+    def save_finding(self, finding: ResearchFinding) -> None:
+        self.execute(
+            "INSERT INTO research_findings(id,project_id,run_id,status,question_id,candidate_id,methodology_freeze_id,"
+            "spec_id,analysis_id,report_id,hypothesis,expected_observation,implementation_digest,observed_outcome_json,"
+            "interpretation,uncertainty,fidelity,failure_classification,lesson,applicability,open_questions_json,"
+            "next_action,keywords_json,provenance_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (finding.id, finding.project_id, finding.run_id, finding.status.value, finding.question_id, finding.candidate_id,
+             finding.methodology_freeze_id, finding.spec_id, finding.analysis_id, finding.report_id, finding.hypothesis,
+             finding.expected_observation, finding.implementation_digest, finding.observed_outcome_json, finding.interpretation,
+             finding.uncertainty, finding.fidelity, finding.failure_classification, finding.lesson, finding.applicability,
+             finding.open_questions_json, finding.next_action, finding.keywords_json, _json_provenance(finding.provenance),
+             finding.created_at),
+        )
+
+    def findings_for_project(self, project_id: str, limit: int = 100) -> list[ResearchFinding]:
+        rows = self.rows(
+            "SELECT * FROM research_findings WHERE project_id=? ORDER BY rowid DESC LIMIT ?", (project_id, limit)
+        )
+        return [_finding(row) for row in rows]
+
+    def findings_for_question(self, project_id: str, question_id: str, limit: int = 8) -> list[ResearchFinding]:
+        rows = self.rows(
+            "SELECT * FROM research_findings WHERE project_id=? AND question_id=? "
+            "ORDER BY CASE status WHEN 'refuted_hypothesis' THEN 0 WHEN 'implementation_failure' THEN 1 "
+            "WHEN 'inconclusive' THEN 2 ELSE 3 END, rowid DESC LIMIT ?",
+            (project_id, question_id, limit),
+        )
+        return [_finding(row) for row in rows]
+
+    def search_findings(self, project_id: str, terms: Sequence[str], limit: int = 8) -> list[ResearchFinding]:
+        """Lexical retrieval over the Findings Memory (simple + inspectable).
+
+        Matches any term against hypothesis/lesson/method keywords; failures
+        and refutations rank first so the generator sees what NOT to redo.
+        """
+        if not terms:
+            return []
+        clauses = " OR ".join(
+            "(hypothesis LIKE ? OR lesson LIKE ? OR keywords_json LIKE ?)" for _ in terms
+        )
+        params: list[str] = []
+        for term in terms:
+            like = f"%{term}%"
+            params.extend([like, like, like])
+        rows = self.rows(
+            "SELECT * FROM research_findings WHERE project_id=? AND (" + clauses + ") "
+            "ORDER BY CASE status WHEN 'refuted_hypothesis' THEN 0 WHEN 'implementation_failure' THEN 1 "
+            "WHEN 'inconclusive' THEN 2 ELSE 3 END, rowid DESC LIMIT ?",
+            (project_id, *params, limit),
+        )
+        return [_finding(row) for row in rows]
+
+    def save_reinvention_analysis(self, analysis: ReinventionAnalysis) -> None:
+        self.execute(
+            "INSERT INTO reinvention_analyses(id,project_id,run_id,spec_id,report_id,parent_candidate_id,action,root_cause_diagnosis,empirical_lessons_json,next_generation_hypothesis,revised_mechanism,actionable_next_steps_json,next_candidate_id,provenance_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (analysis.id, analysis.project_id, analysis.run_id, analysis.spec_id, analysis.report_id, analysis.parent_candidate_id, analysis.action.value, analysis.root_cause_diagnosis, _json(analysis.empirical_lessons), analysis.next_generation_hypothesis, analysis.revised_mechanism, _json(analysis.actionable_next_steps), analysis.next_candidate_id, _json_provenance(analysis.provenance), utc_now())
+        )
+
+    def get_reinvention_analysis(self, report_id: str) -> ReinventionAnalysis | None:
+        row = self.row("SELECT * FROM reinvention_analyses WHERE report_id=? ORDER BY created_at DESC LIMIT 1", (report_id,))
+        return _reinvention_analysis(row) if row else None
+
+    def get_reinvention_analysis_by_id(self, reinvention_id: str) -> ReinventionAnalysis | None:
+        row = self.row("SELECT * FROM reinvention_analyses WHERE id=?", (reinvention_id,))
+        return _reinvention_analysis(row) if row else None
+
+    def get_reinvention_analysis_by_candidate(self, candidate_id: str) -> ReinventionAnalysis | None:
+        row = self.row("SELECT * FROM reinvention_analyses WHERE parent_candidate_id=? ORDER BY created_at DESC LIMIT 1", (candidate_id,))
+        return _reinvention_analysis(row) if row else None
 
     def save_worker_job(self, job: dict[str, Any]) -> None:
         self.execute(
@@ -674,7 +822,33 @@ class ResearchRepository:
             row["approved_actions"] = _loads(row.pop("approved_actions_json"), [])
         return row
 
+    def save_methodology_freeze(self, freeze: "MethodologyFreeze") -> None:
+        from autoresearch.domain.models import MethodologyFreeze  # local import keeps module load order simple
+        assert isinstance(freeze, MethodologyFreeze)
+        self.execute(
+            "INSERT INTO methodology_freezes(id,project_id,run_id,candidate_id,version,selection_rationale,prompt_version,artifact_path,checksum,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (freeze.id, freeze.project_id, freeze.run_id, freeze.candidate_id, freeze.version, freeze.selection_rationale, freeze.prompt_version, freeze.artifact_path, freeze.checksum, freeze.created_at),
+        )
+
+    def methodology_freeze(self, freeze_id: str) -> "MethodologyFreeze | None":
+        row = self.row("SELECT * FROM methodology_freezes WHERE id=?", (freeze_id,))
+        return _methodology_freeze(row) if row else None
+
+    def latest_methodology_freeze(self, project_id: str) -> "MethodologyFreeze | None":
+        # rowid ordering = insertion order; created_at alone could tie within
+        # timestamp resolution across different candidates.
+        row = self.row("SELECT * FROM methodology_freezes WHERE project_id=? ORDER BY rowid DESC LIMIT 1", (project_id,))
+        return _methodology_freeze(row) if row else None
+
+    def latest_methodology_freeze_for_candidate(self, candidate_id: str) -> "MethodologyFreeze | None":
+        row = self.row("SELECT * FROM methodology_freezes WHERE candidate_id=? ORDER BY version DESC LIMIT 1", (candidate_id,))
+        return _methodology_freeze(row) if row else None
+
     def approval_by_checksum(self, checksum: str) -> dict[str, Any] | None:
+        # Not run-scoped by design: the specification checksum embeds the full
+        # spec (including project_id, run_id, and a fresh spec id), actions, and
+        # worker identity, so a checksum can only match the exact spec it was
+        # approved for. Do not weaken the checksum construction.
         row = self.row("SELECT * FROM experiment_approvals WHERE specification_checksum=? ORDER BY created_at DESC LIMIT 1", (checksum,))
         if row:
             row["approved_actions"] = _loads(row.pop("approved_actions_json"), [])
@@ -750,8 +924,13 @@ def _candidate_revision(row: dict[str, Any]) -> CandidateRevision:
 def _novelty_portfolio(row: dict[str, Any]) -> NoveltyPortfolio:
     return NoveltyPortfolio(row["id"], row["project_id"], row["run_id"], row["low_risk_candidate_id"], row["balanced_candidate_id"], row["high_risk_candidate_id"], _loads(row["selection_reasons_json"], {}), _provenance(row["provenance_json"]))
 
+def _methodology_freeze(row: dict[str, Any]) -> "MethodologyFreeze":
+    from autoresearch.domain.models import MethodologyFreeze
+    return MethodologyFreeze(row["id"], row["project_id"], row["run_id"], row["candidate_id"], int(row["version"]), row["selection_rationale"], row["prompt_version"], row["artifact_path"], row["checksum"], row["created_at"])
+
+
 def _experiment_spec(row: dict[str, Any]) -> ExperimentSpec:
-    return ExperimentSpec(row["id"], row["project_id"], row["run_id"], row["candidate_id"], row["hypothesis"], row["causal_mechanism"], row["falsification_condition"], row["repository"], row["baseline_commit"], row["dataset_identity"], row["dataset_checksum"], row["split_definition"], row["baseline_configuration"], row["proposed_change"], tuple(_loads(row["independent_variables_json"], [])), tuple(_loads(row["controlled_variables_json"], [])), tuple(_loads(row["metrics_json"], [])), tuple(_loads(row["random_seeds_json"], [])), tuple(_loads(row["ablations_json"], [])), tuple(_loads(row["robustness_tests_json"], [])), row["statistical_plan"], row["compute_budget"], tuple(_loads(row["stopping_conditions_json"], [])), tuple(_loads(row["expected_outputs_json"], [])), row["artifact_contract"], _provenance(row["provenance_json"]), _loads(row.get("metric_direction_json"), {}), _loads(row.get("minimum_meaningful_effect_json"), {}), int(row.get("required_seed_count", 1)), row.get("network_policy", "disabled"), row.get("target_worker", "local"), bool(row.get("approval_required", 1)))
+    return ExperimentSpec(row["id"], row["project_id"], row["run_id"], row["candidate_id"], row["hypothesis"], row["causal_mechanism"], row["falsification_condition"], row["repository"], row["baseline_commit"], row["dataset_identity"], row["dataset_checksum"], row["split_definition"], row["baseline_configuration"], row["proposed_change"], tuple(_loads(row["independent_variables_json"], [])), tuple(_loads(row["controlled_variables_json"], [])), tuple(_loads(row["metrics_json"], [])), tuple(_loads(row["random_seeds_json"], [])), tuple(_loads(row["ablations_json"], [])), tuple(_loads(row["robustness_tests_json"], [])), row["statistical_plan"], row["compute_budget"], tuple(_loads(row["stopping_conditions_json"], [])), tuple(_loads(row["expected_outputs_json"], [])), row["artifact_contract"], _provenance(row["provenance_json"]), _loads(row.get("metric_direction_json"), {}), _loads(row.get("minimum_meaningful_effect_json"), {}), int(row.get("required_seed_count", 1)), row.get("network_policy", "disabled"), row.get("target_worker", "local"), bool(row.get("approval_required", 1)), str(row.get("gap_id") or ""), str(row.get("methodology_freeze_id") or ""), tuple(_loads(row.get("interpretation_rules_json"), [])))
 
 def _environment_manifest(row: dict[str, Any]) -> EnvironmentManifest:
     return EnvironmentManifest(row["id"], row["project_id"], row["run_id"], row["spec_id"], row["operating_system"], row["python_version"], row["environment_manager"], row["dependency_lock_checksum"], row["cuda_compatibility"], row["gpu_model"], row["gpu_memory"], row["disk_space"], tuple(_loads(row["dataset_paths_json"], [])), _loads(row["sample_counts_json"], {}), tuple(_loads(row["splits_json"], [])), row["pretrained_checkpoint_identity"], row["reproducibility_flags"], _provenance(row["provenance_json"]))
@@ -765,11 +944,53 @@ def _execution_job(row: dict[str, Any]) -> ExecutionJob:
 def _execution_result(row: dict[str, Any]) -> ExecutionResult:
     return ExecutionResult(row["id"], row["project_id"], row["run_id"], row["job_id"], int(row["exit_code"]), row["stdout"], row["stderr"], _loads(row["structured_metrics_json"], {}), _loads(row["gpu_telemetry_json"], {}), tuple(_loads(row["checkpoint_manifest_json"], [])), row["failure_classification"], _provenance(row["provenance_json"]))
 
+def _finding(row: dict[str, Any]) -> ResearchFinding:
+    return ResearchFinding(
+        id=row["id"], project_id=row["project_id"], run_id=row["run_id"],
+        status=FindingStatus(str(row["status"])), question_id=row["question_id"],
+        candidate_id=row["candidate_id"], methodology_freeze_id=row["methodology_freeze_id"],
+        spec_id=row["spec_id"], analysis_id=row["analysis_id"], report_id=row["report_id"],
+        hypothesis=row["hypothesis"], expected_observation=row["expected_observation"],
+        implementation_digest=row["implementation_digest"], observed_outcome_json=row["observed_outcome_json"],
+        interpretation=row["interpretation"], uncertainty=row["uncertainty"], fidelity=row["fidelity"],
+        failure_classification=row["failure_classification"], lesson=row["lesson"],
+        applicability=row["applicability"], open_questions_json=row["open_questions_json"],
+        next_action=row["next_action"], keywords_json=row["keywords_json"],
+        provenance=ArtifactProvenance(**json.loads(row["provenance_json"])), created_at=row["created_at"],
+    )
+
+
 def _statistical_analysis(row: dict[str, Any]) -> StatisticalAnalysis:
-    return StatisticalAnalysis(row["id"], row["project_id"], row["run_id"], row["spec_id"], _loads(row["baseline_metrics_json"], {}), _loads(row["proposed_metrics_json"], {}), _loads(row["effect_size_json"], {}), _loads(row["confidence_intervals_json"], {}), tuple(_loads(row["seed_level_results_json"], [])), _loads(row["ablation_contributions_json"], {}), int(row["parameter_count_diff"]), float(row["flops_latency_diff"]) if row["flops_latency_diff"] is not None else None, float(row["training_inference_cost"]), row["failure_case_analysis"], row["hypothesis_support_assessment"], _provenance(row["provenance_json"]))
+    assessment = str(row["hypothesis_support_assessment"] or "")
+    return StatisticalAnalysis(
+        row["id"], row["project_id"], row["run_id"], row["spec_id"],
+        _loads(row["baseline_metrics_json"], {}), _loads(row["proposed_metrics_json"], {}),
+        _loads(row["effect_size_json"], {}), _loads(row["confidence_intervals_json"], {}),
+        tuple(_loads(row["seed_level_results_json"], [])), _loads(row["ablation_contributions_json"], {}),
+        int(row["parameter_count_diff"]),
+        float(row["flops_latency_diff"]) if row["flops_latency_diff"] is not None else None,
+        float(row["training_inference_cost"]), row["failure_case_analysis"], assessment,
+        _provenance(row["provenance_json"]),
+        decision_gates=_loads(row.get("decision_gates_json") or "{}", {}),
+        statistical_tests=_loads(row.get("statistical_tests_json") or "{}", {}),
+        # Pre-V13 rows never persisted the status: the assessment is the
+        # honest fallback rather than defaulting to insufficiency.
+        evidence_status=str(row.get("evidence_status") or assessment or "INSUFFICIENT_EVIDENCE"),
+    )
 
 def _experiment_report(row: dict[str, Any]) -> ExperimentReport:
     return ExperimentReport(row["id"], row["project_id"], row["run_id"], row["analysis_id"], row["literature_motivation"], row["research_gap"], row["hypothesis"], row["proposed_method"], row["implementation_diff"], row["lineage"], row["dataset_split"], tuple(_loads(row["exact_commands_json"], [])), _loads(row["baseline_results_json"], {}), _loads(row["aggregated_results_json"], {}), row["uncertainty"], row["ablations"], row["robustness_tests"], int(row["failed_runs"]), float(row["cost"]), row["limitations"], row["reproducibility_instructions"], ExperimentDecision(row["decision"]), row["decision_evidence"], _provenance(row["provenance_json"]))
+
+
+def _reinvention_analysis(row: dict[str, Any]) -> ReinventionAnalysis:
+    return ReinventionAnalysis(
+        row["id"], row["project_id"], row["run_id"], row["spec_id"],
+        row["report_id"], row["parent_candidate_id"], ReinventionAction(row["action"]),
+        row["root_cause_diagnosis"], tuple(_loads(row["empirical_lessons_json"], [])),
+        row["next_generation_hypothesis"], row["revised_mechanism"],
+        tuple(_loads(row["actionable_next_steps_json"], [])),
+        _provenance(row["provenance_json"]), row.get("next_candidate_id"),
+    )
 
 
 _SCHEMA_V1 = """
@@ -1294,4 +1515,116 @@ CREATE TABLE IF NOT EXISTS project_links(
   created_at TEXT NOT NULL,
   PRIMARY KEY(source_project_id, target_project_id)
 );
+"""
+
+_SCHEMA_V9 = """
+CREATE TABLE IF NOT EXISTS reinvention_analyses(
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  run_id TEXT NOT NULL REFERENCES pipeline_runs(id),
+  spec_id TEXT NOT NULL,
+  report_id TEXT NOT NULL,
+  parent_candidate_id TEXT NOT NULL,
+  action TEXT NOT NULL,
+  root_cause_diagnosis TEXT NOT NULL,
+  empirical_lessons_json TEXT NOT NULL,
+  next_generation_hypothesis TEXT NOT NULL,
+  revised_mechanism TEXT NOT NULL,
+  actionable_next_steps_json TEXT NOT NULL,
+  next_candidate_id TEXT,
+  provenance_json TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS reinvention_parent_idx ON reinvention_analyses(parent_candidate_id, created_at);
+CREATE INDEX IF NOT EXISTS reinvention_report_idx ON reinvention_analyses(report_id, created_at);
+"""
+
+_SCHEMA_V10 = """
+CREATE TABLE IF NOT EXISTS methodology_freezes(
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  run_id TEXT NOT NULL REFERENCES pipeline_runs(id),
+  candidate_id TEXT NOT NULL REFERENCES novelty_candidates(id),
+  version INTEGER NOT NULL,
+  selection_rationale TEXT NOT NULL,
+  prompt_version TEXT NOT NULL,
+  artifact_path TEXT NOT NULL,
+  checksum TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE(candidate_id, version)
+);
+CREATE INDEX IF NOT EXISTS methodology_project_idx ON methodology_freezes(project_id, created_at);
+ALTER TABLE experiment_specs ADD COLUMN gap_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE experiment_specs ADD COLUMN methodology_freeze_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE experiment_specs ADD COLUMN interpretation_rules_json TEXT NOT NULL DEFAULT '[]';
+"""
+
+_SCHEMA_V11 = """
+ALTER TABLE project_budgets ADD COLUMN token_ceiling INTEGER;
+"""
+
+# V12 (additive): durable manuscript records over one exact research lineage.
+_SCHEMA_V12 = """
+CREATE TABLE IF NOT EXISTS manuscripts(
+id TEXT PRIMARY KEY,
+project_id TEXT NOT NULL REFERENCES projects(id),
+run_id TEXT NOT NULL REFERENCES pipeline_runs(id),
+title TEXT NOT NULL,
+status TEXT NOT NULL,
+decision TEXT NOT NULL,
+lineage_json TEXT NOT NULL,
+evidence_bundle_path TEXT NOT NULL,
+markdown_path TEXT NOT NULL,
+latex_path TEXT NOT NULL,
+bibtex_path TEXT NOT NULL,
+manifest_path TEXT NOT NULL,
+pdf_path TEXT,
+gaps_json TEXT NOT NULL,
+provenance_json TEXT NOT NULL,
+created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS manuscripts_project_idx ON manuscripts(project_id, created_at);
+"""
+
+# V13 (additive): persist the analysis decision gates, statistical tests, and
+# evidence status so a re-fetched analysis remains interpretable downstream
+# (report writing, manuscript tables) without re-running the analyzer.
+_SCHEMA_V13 = """
+ALTER TABLE statistical_analyses ADD COLUMN decision_gates_json TEXT;
+ALTER TABLE statistical_analyses ADD COLUMN statistical_tests_json TEXT;
+ALTER TABLE statistical_analyses ADD COLUMN evidence_status TEXT;
+"""
+
+# V14 (additive): shared Findings Memory — every informative outcome (success,
+# failure, negative, inconclusive) persisted with exact lineage so later stages
+# retrieve failures and contradictions instead of rediscovering them.
+_SCHEMA_V14 = """
+CREATE TABLE IF NOT EXISTS research_findings(
+id TEXT PRIMARY KEY,
+project_id TEXT NOT NULL REFERENCES projects(id),
+run_id TEXT NOT NULL REFERENCES pipeline_runs(id),
+status TEXT NOT NULL,
+question_id TEXT NOT NULL,
+candidate_id TEXT NOT NULL,
+methodology_freeze_id TEXT NOT NULL,
+spec_id TEXT NOT NULL,
+analysis_id TEXT NOT NULL,
+report_id TEXT NOT NULL,
+hypothesis TEXT NOT NULL,
+expected_observation TEXT NOT NULL,
+implementation_digest TEXT NOT NULL,
+observed_outcome_json TEXT NOT NULL,
+interpretation TEXT NOT NULL,
+uncertainty TEXT NOT NULL,
+fidelity TEXT NOT NULL,
+failure_classification TEXT NOT NULL,
+lesson TEXT NOT NULL,
+applicability TEXT NOT NULL,
+open_questions_json TEXT NOT NULL,
+next_action TEXT NOT NULL,
+keywords_json TEXT NOT NULL,
+provenance_json TEXT NOT NULL,
+created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS research_findings_project_idx ON research_findings(project_id, status, created_at);
 """
