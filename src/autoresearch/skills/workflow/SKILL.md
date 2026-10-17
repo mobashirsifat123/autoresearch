@@ -52,11 +52,12 @@ stages, so re-invoking with `--project` resumes instead of repeating.
 ```
 
 Stop stages: `review`, `question`, `hypotheses`, `methodology`, `design`,
-`experiment`, `manuscript`. **Credentials:** no separate API-key export is
-needed inside an agent session — the provider chain resolves the session's
-key automatically (explicit `api_key_env` variable → OpenCode credential
-store → for Anthropic-protocol providers, the session's `ANTHROPIC_API_KEY`
-or the local Claude/Codex connector settings). The design stage also
+`experiment`, `manuscript`. **Credentials:** inside an agent session the
+skills automatically follow the session's own AI model and API key
+(auto-detected from the OpenCode credential store; no config file needed).
+With an explicit config, resolution order is `api_key_env` → OpenCode
+credential store → for Anthropic-protocol providers the session's
+`ANTHROPIC_API_KEY` / connector settings. The design stage also
 generates + statically verifies the experiment implementation when none
 exists (bounded repair loop; failures recorded). The manuscript stage
 requires an analyzed experiment report; without one it reports `blocked`

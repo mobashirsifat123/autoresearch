@@ -128,6 +128,13 @@ def test_skill_doctor_reports_without_config(tmp_path, monkeypatch):
     never a traceback."""
     monkeypatch.setenv("AUTORESEARCH_DATA_ROOT", str(tmp_path / "data"))
     monkeypatch.setenv("AUTORESEARCH_PROVIDER_CONFIG", str(tmp_path / "none.toml"))
+    # Isolate from the developer's real OpenCode session store: with HOME
+    # pointing at the temp dir there is no session credential to auto-detect.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data-home"))
+    monkeypatch.delenv("OPENCODE_DB", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
     result = _invoke("skill", "doctor")
     assert result.exit_code == 1  # degraded state is a signal, not a crash
     assert "Traceback" not in result.output

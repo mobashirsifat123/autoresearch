@@ -60,10 +60,17 @@ pip install -e .
 
 ## Configure
 
-Copy `.autoresearch/config.example.toml` to `.autoresearch/config.toml` and
-point it at your provider. Secrets are never inlined: name an environment
-variable (`api_key_env`). Inside an agent session the key resolves
-automatically (session/connector credentials) — no separate export needed.
+Inside an agent session, the skills automatically use the session's own AI
+model and API key (auto-detected from the OpenCode credential store) — no
+config file required. `AUTORESEARCH_AUTO_PROVIDER=true` or `[research]
+auto_provider = true` forces session-following even when a config file
+exists.
+
+Otherwise copy `.autoresearch/config.example.toml` to
+`.autoresearch/config.toml` and point it at your provider. Secrets are never
+inlined: name an environment variable (`api_key_env`), or rely on ambient
+resolution (OpenCode credential store for recognized endpoints,
+`ANTHROPIC_API_KEY` / connector settings for Anthropic-protocol providers).
 
 ## Use
 

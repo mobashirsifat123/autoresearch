@@ -22,6 +22,44 @@ from urllib.parse import urlsplit
 from .config import ProviderConfig
 from .errors import ErrorKind, ProviderError
 
+# Integration catalog: OpenCode credential-store integration id → protocol
+# details. Autodetect picks the session's provider from here; the endpoint is
+# always the integration's official one (never repurposed elsewhere).
+INTEGRATION_CATALOG: dict[str, dict[str, object]] = {
+    "deepseek": {
+        "kind": "openai_compatible",
+        "base_url": "https://api.deepseek.com/v1",
+        "models": {
+            "literature_extraction": "deepseek-chat",
+            "research_reasoning": "deepseek-chat",
+            "scientific_critic": "deepseek-chat",
+        },
+    },
+    "alibaba-token-plan-cn": {
+        "kind": "openai_compatible",
+        "base_url": "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+        "structured_output_mode": "json_object",
+        "models": {
+            "literature_extraction": "deepseek-v4.1-flash",
+            "research_reasoning": "deepseek-v4.1-flash",
+            "scientific_critic": "deepseek-v4.1-flash",
+        },
+    },
+    "zhipuai-coding-plan": {
+        "kind": "anthropic",
+        "base_url": "https://api.z.ai/api/anthropic",
+        "models": {
+            "literature_extraction": "glm-5.3-flash",
+            "research_reasoning": "glm-5.3",
+            "scientific_critic": "glm-5.3",
+        },
+    },
+}
+
+# Priority when several session credentials match: the session's model
+# provider wins over other plans the user has connected.
+_AUTODETECT_PRIORITY = ("deepseek", "alibaba-token-plan-cn", "zhipuai-coding-plan", "openai")
+
 
 def _opencode_provider(config: ProviderConfig) -> str | None:
     url = urlsplit(config.base_url)
@@ -33,6 +71,7 @@ def _opencode_provider(config: ProviderConfig) -> str | None:
         ("api.openai.com", "/v1"): ("openai_compatible", "openai"),
         ("api.anthropic.com", ""): ("anthropic", "anthropic"),
         ("api.anthropic.com", "/v1"): ("anthropic", "anthropic"),
+        ("api.z.ai", "/api/anthropic"): ("anthropic", "zhipuai-coding-plan"),
         ("generativelanguage.googleapis.com", ""): ("gemini", "google"),
         ("openrouter.ai", "/api/v1"): ("openai_compatible", "openrouter"),
         # Alibaba Token Plan (China): the OpenCode session's credential is
@@ -133,3 +172,50 @@ def resolve_api_key(config: ProviderConfig) -> str:
         "providers) make the session's ANTHROPIC_API_KEY / connector settings available. OAuth tokens are not API keys.",
         ErrorKind.AUTHENTICATION, config.name,
     )
+
+
+def detect_session_provider(database: Path | None = None) -> dict[str, object] | None:
+    """Auto-detect the OpenCode session's model provider from its credential
+    store (the same keys the session itself uses — nothing copied).
+
+    Returns {integration_id, kind, base_url, models, structured_output_mode}
+    for the highest-priority ACTIVE api key credential that matches the
+    catalog, or None when no session credential is usable. OAuth and
+    subscription tokens are never repurposed."""
+    from pathlib import Path as _Path
+
+    root = Path(os.environ.get("XDG_DATA_HOME", str(_Path.home() / ".local/share"))) / "opencode"
+    db = database or Path(os.environ.get("OPENCODE_DB", str(root / "opencode.db"))).expanduser()
+    rows: list[tuple[str, str]] = []
+    if db.exists():
+        try:
+            connection = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True, timeout=3)
+            try:
+                has_credentials = connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'credential'"
+                ).fetchone()
+                if has_credentials:
+                    for integration_id, value in connection.execute(
+                        "SELECT integration_id, value FROM credential WHERE active = 1 AND connector_id IS NULL"
+                    ):
+                        parsed = json.loads(value) if isinstance(value, str) else (value or {})
+                        key = _api_key(parsed)
+                        if key:
+                            rows.append((str(integration_id), key))
+            finally:
+                connection.close()
+        except (OSError, ValueError, sqlite3.Error):
+            return None
+    if not rows:
+        return None
+    for integration_id in _AUTODETECT_PRIORITY:
+        entry = INTEGRATION_CATALOG.get(integration_id)
+        if entry and any(row_id == integration_id for row_id, _key in rows):
+            return {
+                "integration_id": integration_id,
+                "kind": entry["kind"],
+                "base_url": entry["base_url"],
+                "models": dict(entry.get("models") or {}),
+                "structured_output_mode": entry.get("structured_output_mode"),
+            }
+    return None

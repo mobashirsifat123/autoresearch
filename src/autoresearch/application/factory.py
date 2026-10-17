@@ -19,7 +19,7 @@ class ApplicationContainer:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.repository = ResearchRepository(settings.database_path, settings.artifact_root)
-        self.router = build_router(settings.provider_config, usage_sink=self.repository.record_provider_usage, budget_guard=ProviderBudgetGuard(self.repository, default_token_ceiling=settings.default_max_tokens, default_hard_stop=settings.default_max_cost_usd))
+        self.router = build_router(settings.provider_config, usage_sink=self.repository.record_provider_usage, budget_guard=ProviderBudgetGuard(self.repository, default_token_ceiling=settings.default_max_tokens, default_hard_stop=settings.default_max_cost_usd), auto_provider=settings.auto_provider)
         self.sources = _sources(settings.search_sources)
         self.pdf_resolver = LegalPdfResolver()
         self.search_pipeline = StudySearchPipeline(

@@ -26,6 +26,10 @@ class Settings:
     # deterministic numeric/citation/overclaim audit (falls back on any
     # surviving violation).
     manuscript_writer: str = "deterministic"
+    # When true, the skills follow the OpenCode session's own model provider
+    # (auto-detected from the session credential store) instead of the
+    # provider-config file. Also used automatically when no config exists.
+    auto_provider: bool = False
     # Quality-width knobs: parallel expansion adds tokens (width), not
     # wall-clock (depth). All defaults are ON; every one degrades gracefully.
     discovery_query_perspectives: int = 3
@@ -83,6 +87,7 @@ def load_settings() -> Settings:
         default_max_tokens=_positive_int(research.get("max_tokens", os.getenv("AUTORESEARCH_DEFAULT_MAX_TOKENS"))),
         default_max_cost_usd=_positive_float(os.getenv("AUTORESEARCH_DEFAULT_MAX_COST_USD")),
         manuscript_writer=str(research.get("manuscript_writer", os.getenv("AUTORESEARCH_MANUSCRIPT_WRITER", "deterministic"))).strip().lower() or "deterministic",
+        auto_provider=bool(str(research.get("auto_provider", os.getenv("AUTORESEARCH_AUTO_PROVIDER", "false"))).strip().lower() in ("1", "true", "yes", "on")),
         discovery_query_perspectives=_positive_int(research.get("discovery_query_perspectives", os.getenv("AUTORESEARCH_DISCOVERY_QUERY_PERSPECTIVES"))) or 3,
         discovery_citation_expansion=True if citation_expansion is None else citation_expansion,
         discovery_citation_anchors=_positive_int(research.get("discovery_citation_anchors")) or 5,
