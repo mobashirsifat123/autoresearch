@@ -189,6 +189,15 @@ class ExperimentSpecGenerator:
         if not repository or not Path(repository).expanduser().is_dir():
             repository = str(Path.cwd().expanduser().resolve())
 
+        # A power analysis may demand more seeds than the drafted list
+        # contained. Expand deterministically (0, 1, 2, …) so the
+        # preregistration is internally consistent — a spec demanding 75
+        # seeds while listing 5 made the analysis UNREACHABLE for any
+        # honest implementation (observed live on the KAN project).
+        planned_seeds = [int(seed) for seed in selected.get("random_seeds", []) or []]
+        if required_seeds > len(planned_seeds):
+            planned_seeds.extend(range(len(planned_seeds), required_seeds))
+
         return ExperimentSpec(
             id=uuid4().hex, project_id=candidate.project_id, run_id=candidate.run_id,
             candidate_id=candidate.id,
@@ -205,7 +214,7 @@ class ExperimentSpecGenerator:
             independent_variables=tuple(selected.get("independent_variables", [])),
             controlled_variables=tuple(selected.get("controlled_variables", [])),
             metrics=tuple(selected.get("metrics", [])),
-            random_seeds=tuple(selected.get("random_seeds", [])),
+            random_seeds=tuple(planned_seeds),
             ablations=tuple(selected.get("ablations", [])),
             robustness_tests=tuple(selected.get("robustness_tests", [])),
             statistical_plan=f"{selected.get('statistical_plan', '')} {power_note}".strip(),

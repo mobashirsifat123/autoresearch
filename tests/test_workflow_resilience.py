@@ -109,3 +109,32 @@ async def test_orphaned_manuscript_run_retired(tmp_path):
     stale = repository.create_run(project, PipelineKind.MANUSCRIPT, {})
     await workflow.run(project_id=project, until="manuscript")
     assert repository.get_run(stale.id).status is RunStatus.CANCELLED
+
+
+@pytest.mark.anyio
+async def test_planner_expands_seeds_to_required_count(tmp_path, monkeypatch):
+    """Regression (live KAN stall): a spec demanding more seeds than it lists
+    makes the analysis unreachable for any honest implementation. The planner
+    must expand the seed list deterministically so the preregistration is
+    self-consistent."""
+    import test_smoke_e2e
+
+    original = test_smoke_e2e._responder
+
+    def wrapped(messages):
+        prompt = str(messages[-1]["content"])
+        if "experiment-planner" in prompt:
+            payload = original(messages)
+            payload["random_seeds"] = [42]
+            payload["required_seed_count"] = 6
+            return payload
+        return original(messages)
+
+    monkeypatch.setattr(test_smoke_e2e, "_responder", wrapped)
+    repository, workflow, seed = _build_loop(tmp_path)
+    result = await workflow.run(seed=str(seed), until="design")
+    candidate_id = next(s for s in result["stages"] if s["stage"] == "methodology")["candidate_id"]
+    spec = repository.get_experiment_spec(candidate_id)
+    assert spec.required_seed_count == 6
+    assert len(spec.random_seeds) == 6
+    assert len(set(spec.random_seeds)) == 6
