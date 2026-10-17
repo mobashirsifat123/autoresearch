@@ -1207,75 +1207,113 @@ class ManuscriptService:
             ]
             return lines
         block = (methodology or {}).get("methodology", methodology or {})
-        method = (
-            " ".join(str(candidate.method).split())
-            if candidate
-            else "the selected candidate method"
-        )
-        difference = (
-            str(candidate.difference_from_existing)
-            if candidate and candidate.difference_from_existing
-            else "not recorded"
-        )
-        metric_names = ", ".join(sorted(analysis.proposed_metrics.keys()))
-        effects = "; ".join(
-            f"{name}: mean difference {value:+.4f}"
-            for name, value in sorted(analysis.effect_size.items())
-        ) or "none recorded"
-        gates = ", ".join(
-            f"{name}: {'PASS' if passed else 'FAIL'}"
-            for name, passed in dict(analysis.decision_gates).items()
-        )
-        counter_text = (
-            " Counter-evidence recorded in the review: "
-            + "; ".join(str(item["statement"]) for item in counter_claims[:3])
-            if counter_claims
-            else ""
-        )
-        seed_question = str(seed["research_question"]) if seed else ""
-        procedure = "; ".join(
-            str(step) for step in (block.get("procedure") or []) if str(step).strip()
-        ) or "not recorded"
-        gap_part = self._period_join(
-            f"Existing work does not close this question: {gap['why_unsolved'] or 'not recorded'}{counter_text}",
-            f"The recorded falsification test is: {gap['falsification_test'] or 'not recorded'}",
-        )
-        contribution_part = self._period_join(
-            f"To fill this gap we froze a methodology around {method} (difference: {difference}) and tested the preregistered hypothesis: {spec.hypothesis if spec else 'not recorded'}",
-            str(block.get("hypothesis_statement") or ""),
-            f"Mechanism: {block.get('proposed_mechanism') or 'not recorded'}",
-        )
-        methods_part = self._period_join(
-            f"Study design: {self._methodology_field(methodology, 'study_design')}",
-            f"Data: {spec.dataset_identity} (checksum prefix {spec.dataset_checksum[:16]})",
-            f"split: {spec.split_definition}",
-            f"Sample: {len(spec.random_seeds)} seed(s)",
-            f"inclusion criteria: {spec.required_seed_count} seed(s) required",
-            f"Analysis: {spec.statistical_plan}",
-            f"Frozen procedure: {procedure}",
-        )
-        conclusion_part = self._period_join(
-            "Future research should address the limitations listed in the Discussion, "
-            f"in particular the bounds of dataset '{spec.dataset_identity}' and split '{spec.split_definition}'",
-            f"Uncertainty recorded: {report['uncertainty']}",
-        )
-        lines += [
-            f"**Background:** The question under study is: {gap['statement']} "
-            + (f"(research program: {seed_question})" if seed_question else ""),
-            "",
-            f"**Gap in Knowledge:** {gap_part}",
-            "",
-            f"**Contribution:** {contribution_part}",
-            "",
-            f"**Population & Methods:** {methods_part}",
-            "",
-            f"**Results:** Metrics: {metric_names}. Measured effects: {effects}. "
-            f"Decision gates: {gates}. The deterministic gates classified the outcome as "
-            f"**{report['decision']}**.",
-            "",
-            f"**Conclusion:** {conclusion_part}",
-            "",
-        ]
+
+        def _snip(text: str, words: int) -> str:
+            """Deterministic bounded snippet (first N words) so a single long
+            recorded field can never blow the abstract past the template's
+            150-250 word window."""
+            joined = " ".join(str(text).split())
+            tokens = joined.split()
+            if len(tokens) <= words:
+                return joined
+            return " ".join(tokens[:words]) + "…"
+
+        # The six labeled parts are rebuilt with progressively tighter caps
+        # until the whole abstract lands inside the template's word window —
+        # deterministic, and never drops measured numbers (they live in the
+        # Results part, which is already compact).
+
+        def _short_metric(name: str) -> str:
+            """Long metric names (e.g. 'loto_top1_selection_accuracy
+            (PRIMARY)') repeat across the abstract; abbreviate
+            deterministically to the first token."""
+            return str(name).split()[0].rstrip(",")
+
+        template = _template_parameters()["abstract"]
+        min_words, max_words = template["word_min"], template["word_max"]
+        for factor in (1.0, 0.6, 0.4, 0.25, 0.15, 0.1):
+            def cap(words: int) -> int:
+                return max(1, int(words * factor))
+
+            lines = ["## Abstract", ""]
+            method = _snip(
+                " ".join(str(candidate.method).split()) if candidate else "the selected candidate method",
+                cap(30),
+            )
+            difference = _snip(
+                str(candidate.difference_from_existing) if candidate and candidate.difference_from_existing else "not recorded",
+                cap(25),
+            )
+            metric_names = ", ".join(sorted({_short_metric(m) for m in analysis.proposed_metrics}))
+            effects = "; ".join(
+                f"{_short_metric(name)}: mean difference {value:+.4f}"
+                for name, value in sorted(analysis.effect_size.items())
+            ) or "none recorded"
+            gates = ", ".join(
+                f"{_short_metric(name)}: {'PASS' if passed else 'FAIL'}"
+                for name, passed in dict(analysis.decision_gates).items()
+            )
+            counter_text = (
+                " Counter-evidence recorded in the review: "
+                + "; ".join(_snip(str(item["statement"]), cap(20)) for item in counter_claims[:3])
+                if counter_claims
+                else ""
+            )
+            seed_question = _snip(str(seed["research_question"]), cap(25)) if seed else ""
+            procedure = "; ".join(
+                str(step) for step in (block.get("procedure") or []) if str(step).strip()
+            ) or "not recorded"
+            procedure = _snip(procedure, cap(35))
+            gap_part = self._period_join(
+                f"Existing work does not close this question: {_snip(gap['why_unsolved'] or 'not recorded', cap(45))}{counter_text}",
+                f"The recorded falsification test is: {_snip(gap['falsification_test'] or 'not recorded', cap(35))}",
+            )
+            contribution_part = self._period_join(
+                f"To fill this gap we froze a methodology around {method} (difference: {difference}) and tested the preregistered hypothesis: {_snip(spec.hypothesis, cap(30)) if spec else 'not recorded'}",
+                _snip(str(block.get("hypothesis_statement") or ""), cap(30)),
+                f"Mechanism: {_snip(str(block.get('proposed_mechanism') or 'not recorded'), cap(25))}",
+            )
+            methods_part = self._period_join(
+                f"Study design: {_snip(self._methodology_field(methodology, 'study_design'), cap(25))}",
+                f"Data: {_snip(spec.dataset_identity, cap(15))} (checksum prefix {spec.dataset_checksum[:16]})",
+                f"split: {_snip(spec.split_definition, cap(15))}",
+                f"Sample: {len(spec.random_seeds)} seed(s)",
+                f"inclusion criteria: {spec.required_seed_count} seed(s) required",
+                f"Analysis: {_snip(spec.statistical_plan, cap(30))}",
+                f"Frozen procedure: {procedure}",
+            )
+            if factor <= 0.25:
+                conclusion_part = self._period_join(
+                    "Future research should address the limitations listed in the Discussion.",
+                    f"Uncertainty recorded: {_snip(str(report['uncertainty']), cap(15))}",
+                )
+            else:
+                conclusion_part = self._period_join(
+                    "Future research should address the limitations listed in the Discussion, "
+                    f"in particular the bounds of dataset '{_snip(spec.dataset_identity, cap(10))}' and split '{_snip(spec.split_definition, cap(8))}'",
+                    f"Uncertainty recorded: {_snip(str(report['uncertainty']), cap(20))}",
+                )
+            lines += [
+                f"**Background:** The question under study is: {_snip(str(gap['statement']), cap(55))} "
+                + (f"(research program: {seed_question})" if seed_question else ""),
+                "",
+                f"**Gap in Knowledge:** {gap_part}",
+                "",
+                f"**Contribution:** {contribution_part}",
+                "",
+                f"**Population & Methods:** {methods_part}",
+                "",
+                f"**Results:** Metrics: {metric_names}. Measured effects: {effects}. "
+                f"Decision gates: {gates}. The deterministic gates classified the outcome as "
+                f"**{report['decision']}**.",
+                "",
+                f"**Conclusion:** {conclusion_part}",
+                "",
+            ]
+            count = _word_count("\n".join(lines))
+            if count <= max_words:
+                break
+
         # Floor guard: when the recorded evidence is sparse the abstract could
         # fall below the template's 150-word minimum. Append further VERBATIM
         # evidence fields (never new prose) until the minimum is met; a chain
@@ -1311,6 +1349,21 @@ class ManuscriptService:
                     added = True
                     break
             if not added:
+                break
+        # Ceiling guard: a long evidence chain can still overshoot the
+        # template's 250-word maximum. Remove the verbatim extras (added by
+        # the floor loop) in reverse order until within bounds; if the six
+        # core parts alone exceed the window, the template audit fails
+        # honestly rather than silently truncating measured results.
+        max_words = _template_parameters()["abstract"]["word_max"]
+        while _word_count("\n".join(lines)) > max_words:
+            stripped = False
+            for index in range(len(lines) - 1, -1, -1):
+                if lines[index].startswith("Additional recorded evidence"):
+                    del lines[index : index + 2]
+                    stripped = True
+                    break
+            if not stripped:
                 break
         return lines
 

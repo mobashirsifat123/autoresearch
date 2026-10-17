@@ -548,3 +548,56 @@ async def test_shipped_reaudit_discards_model_draft_through_build(tmp_path, monk
     assert "template audit failed on the final model draft" in report["reason"]
     shipped = Path(record.markdown_path).read_text(encoding="utf-8")
     assert "deterministic decision gates" in shipped  # deterministic draft restored
+
+
+def test_abstract_stays_in_window_with_huge_recorded_fields(tmp_path):
+    """Regression (live AutoFID run): one oversized recorded field (a
+    150-word dataset identity, paragraph-length uncertainty, 13 long metric
+    names) blew the deterministic abstract to 1576 words. The builder must
+    scale its per-part caps until the abstract lands inside 150-250."""
+    from types import SimpleNamespace
+
+    from autoresearch.application.manuscript import ManuscriptService
+    from autoresearch.storage.repository import ResearchRepository
+
+    service = ManuscriptService(ResearchRepository(tmp_path / "db.sqlite3", tmp_path / "artifacts"))
+    gap = {
+        "statement": "A question. " * 60,
+        "why_unsolved": "Each paper defines its own protocol. " * 40,
+        "falsification_test": "Refuted if. " * 30,
+        "id": "g1",
+    }
+    candidate = SimpleNamespace(
+        method="A protocol that " + "calibrates " * 40,
+        difference_from_existing="differs " * 40,
+    )
+    methodology = {"methodology": {
+        "study_design": "Quantitative. " * 30,
+        "hypothesis_statement": "H " * 40,
+        "proposed_mechanism": "M " * 40,
+        "procedure": [f"step {index}. " * 6 for index in range(6)],
+    }}
+    spec = SimpleNamespace(
+        dataset_identity="Three benchmarks as described in the supplied papers and their appendices, each with distinct metrics and aggregation. " * 4,
+        dataset_checksum="checksum", split_definition="held-out " * 30,
+        random_seeds=(1, 2, 3), required_seed_count=3,
+        statistical_plan="exact Wilcoxon " * 15,
+        hypothesis="H " * 40,
+        interpretation_rules=["rule " * 15],
+    )
+    metrics = {
+        f"very_long_metric_name_{index}_with_suffix (PRIMARY)": 0.5 + index / 100
+        for index in range(13)
+    }
+    analysis = SimpleNamespace(
+        proposed_metrics=metrics, effect_size=metrics, decision_gates={name: True for name in metrics},
+    )
+    report = {"decision": "partially_supported", "uncertainty": "Limited by " * 50}
+    seed = {"research_question": "How reliably do " * 12, "topic": "t"}
+    counter = [{"statement": f"counter {index} " * 10} for index in range(3)]
+
+    lines = service._abstract_markdown(gap, counter, candidate, methodology, spec, analysis, report, True, [], seed)
+    words = len(" ".join(lines).split())
+    assert 150 <= words <= 250, words
+    for part in ("Background:", "Gap in Knowledge:", "Contribution:", "Population & Methods:", "Results:", "Conclusion:"):
+        assert any(part in line for line in lines), part

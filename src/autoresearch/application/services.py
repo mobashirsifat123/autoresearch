@@ -1607,7 +1607,7 @@ class ExperimentService:
         self.findings = FindingsMemory(repository)
         self.pipeline = ExperimentPipeline(
             repository=repository,
-            planner=ExperimentSpecGenerator(router),
+            planner=ExperimentSpecGenerator(router, default_repository=workspace_root),
             environment_builder=IsolatedEnvironmentBuilder(workspace_root),
             executor=DurableExperimentExecutor(repository, None),
             analyzer=StatisticalAnalyzer(router),

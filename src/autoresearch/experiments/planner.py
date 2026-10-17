@@ -130,8 +130,34 @@ _FIELD_CONTRACT = (
 
 
 class ExperimentSpecGenerator:
-    def __init__(self, router: ModelRouter) -> None:
+    def __init__(self, router: ModelRouter, default_repository: Path | None = None) -> None:
         self.router = router
+        # The worker executes ONLY inside its workspace root. When no
+        # repository is supplied (or the supplied one is outside the
+        # workspace), the spec must be pinned to this root — otherwise the
+        # approval flows cleanly and execution dies with
+        # 'unsafe_execution_request: repository is outside worker workspace'
+        # (observed live on the AutoFID project).
+        self.default_repository = default_repository.expanduser().resolve() if default_repository else None
+
+    def _resolve_repository(self, claimed: str) -> str:
+        fallback = (
+            self.default_repository
+            if self.default_repository is not None
+            else Path.cwd().expanduser().resolve()
+        )
+        claimed_path = Path(claimed).expanduser() if claimed.strip() else None
+        if claimed_path is not None and claimed_path.is_dir():
+            resolved = claimed_path.resolve()
+            if self.default_repository is None:
+                return str(resolved)
+            root = self.default_repository
+            # The worker accepts a repository that nests with its root in
+            # either direction; anything else can never execute.
+            if resolved == root or root in resolved.parents or resolved in root.parents:
+                return str(resolved)
+        fallback.mkdir(parents=True, exist_ok=True)
+        return str(fallback)
 
     async def plan(
         self,
@@ -183,11 +209,10 @@ class ExperimentSpecGenerator:
             power_note = "Power is not established without a standardized effect size or pilot variance; the seed count is a proposed minimum."
 
         # The repository is an execution target: never trust the LLM to invent
-        # it (it emits URLs and hallucinated paths). Default to the process CWD
-        # when the claimed path does not exist on disk.
-        repository = str(selected.get("repository") or "").strip()
-        if not repository or not Path(repository).expanduser().is_dir():
-            repository = str(Path.cwd().expanduser().resolve())
+        # it (it emits URLs and hallucinated paths). Default to the worker
+        # workspace when the claimed path is missing or outside it — the
+        # typed worker can only execute inside its own root.
+        repository = self._resolve_repository(str(selected.get("repository") or "").strip())
 
         # A power analysis may demand more seeds than the drafted list
         # contained. Expand deterministically (0, 1, 2, …) so the
