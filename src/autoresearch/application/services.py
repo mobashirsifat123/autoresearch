@@ -883,13 +883,25 @@ class LiteratureReviewService:
         try:
             guard.require_allowed("paper review")
             require_provider_credentials(self.router, ModelRole.LITERATURE_EXTRACTION)
-            results = await asyncio.gather(
-                *(
-                    self._review_one(
+            from autoresearch.application.progress import report as _progress
+
+            completed = {"count": 0}
+            total = len(papers)
+
+            async def _review_tracked(paper):
+                try:
+                    return await self._review_one(
                         paper, run_id, hierarchical=hierarchical, allow_reuse=not fresh
                     )
-                    for paper in papers
-                ),
+                finally:
+                    completed["count"] += 1
+                    _progress(
+                        "review.papers", completed["count"], total,
+                        detail=f"{completed['count']}/{total} papers reviewed",
+                    )
+
+            results = await asyncio.gather(
+                *(_review_tracked(paper) for paper in papers),
                 return_exceptions=True,
             )
             bundles: list[ReviewBundle] = []
@@ -1874,12 +1886,16 @@ class ExperimentService:
                     raise PermissionError(
                         "approval_expired: experiment approval has expired"
                     )
+                from autoresearch.application.progress import report as _progress
+
+                _progress("experiment.worker", 0, 4, detail="approved execution starting", remaining=["execution", "ingestion", "analysis", "report"])
                 result = await self.worker.run(
                     spec,
                     self.action_plan(spec),
                     approved_checksum=str(preview["checksum"]),
                     timeout_seconds=int(approval.get("approved_budget") or 3600),
                 )
+                _progress("experiment.worker", 1, 4, detail=f"worker state: {result.get('state')}", remaining=["ingestion", "analysis", "report"])
                 if result.get("state") != "COMPLETED":
                     raise RuntimeError(
                         "execution_failed: worker did not complete the approved scientific action"
@@ -1899,9 +1915,24 @@ class ExperimentService:
                         ingested = MeasurementIngester(self.repository).ingest(
                             spec, result, job_id=str(result.get("job_id"))
                         )
+                        _progress(
+                            "experiment.worker", 2, 4,
+                            detail="measurements ingested and identity-checked",
+                            remaining=["analysis", "report"],
+                        )
                         analysis = await self.pipeline.analyzer.analyze(spec, ingested)
                         self.repository.save_statistical_analysis(analysis)
+                    _progress(
+                        "experiment.worker", 3, 4,
+                        detail="deterministic statistical analysis complete",
+                        remaining=["report"],
+                    )
                     report = await self.report_for_candidate(candidate_id)
+                    _progress(
+                        "experiment.worker", 4, 4,
+                        detail="report written; result path complete",
+                        remaining=[],
+                    )
                     self.repository.append_api_event(
                         run.id,
                         "experiment.analyzed",

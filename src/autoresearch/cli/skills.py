@@ -128,19 +128,22 @@ def _canonical_root() -> Path:
 
 
 def _target_roots(target: str) -> list[Path]:
-    """Installation targets: Claude Code and OpenCode skill discovery dirs."""
+    """Installation targets: Codex, Claude Code, and OpenCode skill dirs."""
     if target == "claude":
         configured = os.environ.get("CLAUDE_SKILLS_DIR", "").strip()
         return [Path(configured).expanduser() if configured else Path.home() / ".claude" / "skills"]
     if target == "opencode":
         configured = os.environ.get("OPENCODE_SKILLS_DIR", "").strip()
         return [Path(configured).expanduser() if configured else Path.home() / ".config" / "opencode" / "skills"]
+    if target == "codex":
+        configured = os.environ.get("CODEX_SKILLS_DIR", "").strip()
+        return [Path(configured).expanduser() if configured else Path.home() / ".codex" / "skills"]
     if target == "all":
         roots: list[Path] = []
-        for sub in ("claude", "opencode"):
+        for sub in ("codex", "claude", "opencode"):
             roots.extend(_target_roots(sub))
         return list(dict.fromkeys(roots))
-    raise ValueError(f"unknown skill target '{target}'; use claude, opencode, or all")
+    raise ValueError(f"unknown skill target '{target}'; use codex, claude, opencode, or all")
 
 
 def _user_skills_dir() -> Path:
@@ -231,7 +234,7 @@ def skill_list() -> None:
         meta = SKILLS[name]
         canonical_present = (_canonical_dir(name) / "SKILL.md").is_file()
         targets = {}
-        for target in ("claude", "opencode"):
+        for target in ("codex", "claude", "opencode"):
             root = _target_roots(target)[0]
             provenance = _installed_provenance(name, root)
             targets[target] = {
@@ -262,7 +265,7 @@ def _selected_or_all(names: list[str]) -> list[str]:
 @skill_app.command("install")
 def skill_install(
     names: list[str] = typer.Argument(None, help="Skills to install (default: all)."),
-    target: str = typer.Option("all", "--target", help="Install target: claude, opencode, or all (default: all installed targets)."),
+    target: str = typer.Option("all", "--target", help="Install target: codex, claude, opencode, or all (default: all)."),
     force: bool = typer.Option(False, "--force", help="Overwrite a colliding skill we did not install."),
 ) -> None:
     """Install canonical skills into the Claude Code and/or OpenCode skill directories."""
@@ -285,7 +288,7 @@ def skill_install(
 @skill_app.command("update")
 def skill_update(
     names: list[str] = typer.Argument(None, help="Skills to refresh (default: all)."),
-    target: str = typer.Option("all", "--target", help="Update target: claude, opencode, or all (default: all installed targets)."),
+    target: str = typer.Option("all", "--target", help="Update target: codex, claude, opencode, or all (default: all)."),
 ) -> None:
     """Re-sync installed skills from the canonical package copies."""
     roots = _target_roots(target)
@@ -307,7 +310,7 @@ def skill_update(
 @skill_app.command("uninstall")
 def skill_uninstall(
     names: list[str] = typer.Argument(None, help="Skills to remove (default: all installed by this tool)."),
-    target: str = typer.Option("all", "--target", help="Removal target: claude, opencode, or all (default: all installed targets)."),
+    target: str = typer.Option("all", "--target", help="Removal target: codex, claude, opencode, or all (default: all)."),
 ) -> None:
     """Remove only skill directories this tool installed (provenance-marked)."""
     import shutil
@@ -338,7 +341,7 @@ def skill_doctor() -> None:
             "detail": "SKILL.md present" if present else "missing canonical SKILL.md",
         })
     for name in sorted(SKILLS):
-        for target in ("claude", "opencode"):
+        for target in ("codex", "claude", "opencode"):
             root = _target_roots(target)[0]
             provenance = _installed_provenance(name, root)
             if not provenance:
@@ -431,11 +434,15 @@ def _fail(code: str, exc: Exception, exit_code: int) -> None:
 
 
 def _invoke(operation: Callable[[ApplicationContainer], Awaitable[Any]], *, operation_name: str) -> None:
+    from autoresearch.application.progress import reset_sink, set_sink, stderr_sink
+
     async def execute() -> Any:
         container = ApplicationContainer(load_settings())
+        token = set_sink(stderr_sink)  # live progress → stderr JSON lines
         try:
             return await operation(container)
         finally:
+            reset_sink(token)
             await container.close()
 
     try:

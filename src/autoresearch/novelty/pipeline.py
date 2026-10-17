@@ -66,8 +66,20 @@ class NoveltyPipeline:
 
         # 1. Generate Candidates — each one is persisted the moment its model
         # call completes (checkpoint at this expensive boundary), so an
-        # interrupted run leaves recoverable state.
-        raw_candidates = await self.generator.generate(gap, count=5, evidence_context=evidence_context, on_candidate=self.repository.save_novelty_candidate)
+        # interrupted run leaves recoverable state; progress is reported live.
+        from autoresearch.application.progress import report as _progress
+        generated = {"count": 0}
+
+        def _persist_candidate(candidate) -> None:
+            self.repository.save_novelty_candidate(candidate)
+            generated["count"] += 1
+            _progress(
+                "novelty.candidates", generated["count"], 5,
+                detail=f"{generated['count']}/5 candidates generated",
+                remaining=["prior-art", "critique", "selection"],
+            )
+
+        raw_candidates = await self.generator.generate(gap, count=5, evidence_context=evidence_context, on_candidate=_persist_candidate)
 
         # N3: Semantic deduplication before prior-art check
         candidates = _deduplicate_candidates(list(raw_candidates))

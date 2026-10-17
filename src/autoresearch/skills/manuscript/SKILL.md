@@ -89,6 +89,21 @@ anything — it only writes editable files locally.
   the deterministic companion (`manuscript_deterministic.md`) is kept for
   diffing.
 
+## Live progress (percent + remaining)
+
+While the skill runs, the CLI writes one JSON line per completed step to
+**stderr** (stdout stays the single final result):
+
+```json
+{"progress": {"stage": "review.papers", "percent": 40, "completed": 8,
+  "total": 20, "detail": "8/20 papers reviewed",
+  "remaining": ["novelty", "experiment", "manuscript"]}}
+```
+
+Surface every event to the user as: `stage: N% (k/total) — remaining: ...`.
+Percentages are completed steps / total steps, NEVER time estimates. Do not
+invent a percentage before a progress line arrives; report stalls honestly.
+
 ## Quality rules
 
 - NEVER present an incomplete manuscript as complete; the gap report is

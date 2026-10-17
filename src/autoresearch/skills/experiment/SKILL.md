@@ -163,6 +163,20 @@ Exit codes: `0` success · `1` internal · `2` usage · `3` approval required ·
 
 ## Progress reporting
 
+While the skill runs, the CLI writes one JSON line per completed step to
+**stderr** (stdout stays the single final result):
+
+```json
+{"progress": {"stage": "review.papers", "percent": 40, "completed": 8,
+  "total": 20, "detail": "8/20 papers reviewed",
+  "remaining": ["novelty", "experiment", "manuscript"]}}
+```
+
+Surface every event to the user as: `stage: N% (k/total) — remaining: ...`.
+Percentages are completed steps / total steps, NEVER time estimates. Do not
+invent a percentage before a progress line arrives; report stalls honestly.
+
+
 - The 5 steps are the progress bar. Announce `[k/5] <step>` before running
   each step's command (e.g. `[3/5] approve`) and report the outcome before
   moving on.

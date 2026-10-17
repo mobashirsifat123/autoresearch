@@ -92,6 +92,12 @@ class ManuscriptService:
         if not project:
             raise ValueError(f"project_not_found: project '{project_id}' not found")
         lineage, gaps = self._resolve_lineage(project_id)
+        from autoresearch.application.progress import report as _progress
+
+        _progress(
+            "manuscript.steps", 1, 5, detail="lineage resolved",
+            remaining=["evidence bundle", "draft", "audit", "manifest"],
+        )
         run = self.repository.create_run(
             project_id, PipelineKind.MANUSCRIPT, {"lineage": lineage}
         )
@@ -316,6 +322,12 @@ class ManuscriptService:
         (root / "tables").mkdir(exist_ok=True)
         (root / "tables" / "results.md").write_text(tables_md, encoding="utf-8")
         (root / "tables" / "results.tex").write_text(tables_tex, encoding="utf-8")
+        from autoresearch.application.progress import report as _progress
+
+        _progress(
+            "manuscript.steps", 2, 5, detail="evidence bundle and draft files written",
+            remaining=["audit", "manifest", "compile"],
+        )
 
         self._verify_citations(markdown, latex, bib, keys)
         if complete:
@@ -354,6 +366,13 @@ class ManuscriptService:
                 json.dumps(writer_report, indent=2, default=str), encoding="utf-8"
             )
 
+        from autoresearch.application.progress import report as _progress
+
+        _progress(
+            "manuscript.steps", 4, 5, detail="writing audit complete",
+            remaining=["manifest", "compile"],
+        )
+
         manifest = self._manifest(root, bundle)
         manifest_path = root / "manifest.json"
         manifest_path.write_text(
@@ -361,6 +380,13 @@ class ManuscriptService:
         )
 
         pdf_path = self._compile(latex_path) if complete else None
+        from autoresearch.application.progress import report as _progress
+
+        _progress(
+            "manuscript.steps", 5, 5,
+            detail=f"manifest written; pdf {'compiled' if pdf_path else 'not compiled (no verified compiler)'}",
+            remaining=[],
+        )
 
         provenance = ArtifactProvenance.create(
             project_id=project.id,

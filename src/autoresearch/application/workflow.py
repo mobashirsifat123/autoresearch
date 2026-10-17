@@ -84,6 +84,7 @@ class WorkflowService:
 
         def record(stage: str, status: str, **ids: Any) -> None:
             dispositions.append({"stage": stage, "status": status, **ids})
+            self._emit_progress(stage, status, until)
 
         # ---- Stage 0/1: discovery + review (produces the question/gap) ----
         project = project_id
@@ -295,6 +296,21 @@ class WorkflowService:
         if row and row["run_status"] == RunStatus.COMPLETED.value:
             return row
         return None
+
+    def _emit_progress(self, stage: str, status: str, until: str) -> None:
+        """Step-level progress for the requested loop (never time estimates)."""
+        from autoresearch.application.progress import report
+
+        alias = {"implementation": "design"}
+        current = alias.get(stage, stage)
+        if current not in STOP_STAGES or until not in STOP_STAGES:
+            return
+        index = STOP_STAGES.index(current)
+        target = STOP_STAGES.index(until)
+        total = target + 1
+        completed = min(index + 1, total)
+        remaining = list(STOP_STAGES[index + 1: total])
+        report(f"workflow.{current}", completed, total, detail=f"{current} {status}", remaining=remaining)
 
     def _result(self, project: str, dispositions: list[dict[str, Any]], *, stopped_at: str, note: str | None = None) -> dict[str, Any]:
         result: dict[str, Any] = {

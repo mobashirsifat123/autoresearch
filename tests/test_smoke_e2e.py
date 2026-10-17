@@ -217,8 +217,8 @@ def anyio_backend():
     return "asyncio"
 
 
-@pytest.mark.anyio
-async def test_five_skill_loop_runs_end_to_end_offline(tmp_path):
+def _build_loop(tmp_path: Path):
+    """Shared offline harness: repository + workflow + seed PDF, no network."""
     repository = ResearchRepository(tmp_path / "state.sqlite3", tmp_path / "artifacts")
     workspace = tmp_path / "workspace"
     (workspace / "scripts").mkdir(parents=True, exist_ok=True)
@@ -248,6 +248,12 @@ async def test_five_skill_loop_runs_end_to_end_offline(tmp_path):
     writer = PdfWriter(); writer.add_blank_page(width=200, height=200); writer.add_metadata({"/Title": "Seed Adaptive Fusion"})
     with seed.open("wb") as handle:
         writer.write(handle)
+    return repository, workflow, seed
+
+
+@pytest.mark.anyio
+async def test_five_skill_loop_runs_end_to_end_offline(tmp_path):
+    repository, workflow, seed = _build_loop(tmp_path)
 
     # Pass 1: seed → … → design, with NO hand-written experiment script: the
     # implementation must be generated and statically verified.
