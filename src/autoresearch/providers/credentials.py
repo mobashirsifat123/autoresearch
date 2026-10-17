@@ -35,6 +35,10 @@ def _opencode_provider(config: ProviderConfig) -> str | None:
         ("api.anthropic.com", "/v1"): ("anthropic", "anthropic"),
         ("generativelanguage.googleapis.com", ""): ("gemini", "google"),
         ("openrouter.ai", "/api/v1"): ("openai_compatible", "openrouter"),
+        # Alibaba Token Plan (China): the OpenCode session's credential is
+        # usable only for this official endpoint, selected by exact host+path.
+        ("token-plan.cn-beijing.maas.aliyuncs.com", "/compatible-mode/v1"): ("openai_compatible", "alibaba-token-plan-cn"),
+        ("dashscope.aliyuncs.com", "/compatible-mode/v1"): ("openai_compatible", "alibaba"),
     }
     match = endpoints.get((url.hostname, url.path.rstrip("/")))
     if match and (config.kind == match[0] or config.kind == "external_embeddings" and match[1] == "openai"):
