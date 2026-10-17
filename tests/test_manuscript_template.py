@@ -484,3 +484,66 @@ def test_template_violations_reports_none_for_conformant_draft(tmp_path):
         _TEMPLATE_VIOLATING_DRAFT, literature_evidence=False, figure_svg=None
     )
     assert violations, "the violating draft must produce template violations"
+
+
+async def test_shipped_reaudit_discards_model_draft_through_build(tmp_path, monkeypatch):
+    """Judge follow-up: route through _build to cover the shipped-text
+    re-audit branch. When the final model draft fails the template audit at
+    SHIP time (defense-in-depth re-check), the deterministic draft is
+    restored and the fallback reason recorded — never shipped silently."""
+    from pathlib import Path
+    from uuid import uuid4
+
+    import autoresearch.application.manuscript as manuscript_module
+    from autoresearch.application.manuscript import ManuscriptService
+    from test_smoke_e2e import _build_loop
+
+    repository, workflow, seed = _build_loop(tmp_path)
+    texts = ["outline", _complete_manuscript()]
+    service = ManuscriptService(repository, router=_StubRouter(texts), writer_mode="model")
+    workflow.manuscript = service
+
+    real_audit = manuscript_module.run_template_audit
+    calls = {"n": 0}
+
+    def failing_shipped_audit(*args, **kwargs):
+        calls["n"] += 1
+        audit = real_audit(*args, **kwargs)
+        if calls["n"] == 3:  # deterministic-audit, gate-1, then the shipped re-audit
+            audit.violations.append("shipped_reaudit_simulation")
+        return audit
+
+    monkeypatch.setattr(manuscript_module, "run_template_audit", failing_shipped_audit)
+    # The model draft's fixed fixture numbers/decision must not trip the
+    # numeric/citation/overclaim gate: this test covers the TEMPLATE
+    # re-audit branch, so those gates are bypassed for the model draft only.
+    monkeypatch.setattr(
+        service,
+        "_audit_draft",
+        lambda draft, allowed, keys, decision: {
+            "numbers": [], "citations": [], "overclaims": [], "decision_missing": False,
+        },
+    )
+
+    first = await workflow.run(seed=str(seed), until="design")
+    project = first["project_id"]
+    candidate_id = next(s for s in first["stages"] if s["stage"] == "methodology")["candidate_id"]
+    preview = workflow.experiment.approval_preview_for_candidate(candidate_id)
+    saved = repository.save_exact_approval({
+        "id": uuid4().hex, "run_id": preview["run_id"], "specification_checksum": str(preview["checksum"]),
+        "approver": "test", "approved_scope": "workspace", "approved_target": str(preview["worker"]),
+        "approved_budget": 60.0, "expires_at": "2099-01-01T00:00:00+00:00", "status": "pending",
+    })
+    repository.approve_exact(saved["id"], approver="test")
+    result = await workflow.run(project_id=project, until="manuscript")
+
+    stages = {s["stage"]: s for s in result["stages"]}
+    assert stages["manuscript"]["status"] == "complete"
+    assert calls["n"] >= 3, f"expected the shipped re-audit to run; {calls['n']} calls"
+    record = repository.latest_manuscript(project)
+    report = json.loads(Path(record.evidence_bundle_path).parent.joinpath("writing_audit.json").read_text(encoding="utf-8"))
+    assert report["used_model_draft"] is False
+    assert report["fallback"] == "deterministic"
+    assert "template audit failed on the final model draft" in report["reason"]
+    shipped = Path(record.markdown_path).read_text(encoding="utf-8")
+    assert "deterministic decision gates" in shipped  # deterministic draft restored

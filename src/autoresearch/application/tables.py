@@ -130,9 +130,12 @@ def build_result_tables(analysis: Any) -> ResultTables:
             f"| {metric} | {_cell(before)} | {_cell(after)} | {delta_text} | "
             f"{d_text} | {p_text} | {n} | {gate_text} |"
         )
+        # PEP-701-incompatible escapes (backslashes inside f-string
+        # expressions) would break Python 3.11 — precompute the TeX cells.
+        before_tex = _cell(before).replace("±", "$\\pm$")
+        after_tex = _cell(after).replace("±", "$\\pm$")
         tex_rows.append(
-            f"{metric} & {_cell(before).replace('±', '$\\\\pm$')} & "
-            f"{_cell(after).replace('±', '$\\\\pm$')} & {delta_text} & {d_text} & "
+            f"{metric} & {before_tex} & {after_tex} & {delta_text} & {d_text} & "
             f"{p_text} & {n} & {gate_text} \\\\"
         )
 
