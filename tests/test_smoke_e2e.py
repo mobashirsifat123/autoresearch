@@ -130,7 +130,7 @@ def _responder(messages):
         return _generated_script(prompt)
     if "seed-analysis-v1" in prompt:
         return {"title": "Seed Adaptive Fusion", "topic": "robust adaptive fusion", "research_question": "Can adaptive fusion improve cross-domain robustness?", "methods": ["adaptive fusion"], "datasets": ["Dataset-A"], "citations": [], "limitations": ["single-domain evaluation"], "keywords": ["robustness"]}
-    if "search-strategies-v1" in prompt:
+    if "search-strategies-v2" in prompt:
         return {"strategies": [{"name": "topic", "query": "adaptive fusion robustness"}, {"name": "method", "query": "adaptive fusion domain shift"}, {"name": "question", "query": "cross-domain robust fusion"}]}
     if "paper-review-v2" in prompt:
         source = prompt.split("SOURCE:\n", 1)[1].split("\n\nReturn one JSON object", 1)[0]

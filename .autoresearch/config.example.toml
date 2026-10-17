@@ -58,3 +58,18 @@ model = "provider-embedding-model-id"
 # No aggregate token ceiling, including when the shell sets a global default.
 # An explicit --max-tokens still sets a project-specific budget if requested.
 max_tokens = 0
+
+# Quality-width knobs (all default ON): each adds PARALLEL width — more
+# tokens and wider coverage — without adding serial latency. Every one
+# degrades gracefully under partial failure.
+# Parallel complementary perspectives for search-strategy generation
+# (1..8; the union is deduplicated).
+discovery_query_perspectives = 3
+# OpenAlex citation chaining: pull forward/backward citation neighbors of
+# the top-ranked anchors into the discovery candidate pool (zero tokens).
+discovery_citation_expansion = true
+discovery_citation_anchors = 5
+discovery_citation_neighbors = 10
+# Dual-leg parallel extraction per paper review, merged with deduplication.
+# A failing leg degrades to the survivor; set false for the single-pass cost.
+review_ensemble = true

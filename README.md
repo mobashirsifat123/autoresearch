@@ -30,6 +30,28 @@ Every analyzed outcome is persisted to a shared **Findings Memory**
 (including failures and refutations) that conditions later runs, so the
 system does not repeatedly rediscover unsuccessful approaches.
 
+## Quality width (parallel, latency-neutral)
+
+Quality scales by *width, not depth*: the four skills add parallel fan-out
+where coverage is the ceiling — more tokens, same wall-clock, no new serial
+hops. All knobs default ON and degrade gracefully under partial failure;
+tune them under `[research]` in `.autoresearch/config.toml` (the boolean and
+perspective knobs also accept `AUTORESEARCH_*` env equivalents; the
+anchors/neighbors bounds are config-file only):
+
+- `discovery_query_perspectives` — parallel complementary perspectives for
+  search-strategy generation (topic/method, application/domain,
+  limitation/counter-evidence); the union is deduplicated.
+- `discovery_citation_expansion` + `_anchors`/`_neighbors` — deterministic,
+  zero-token OpenAlex citation chaining: forward/backward neighbors of the
+  top-ranked candidates join the candidate pool and are re-ranked with it.
+- `review_ensemble` — dual-leg parallel extraction per paper (second leg
+  sees reversed chunk order), merged with claim deduplication; a failing
+  leg degrades to the survivor.
+- Prior-art checking (novelty) now fans out across **all** sources with six
+  complementary queries per candidate, including cross-domain probes
+  grounded in the seed's topic and datasets.
+
 ## Install
 
 ```bash

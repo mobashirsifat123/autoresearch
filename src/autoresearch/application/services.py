@@ -134,7 +134,7 @@ from autoresearch.experiments.policy import (
 )
 from autoresearch.workers.local_typed import LocalTypedWorker
 
-SEARCH_PROMPT_VERSION = "search-strategies-v1"
+SEARCH_PROMPT_VERSION = "search-strategies-v2"
 SEARCH_STRATEGIES_SCHEMA = {
     "type": "object",
     "properties": {
@@ -151,6 +151,15 @@ SEARCH_STRATEGIES_SCHEMA = {
     "required": ["strategies"],
     "additionalProperties": False,
 }
+
+# Complementary retrieval perspectives. Each runs as an independent parallel
+# generation call (same wall-clock as one call, wider recall), and the union
+# is deduplicated. Partial perspective failure degrades to the survivors.
+_SEARCH_PERSPECTIVES = (
+    ("topic-method", "Emphasize the seed's core topic and its primary methods."),
+    ("application-domain", "Emphasize applications, datasets, benchmarks, and downstream domains where these methods apply."),
+    ("limitation-counter", "Emphasize the seed's stated limitations and counter-evidence; surface work that challenges or circumvents them."),
+)
 
 
 @dataclass(frozen=True)
@@ -180,44 +189,75 @@ class ReviewOutcome:
 
 
 class SearchStrategyGenerator:
-    def __init__(self, router: ModelRouter) -> None:
+    def __init__(self, router: ModelRouter, *, perspectives: int = 3) -> None:
         self.router = router
+        self.perspectives = max(1, min(8, perspectives))
 
     async def generate(
         self, analysis: SeedAnalysis, *, project_id: str, run_id: str
     ) -> tuple[SearchStrategy, ...]:
-        payload = await self.router.structured_output(
+        """Generate strategies from parallel complementary perspectives.
+
+        Width is the recall lever: each perspective call runs concurrently, so
+        the wall-clock is that of a single call. One perspective failing must
+        not discard the others' strategies; only fewer than three distinct
+        strategies in total is a hard failure (as before).
+        """
+        selected = _SEARCH_PERSPECTIVES[: self.perspectives]
+        results = await asyncio.gather(
+            *(
+                self._generate_perspective(
+                    analysis, perspective, directive, project_id, run_id
+                )
+                for perspective, directive in selected
+            ),
+            return_exceptions=True,
+        )
+        strategies: list[SearchStrategy] = []
+        seen: set[str] = set()
+        for result in results:
+            if isinstance(result, Exception):
+                continue
+            for raw in result.get("strategies") or []:
+                if not isinstance(raw, dict):
+                    continue
+                name = " ".join(str(raw.get("name") or "").split())
+                query = " ".join(str(raw.get("query") or "").split())
+                if name and query and query.lower() not in seen:
+                    strategies.append(SearchStrategy(name, query))
+                    seen.add(query.lower())
+        if len(strategies) < 3:
+            raise ValueError(
+                "Provider must return at least three distinct search strategies."
+            )
+        return tuple(strategies[:32])
+
+    async def _generate_perspective(
+        self,
+        analysis: SeedAnalysis,
+        perspective: str,
+        directive: str,
+        project_id: str,
+        run_id: str,
+    ) -> dict[str, Any]:
+        return await self.router.structured_output(
             ModelRole.RESEARCH_REASONING,
             messages=[
                 {
                     "role": "system",
-                    "content": "Generate complementary scholarly-search queries. Queries must be concise and grounded in the supplied seed analysis.",
+                    "content": "Generate complementary scholarly-search queries. Queries must be concise and grounded in the supplied seed analysis. "
+                    + directive,
                 },
                 {
                     "role": "user",
-                    "content": f"Prompt version: {SEARCH_PROMPT_VERSION}\nTopic: {analysis.topic}\nQuestion: {analysis.research_question}\nMethods: {list(analysis.methods)}\nDatasets: {list(analysis.datasets)}\nKeywords: {list(analysis.keywords)}\nReturn strategies[] with unique name and query. Include topic, method, research-question, and limitation strategies.",
+                    "content": f"Prompt version: {SEARCH_PROMPT_VERSION}\nPerspective: {perspective}\nTopic: {analysis.topic}\nQuestion: {analysis.research_question}\nMethods: {list(analysis.methods)}\nDatasets: {list(analysis.datasets)}\nKeywords: {list(analysis.keywords)}\nReturn strategies[] with unique name and query.",
                 },
             ],
             schema={"name": "search_strategies", "schema": SEARCH_STRATEGIES_SCHEMA},
             project_id=project_id,
             run_id=run_id,
-            operation="search_strategy_generation",
+            operation=f"search_strategy_generation:{perspective}",
         )
-        strategies: list[SearchStrategy] = []
-        seen: set[str] = set()
-        for raw in payload.get("strategies") or []:
-            if not isinstance(raw, dict):
-                continue
-            name = " ".join(str(raw.get("name") or "").split())
-            query = " ".join(str(raw.get("query") or "").split())
-            if name and query and query.lower() not in seen:
-                strategies.append(SearchStrategy(name, query))
-                seen.add(query.lower())
-        if len(strategies) < 3:
-            raise ValueError(
-                "Provider must return at least three distinct search strategies."
-            )
-        return tuple(strategies[:8])
 
 
 class DiscoveryService:
@@ -228,13 +268,16 @@ class DiscoveryService:
         search_pipeline: StudySearchPipeline,
         *,
         parser: DocumentParser | None = None,
+        strategy_perspectives: int = 3,
     ) -> None:
         self.repository = repository
         self.router = router
         self.search_pipeline = search_pipeline
         self.parser = parser or DocumentParser()
         self.seed_analyzer = SeedAnalyzer(router)
-        self.strategy_generator = SearchStrategyGenerator(router)
+        self.strategy_generator = SearchStrategyGenerator(
+            router, perspectives=strategy_perspectives
+        )
 
     async def import_catalog(
         self,
@@ -754,6 +797,7 @@ class LiteratureReviewService:
         router: ModelRouter,
         *,
         parser: DocumentParser | None = None,
+        ensemble: bool = True,
     ) -> None:
         self.repository = repository
         self.router = router
@@ -763,6 +807,7 @@ class LiteratureReviewService:
         self.gap_analyzer = GapAnalyzer(router)
         self.writer = ReviewSynthesisWriter(repository)
         self.review_semaphore = asyncio.Semaphore(_review_fanout(router))
+        self.ensemble = ensemble
 
     async def review(
         self,
@@ -1135,13 +1180,28 @@ class LiteratureReviewService:
                     ):
                         bundle = ReviewBundle(cached, cached_claims)
                 if bundle is None:
-                    bundle = await self.extractor.extract(
-                        paper,
-                        run_id=run_id,
-                        chunks=chunks,
-                        fallback_text=paper.abstract,
-                        hierarchical=hierarchical,
-                    )
+                    if self.ensemble:
+                        # Dual-leg parallel extraction with a merged result:
+                        # wider evidence-span coverage at the same wall-clock
+                        # as a single leg (the legs run concurrently under the
+                        # same semaphore slot). One failing leg degrades to
+                        # the survivor — an ensemble never makes a paper
+                        # review harder to obtain than a single pass.
+                        bundle = await self.extractor.extract_ensemble(
+                            paper,
+                            run_id=run_id,
+                            chunks=chunks,
+                            fallback_text=paper.abstract,
+                            hierarchical=hierarchical,
+                        )
+                    else:
+                        bundle = await self.extractor.extract(
+                            paper,
+                            run_id=run_id,
+                            chunks=chunks,
+                            fallback_text=paper.abstract,
+                            hierarchical=hierarchical,
+                        )
             for claim in bundle.claims:
                 self.repository.save_claim(claim)
             self.repository.save_review(bundle.review)

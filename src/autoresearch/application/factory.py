@@ -22,9 +22,19 @@ class ApplicationContainer:
         self.router = build_router(settings.provider_config, usage_sink=self.repository.record_provider_usage, budget_guard=ProviderBudgetGuard(self.repository, default_token_ceiling=settings.default_max_tokens, default_hard_stop=settings.default_max_cost_usd))
         self.sources = _sources(settings.search_sources)
         self.pdf_resolver = LegalPdfResolver()
-        self.search_pipeline = StudySearchPipeline(self.repository, self.sources, self.pdf_resolver, settings.download_root)
-        self.discovery = DiscoveryService(self.repository, self.router, self.search_pipeline)
-        self.review = LiteratureReviewService(self.repository, self.router)
+        self.search_pipeline = StudySearchPipeline(
+            self.repository, self.sources, self.pdf_resolver, settings.download_root,
+            citation_expansion=settings.discovery_citation_expansion,
+            citation_anchors=settings.discovery_citation_anchors,
+            citation_neighbors=settings.discovery_citation_neighbors,
+        )
+        self.discovery = DiscoveryService(
+            self.repository, self.router, self.search_pipeline,
+            strategy_perspectives=settings.discovery_query_perspectives,
+        )
+        self.review = LiteratureReviewService(
+            self.repository, self.router, ensemble=settings.review_ensemble
+        )
         self.novelty = NoveltyService(self.repository, self.router, self.search_pipeline)
         self.worker = LocalTypedWorker(self.repository, settings.data_root / "workspace")
         self.experiment = ExperimentService(self.repository, self.router, settings.data_root / "workspace", worker=self.worker)

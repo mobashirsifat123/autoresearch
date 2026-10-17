@@ -130,7 +130,42 @@ class PaperReviewExtractor:
         if not leaves:
             first_error = next((result for result in leaves_results if isinstance(result, Exception)), None)
             raise first_error or ValueError(f"Paper '{paper.title}' yielded no evidence-backed review.")
-        return self._merge_leaves(paper, run_id, leaves)
+        return self._merge_bundles(paper, run_id, leaves, prompt_version=HIERARCHICAL_REVIEW_PROMPT_VERSION)
+
+    async def extract_ensemble(
+        self,
+        paper: PaperRecord,
+        *,
+        run_id: str,
+        chunks: tuple[DocumentChunk, ...],
+        fallback_text: str = "",
+        hierarchical: bool = False,
+    ) -> ReviewBundle:
+        """Two independent parallel extraction legs merged into one review.
+
+        The second leg sees the source in reversed chunk order — a diversity
+        signal for evidence-span coverage without any prompt/API change. Both
+        legs run concurrently, so the ensemble costs the wall-clock of one
+        leg. A single failing leg degrades to the survivor; only a total
+        failure raises.
+        """
+        ordered = tuple(chunks)
+        reversed_chunks = tuple(reversed(ordered))
+        results = await asyncio.gather(
+            self.extract(paper, run_id=run_id, chunks=ordered, fallback_text=fallback_text, hierarchical=hierarchical),
+            self.extract(paper, run_id=run_id, chunks=reversed_chunks, fallback_text=fallback_text, hierarchical=hierarchical),
+            return_exceptions=True,
+        )
+        bundles = [result for result in results if isinstance(result, ReviewBundle)]
+        if not bundles:
+            first_error = next((result for result in results if isinstance(result, Exception)), None)
+            raise first_error or ValueError(f"Paper '{paper.title}' ensemble yielded no evidence-backed review.")
+        if len(bundles) == 1:
+            return bundles[0]
+        return self._merge_bundles(
+            paper, run_id, bundles,
+            prompt_version=f"{REVIEW_PROMPT_VERSION}-ensemble-v1",
+        )
 
     async def _extract_source(self, paper: PaperRecord, *, run_id: str, source_text: str, prompt_version: str, operation: str, system_prompt: str | None = None) -> ReviewBundle:
         system = system_prompt or _RIGOR_SYSTEM_PROMPT
@@ -161,7 +196,7 @@ class PaperReviewExtractor:
         review = PaperReview(uuid4().hex, paper.project_id, run_id, paper.id, review_content["problem"], review_content["research_question"], review_content["method"], review_content["datasets"], review_content["experimental_protocol"], review_content["results"], review_content["ablations"], review_content["limitations"], review_content["failure_modes"], review_content["evidence_claim_ids"], review_content["confidence"], provenance)
         return ReviewBundle(review, claims)
 
-    def _merge_leaves(self, paper: PaperRecord, run_id: str, bundles: list[ReviewBundle]) -> ReviewBundle:
+    def _merge_bundles(self, paper: PaperRecord, run_id: str, bundles: list[ReviewBundle], *, prompt_version: str) -> ReviewBundle:
         reviews = [b.review for b in bundles]
         all_claims = [claim for b in bundles for claim in b.claims]
         provider = reviews[0].provenance.provider
@@ -194,7 +229,7 @@ class PaperReviewExtractor:
             project_id=paper.project_id, run_id=run_id,
             source_evidence=content["evidence_claim_ids"],
             provider=provider, model=model,
-            prompt_version=HIERARCHICAL_REVIEW_PROMPT_VERSION,
+            prompt_version=prompt_version,
             content={**content, "sections": [r.provenance.checksum for r in reviews]},
         )
         review = PaperReview(
