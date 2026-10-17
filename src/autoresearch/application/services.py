@@ -829,6 +829,16 @@ class LiteratureReviewService:
         papers = self.repository.list_papers(project_id)
         if not papers:
             raise ValueError("Run discovery before literature review.")
+        # A previous review process that died mid-run leaves an orphaned
+        # 'running' record that blocks clean status forever. Paper checkpoints
+        # and verified reviews are reusable ACROSS runs, so retiring the
+        # orphan loses nothing and makes the new run the single source of
+        # truth.
+        for row in self.repository.rows(
+            "SELECT id FROM pipeline_runs WHERE project_id=? AND kind=? AND status=?",
+            (project_id, PipelineKind.REVIEW.value, RunStatus.RUNNING.value),
+        ):
+            self.repository.cancel_run(row["id"])
         run = self.repository.create_run(
             project_id,
             PipelineKind.REVIEW,
@@ -932,12 +942,37 @@ class LiteratureReviewService:
 
             completed = {"count": 0}
             total = len(papers)
+            fatal = asyncio.Event()
+            fatal_error: list[BaseException] = []
+            tasks: list[asyncio.Task] = []
 
             async def _review_tracked(paper):
                 try:
                     return await self._review_one(
                         paper, run_id, hierarchical=hierarchical, allow_reuse=not fresh
                     )
+                except BaseException as exc:
+                    if _is_hard_error(exc) and not fatal.is_set():
+                        # Systemic failure (dead credential, exhausted budget,
+                        # invalid contract): every remaining paper would fail
+                        # identically. Cancel the rest and surface the cause
+                        # NOW instead of grinding through N identical failures.
+                        fatal_error.append(exc)
+                        fatal.set()
+                        for task in tasks:
+                            if task is not asyncio.current_task():
+                                task.cancel()
+                        raise
+                    if _is_transient_error(exc):
+                        # Provider retries already ran inside the call; one
+                        # extra review-level attempt absorbs cross-call flake.
+                        try:
+                            return await self._review_one(
+                                paper, run_id, hierarchical=hierarchical, allow_reuse=not fresh
+                            )
+                        except BaseException as second:
+                            raise second from exc
+                    raise
                 finally:
                     completed["count"] += 1
                     _progress(
@@ -945,13 +980,19 @@ class LiteratureReviewService:
                         detail=f"{completed['count']}/{total} papers reviewed",
                     )
 
-            results = await asyncio.gather(
-                *(_review_tracked(paper) for paper in papers),
-                return_exceptions=True,
-            )
+            tasks = [asyncio.create_task(_review_tracked(paper)) for paper in papers]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            if fatal.is_set():
+                cause = redact_text(str(fatal_error[0]))
+                raise RuntimeError(
+                    f"review_aborted: systemic provider failure — {cause}. "
+                    "Completed paper checkpoints are reusable; fix the cause and resume."
+                )
             bundles: list[ReviewBundle] = []
             failure_reasons: list[str] = []
             for paper, result in zip(papers, results):
+                if isinstance(result, asyncio.CancelledError):
+                    continue  # cancelled by the systemic fail-fast path
                 if isinstance(result, Exception):
                     reason = redact_text(f"{type(result).__name__}: {result}")
                     failure_reasons.append(reason)
@@ -963,6 +1004,11 @@ class LiteratureReviewService:
                     )
                 else:
                     bundles.append(result)
+            if failure_reasons:
+                self.repository.append_api_event(
+                    run_id, "review.partial_coverage",
+                    {"reviewed": len(bundles), "failed": len(failure_reasons), "total": total},
+                )
             if len(bundles) < top_k:
                 # Surface the actual dominant cause, not just the count: the
                 # 2026-08-09 failure looked like a review-quality problem but
@@ -1036,13 +1082,16 @@ class LiteratureReviewService:
             ):
                 self.repository.begin_checkpoint(run_id, "gap_analysis")
                 try:
-                    gap = await self.gap_analyzer.analyze(
-                        project_id=project_id,
-                        run_id=run_id,
-                        papers=top_papers,
-                        reviews=top_reviews,
-                        claims=top_claims,
-                        scores=top_scores,
+                    gap = await _with_transient_retry(
+                        lambda: self.gap_analyzer.analyze(
+                            project_id=project_id,
+                            run_id=run_id,
+                            papers=top_papers,
+                            reviews=top_reviews,
+                            claims=top_claims,
+                            scores=top_scores,
+                        ),
+                        operation_name="gap analysis",
                     )
                     self.repository.save_gap(gap)
                     self.repository.complete_checkpoint(
@@ -1274,6 +1323,44 @@ class _ExecutionGuard:
             raise TimeoutError(
                 f"Runtime limit of {self.max_runtime_seconds:g}s reached before {operation}."
             )
+
+
+_TRANSIENT_KINDS = frozenset(
+    {ErrorKind.RATE_LIMIT, ErrorKind.TIMEOUT, ErrorKind.UNAVAILABLE, ErrorKind.SERVER}
+)
+
+
+async def _with_transient_retry(operation, *, operation_name: str, attempts: int = 2, delay: float = 1.0):
+    """Retry a model-backed operation only on errors a retry plausibly fixes
+    (throttles, deadlines, outages). Hard errors re-raise immediately — this
+    never masks a dead credential or an exhausted budget."""
+    for attempt in range(attempts):
+        try:
+            return await operation()
+        except BaseException as exc:
+            if not _is_transient_error(exc) or attempt == attempts - 1:
+                raise
+            logger.warning("Transient failure in %s (attempt %d/%d): %s", operation_name, attempt + 1, attempts, type(exc).__name__)
+            await asyncio.sleep(delay)
+    raise AssertionError("unreachable")
+
+
+def _is_transient_error(exc: BaseException) -> bool:
+    """Errors a retry plausibly fixes: throttles, deadlines, outages."""
+    if isinstance(exc, (TimeoutError, asyncio.TimeoutError)):
+        return True
+    return isinstance(exc, ProviderError) and exc.kind in _TRANSIENT_KINDS
+
+
+def _is_hard_error(exc: BaseException) -> bool:
+    """Errors that will strike EVERY remaining call identically — a dead
+    credential, an exhausted budget, a malformed contract. Retrying (or
+    letting the rest of the gather grind through N identical failures) is
+    waste: fail fast so the user sees the real cause immediately and the
+    completed paper checkpoints stay reusable."""
+    if isinstance(exc, PermissionError):
+        return True
+    return isinstance(exc, ProviderError) and exc.kind not in _TRANSIENT_KINDS and exc.kind is not ErrorKind.UNKNOWN
 
 
 def _parsed_payload(document: ParsedDocument) -> dict:

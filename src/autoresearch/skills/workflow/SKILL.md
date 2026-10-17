@@ -124,3 +124,11 @@ invent a percentage before a progress line arrives; report stalls honestly.
 - Methodology freezing records what will be tested; it never certifies novelty.
 - Do not fabricate results, citations, or decisions. All claims come from the
   backend's retained artifacts.
+
+## Where state lives
+
+Run the first invocation from inside the project's folder: the project's
+state is stored in `<project-dir>/.autoresearch/` and the project remembers
+it. Resume with `--project <id>` from any directory — the skills anchor to
+the project's own database and never mix projects or write into the source
+checkout.

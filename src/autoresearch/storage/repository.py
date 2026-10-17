@@ -54,7 +54,38 @@ from autoresearch.domain.models import (
 )
 
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
+
+
+def _register_project_root(project_id: str, data_root: str) -> None:
+    """Machine-local registry: project id -> the directory its state lives
+    in. Lets any later command anchor to the project from an arbitrary
+    working directory (resume never starts a fresh database by accident)."""
+    import json as _json
+    import os as _os
+    from pathlib import Path as _Path
+
+    registry_path = _Path(_os.environ.get(
+        "AUTORESEARCH_REGISTRY_PATH", str(_Path.home() / ".autoresearch" / "project-registry.json"),
+    )).expanduser()
+    try:
+        payload: dict = {}
+        if registry_path.is_file():
+            try:
+                payload = _json.loads(registry_path.read_text(encoding="utf-8"))
+                if not isinstance(payload, dict):
+                    payload = {}
+            except _json.JSONDecodeError:
+                payload = {}
+        payload[str(project_id)] = str(data_root)
+        registry_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = registry_path.with_suffix(".tmp")
+        temporary.write_text(_json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        temporary.replace(registry_path)
+    except OSError:
+        # Registry writes are best-effort bookkeeping; the project row itself
+        # still carries data_root for same-database lookups.
+        pass
 
 
 class ResearchRepository:
@@ -130,6 +161,9 @@ class ResearchRepository:
             if current < 15:
                 connection.executescript(_SCHEMA_V15)
                 connection.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(?,?)", (15, utc_now()))
+            if current < 16:
+                connection.executescript(_SCHEMA_V16)
+                connection.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(?,?)", (16, utc_now()))
             latest = int(connection.execute("SELECT COALESCE(MAX(version), 0) FROM schema_migrations").fetchone()[0])
             if latest != SCHEMA_VERSION:
                 raise RuntimeError(f"Unsupported database schema v{latest}; expected v{SCHEMA_VERSION}.")
@@ -138,7 +172,12 @@ class ResearchRepository:
         project = Project(uuid4().hex, title.strip())
         if not project.title:
             raise ValueError("Project title is required.")
-        self.execute("INSERT INTO projects(id,title,created_at) VALUES(?,?,?)", (project.id, project.title, project.created_at))
+        # The project remembers where its state lives: later commands can
+        # anchor to this directory from any CWD instead of creating a fresh
+        # database wherever they happen to run.
+        state_db_path = str(self.path.resolve())
+        self.execute("INSERT INTO projects(id,title,created_at,state_db_path) VALUES(?,?,?,?)", (project.id, project.title, project.created_at, state_db_path))
+        _register_project_root(project.id, state_db_path)
         return project
 
     def get_project(self, project_id: str) -> Project | None:
@@ -1688,4 +1727,9 @@ CREATE INDEX IF NOT EXISTS research_findings_project_idx ON research_findings(pr
 # reconstructing (or inventing) them.
 _SCHEMA_V15 = """
 ALTER TABLE execution_results ADD COLUMN command_json TEXT NOT NULL DEFAULT '';
+"""
+
+_SCHEMA_V16 = """
+ALTER TABLE projects ADD COLUMN state_db_path TEXT;
+UPDATE projects SET state_db_path = (SELECT hex(randomblob(0))) WHERE 0; -- no-op placeholder
 """

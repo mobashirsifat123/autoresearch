@@ -106,3 +106,22 @@ five skills into your agent host as explicit slash commands
 pip install pytest anyio
 pytest tests/ -q   # offline end-to-end smoke of the five-skill loop
 ```
+
+
+## Where project state lives
+
+Each research project stores its state **in its own directory** — the
+directory you run the skills from when the project is created:
+
+- The project's database, artifacts, and downloads live in
+  `<project-dir>/.autoresearch/`.
+- The project remembers that directory (exact database path recorded at
+  creation, plus a machine-local registry at
+  `~/.autoresearch/project-registry.json`).
+- Resuming with `--project <id>` works **from any working directory** —
+  the skills re-open the project's own database instead of starting a fresh
+  one. Four projects in four folders stay four separate stores; nothing
+  lands in the source checkout.
+
+**Rule of thumb:** run `/workflow` (or the individual skills) from inside
+the project's folder the first time; after that, resume from anywhere.

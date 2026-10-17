@@ -433,11 +433,28 @@ def _fail(code: str, exc: Exception, exit_code: int) -> None:
     raise typer.Exit(exit_code)
 
 
-def _invoke(operation: Callable[[ApplicationContainer], Awaitable[Any]], *, operation_name: str) -> None:
+def _settings_for(project_id: str | None = None, *, candidate_id: str | None = None) -> Any:
+    """Settings anchored to the project's recorded data root, so --project
+    resume works from any working directory and projects never bleed into
+    each other's state (or into the source checkout)."""
+    from autoresearch.application.config import load_settings, resolve_settings
+
+    settings = load_settings()
+    if not project_id and candidate_id:
+        from autoresearch.storage.repository import ResearchRepository
+
+        probe = ResearchRepository(settings.database_path, settings.artifact_root)
+        row = probe.row("SELECT project_id FROM novelty_candidates WHERE id=?", (candidate_id,))
+        if row:
+            project_id = str(row["project_id"])
+    return resolve_settings(project_id)
+
+
+def _invoke(operation: Callable[[ApplicationContainer], Awaitable[Any]], *, operation_name: str, project_id: str | None = None, candidate_id: str | None = None) -> None:
     from autoresearch.application.progress import reset_sink, set_sink, stderr_sink
 
     async def execute() -> Any:
-        container = ApplicationContainer(load_settings())
+        container = ApplicationContainer(_settings_for(project_id, candidate_id=candidate_id))
         token = set_sink(stderr_sink)  # live progress → stderr JSON lines
         try:
             return await operation(container)
@@ -548,7 +565,7 @@ def review(
             "markdown_report": outcome.markdown_report,
         }
 
-    _invoke(operation, operation_name="review")
+    _invoke(operation, operation_name="review", project_id=project)
 
 
 @skill_app.command("novelty")
@@ -601,7 +618,7 @@ def novelty(
             "high_risk_candidate_id": portfolio.high_risk_candidate_id,
         }
 
-    _invoke(operation, operation_name="novelty")
+    _invoke(operation, operation_name="novelty", project_id=project)
 
 
 @skill_app.command("workflow")
@@ -635,7 +652,7 @@ def workflow(
         )
         return result
 
-    _invoke(operation, operation_name="workflow")
+    _invoke(operation, operation_name="workflow", project_id=project)
 experiment_app = typer.Typer(
     name="experiment",
     help="Falsifiable experiment lifecycle from a novelty candidate. Planning never executes code.",
@@ -678,7 +695,7 @@ def experiment_plan(
             "spec": _spec_summary(spec),
         }
 
-    _invoke(operation, operation_name="experiment/plan")
+    _invoke(operation, operation_name="experiment/plan", candidate_id=candidate_id)
 
 
 @experiment_app.command("validate")
@@ -701,7 +718,7 @@ def experiment_validate(
             "environment": _manifest_summary(manifest),
         }
 
-    _invoke(operation, operation_name="experiment/validate")
+    _invoke(operation, operation_name="experiment/validate", candidate_id=candidate_id)
 
 
 @experiment_app.command("implement")
@@ -714,7 +731,7 @@ def experiment_implement(
         _require_candidate(c, candidate_id)
         return await c.experiment.implement_candidate(candidate_id)
 
-    _invoke(operation, operation_name="experiment/implement")
+    _invoke(operation, operation_name="experiment/implement", candidate_id=candidate_id)
 
 
 @experiment_app.command("approve")
@@ -755,7 +772,7 @@ def experiment_approve(
             "preview": _approval_preview(preview),
         }
 
-    _invoke(operation, operation_name="experiment/approve")
+    _invoke(operation, operation_name="experiment/approve", candidate_id=candidate_id)
 
 
 def _approval_preview(preview: dict[str, Any]) -> dict[str, Any]:
@@ -799,7 +816,7 @@ def experiment_execute(
             "jobs": jobs,
         }
 
-    _invoke(operation, operation_name="experiment/execute")
+    _invoke(operation, operation_name="experiment/execute", candidate_id=candidate_id)
 
 
 @experiment_app.command("inspect")
@@ -822,7 +839,7 @@ def experiment_inspect(
             "environment": _manifest_summary(manifest),
         }
 
-    _invoke(operation, operation_name="experiment/inspect")
+    _invoke(operation, operation_name="experiment/inspect", candidate_id=candidate_id)
 
 
 @experiment_app.command("report")
@@ -835,7 +852,7 @@ def experiment_report(
         _require_candidate(c, candidate_id)
         return await c.experiment.report_for_candidate(candidate_id)
 
-    _invoke(operation, operation_name="experiment/report")
+    _invoke(operation, operation_name="experiment/report", candidate_id=candidate_id)
 
 
 @skill_app.command("manuscript")
@@ -847,7 +864,7 @@ def skill_manuscript(
     async def operation(c: ApplicationContainer) -> dict[str, Any]:
         return await c.manuscript.generate(project)
 
-    _invoke(operation, operation_name="skill/manuscript")
+    _invoke(operation, operation_name="skill/manuscript", project_id=project)
 
 
 @experiment_app.command("cancel")
@@ -863,7 +880,7 @@ def experiment_cancel(
         c.repository.cancel_run(run_id)
         return {"run_id": run_id, "status": "cancelled"}
 
-    _invoke(operation, operation_name="experiment/cancel")
+    _invoke(operation, operation_name="experiment/cancel", candidate_id=candidate_id)
 
 
 skill_app.add_typer(experiment_app)

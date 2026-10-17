@@ -30,8 +30,9 @@ from autoresearch.application.manuscript import (
     run_template_audit,
 )
 
-SKILLS_DIR = Path(__file__).resolve().parents[1] / "src" / "autoresearch" / "skills" / "manuscript"
-assert TEMPLATE_SPEC_PATH == SKILLS_DIR / "template-spec.json"
+# The spec ships inside the package (works from source AND installed wheels);
+# resolve it from the module, never from a repo-relative path.
+assert TEMPLATE_SPEC_PATH.is_file(), f"template-spec.json missing at {TEMPLATE_SPEC_PATH}"
 
 
 def _norm(text: str) -> str:

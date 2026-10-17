@@ -29,6 +29,8 @@ INTEGRATION_CATALOG: dict[str, dict[str, object]] = {
     "deepseek": {
         "kind": "openai_compatible",
         "base_url": "https://api.deepseek.com/v1",
+        # deepseek-chat supports json_object; json_schema is rejected with 400.
+        "structured_output_mode": "json_object",
         "models": {
             "literature_extraction": "deepseek-chat",
             "research_reasoning": "deepseek-chat",

@@ -5,6 +5,8 @@ from __future__ import annotations
 import os
 import tomllib
 from dataclasses import dataclass
+import json
+import os
 from pathlib import Path
 
 
@@ -93,4 +95,57 @@ def load_settings() -> Settings:
         discovery_citation_anchors=_positive_int(research.get("discovery_citation_anchors")) or 5,
         discovery_citation_neighbors=_positive_int(research.get("discovery_citation_neighbors")) or 10,
         review_ensemble=True if review_ensemble is None else review_ensemble,
+    )
+
+
+def resolve_settings(project_id: str | None = None) -> Settings:
+    """Settings anchored to a project's recorded data root.
+
+    Projects remember the directory their state lives in (recorded at
+    creation). Resuming with --project therefore works from ANY working
+    directory: the command re-opens the database where the project actually
+    lives instead of silently starting a fresh one.
+    """
+    from pathlib import Path as _Path
+
+    settings = load_settings()
+    if not project_id:
+        return settings
+    root_raw: str | None = None
+    # 1) machine-local registry: works from any working directory.
+    registry_path = _Path(os.environ.get(
+        "AUTORESEARCH_REGISTRY_PATH", str(_Path.home() / ".autoresearch" / "project-registry.json"),
+    )).expanduser()
+    try:
+        if registry_path.is_file():
+            payload = json.loads(registry_path.read_text(encoding="utf-8"))
+            root_raw = str(payload.get(str(project_id))) if isinstance(payload, dict) and payload.get(str(project_id)) else None
+    except (OSError, ValueError):
+        root_raw = None
+    # 2) fallback: the project row in the current default database. If
+    # found there, lazily register it so the NEXT resume works from anywhere.
+    if not root_raw:
+        from autoresearch.storage.repository import ResearchRepository, _register_project_root
+
+        probe = ResearchRepository(settings.database_path, settings.artifact_root)
+        row = probe.row("SELECT state_db_path FROM projects WHERE id=?", (project_id,))
+        if row:
+            root_raw = str(row.get("state_db_path") or settings.database_path)
+            try:
+                _register_project_root(str(project_id), root_raw)
+            except Exception:
+                pass
+    if not root_raw:
+        return settings
+    database = _Path(root_raw).expanduser().resolve()
+    if database == settings.database_path.resolve():
+        return settings
+    from dataclasses import replace
+
+    return replace(
+        settings,
+        data_root=database.parent,
+        database_path=database,
+        artifact_root=database.parent / "artifacts",
+        download_root=database.parent / "downloads",
     )

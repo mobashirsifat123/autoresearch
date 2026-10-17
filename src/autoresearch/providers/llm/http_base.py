@@ -132,7 +132,18 @@ class HTTPProviderBase:
                         delay = None
                     throttle_delay = delay
                     request_id = response.headers.get("x-request-id") or response.headers.get("request-id")
-                    raise ProviderError(f"Provider returned HTTP {response.status_code}.", kind_for_status(response.status_code), self.name, response.status_code, request_id, delay)
+                    detail = ""
+                    if response.status_code < 500:
+                        # 4xx bodies explain the rejection (missing mode,
+                        # bad model name, expired key…) — surface a bounded,
+                        # sanitized snippet so failures are self-diagnosing.
+                        body = (response.text or "").strip()[:300]
+                        if body:
+                            detail = f" detail: {body}"
+                    raise ProviderError(
+                        f"Provider returned HTTP {response.status_code}.{detail}",
+                        kind_for_status(response.status_code), self.name, response.status_code, request_id, delay,
+                    )
                 try:
                     payload = response.json()
                 except ValueError as exc:

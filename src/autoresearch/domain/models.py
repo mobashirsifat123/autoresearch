@@ -94,6 +94,10 @@ class Project:
     id: str
     title: str
     created_at: str = field(default_factory=utc_now)
+    # Exact database path this project's state lives in (recorded at
+    # creation; lets later commands anchor to the project from any working
+    # directory, even with a custom database path).
+    state_db_path: str | None = None
 
 
 @dataclass(frozen=True)
