@@ -86,10 +86,29 @@ class WorkflowService:
             dispositions.append({"stage": stage, "status": status, **ids})
             self._emit_progress(stage, status, until)
 
+        async def stage_invoke(stage: str, operation, *, retry_transient: bool = True):
+            """Run one stage call with resilience semantics:
+            - transient provider errors (throttle/timeout/outage) retry once;
+            - a hard failure is annotated with the stage name and re-raised
+              (the CLI classifies the ORIGINAL error, so exit codes stay
+              meaningful) — completed earlier stages remain reusable."""
+            from autoresearch.application.services import _with_transient_retry
+
+            try:
+                if retry_transient:
+                    return await _with_transient_retry(operation, operation_name=f"workflow stage {stage}")
+                return await operation()
+            except BaseException as exc:
+                try:
+                    exc.add_note(f"workflow stage: {stage}")
+                except AttributeError:  # pragma: no cover — non-Exception bases
+                    pass
+                raise
+
         # ---- Stage 0/1: discovery + review (produces the question/gap) ----
         project = project_id
         if project is None:
-            discovery = await self.discovery.discover(seed, limit=limit, max_cost_usd=max_cost_usd)
+            discovery = await stage_invoke("discovery", lambda: self.discovery.discover(seed, limit=limit, max_cost_usd=max_cost_usd))
             project = discovery.project_id
             record("discovery", "completed", project_id=project, run_id=discovery.run_id, papers=discovery.retrieved)
 
@@ -107,7 +126,7 @@ class WorkflowService:
             record("review", "reused", project_id=project, run_id=gap["run_id"], gap_id=gap["id"])
             record("question", "reused", gap_id=gap["id"], classification=gap["classification"])
         else:
-            review = await self.review.review(project, top_k=top_k, max_cost_usd=max_cost_usd)
+            review = await stage_invoke("review", lambda: self.review.review(project, top_k=top_k, max_cost_usd=max_cost_usd))
             gap = {"id": review.gap.id, "run_id": review.run_id, "classification": review.gap.classification.value}
             record("review", "completed", project_id=project, run_id=review.run_id,
                    gap_id=review.gap.id, report=review.json_report)
@@ -132,7 +151,25 @@ class WorkflowService:
             record("hypotheses", "reused", portfolio_id=portfolio_row.id,
                    candidates=[portfolio_row.low_risk_candidate_id, portfolio_row.balanced_candidate_id, portfolio_row.high_risk_candidate_id])
         else:
-            portfolio_id = await self.novelty.generate_portfolio(project, gap_id=str(gap["id"]))
+            # A dead novelty process leaves an orphaned 'running' run that
+            # blocks clean status forever; candidates and critiques are
+            # durable per run, and generation is cheap to restart.
+            self._retire_stale_running(project, PipelineKind.NOVELTY)
+
+            async def _generate_once():
+                return await self.novelty.generate_portfolio(project, gap_id=str(gap["id"]))
+
+            try:
+                portfolio_id = await stage_invoke("hypotheses", _generate_once)
+            except RuntimeError as exc:
+                # Zero candidates passing the gates is an HONEST outcome but
+                # also model-sample dependent: one bounded second sample is
+                # justified before reporting it as a dead end.
+                if "insufficient_evidence" in str(exc):
+                    record("hypotheses", "retrying", reason=str(exc)[:200])
+                    portfolio_id = await stage_invoke("hypotheses", _generate_once)
+                else:
+                    raise
             portfolio_row = self.repository.get_novelty_portfolio_by_id(str(portfolio_id))
             if portfolio_row is None:
                 raise RuntimeError(f"portfolio_missing_after_generation: {portfolio_id}")
@@ -158,9 +195,9 @@ class WorkflowService:
             )
             # The freeze attaches to the candidate's own novelty run via its
             # provenance; no extra mislabeled run is created.
-            freeze = await self.freezer.freeze(
+            freeze = await stage_invoke("methodology", lambda: self.freezer.freeze(
                 candidate, selection_rationale=rationale, portfolio_id=str(portfolio_row.id),
-            )
+            ))
             record("methodology", "completed", methodology_freeze_id=freeze.id, version=freeze.version,
                    candidate_id=freeze.candidate_id, artifact=freeze.artifact_path)
         if _STAGE_ORDER[until] <= _STAGE_ORDER["methodology"]:
@@ -189,13 +226,13 @@ class WorkflowService:
                        expected_freeze_id=freeze.id)
                 return self._result(project, dispositions, stopped_at="design",
                                     note="Resolve the spec conflict manually (new candidate or explicit spec removal) before re-planning.")
-            spec_id = await self.experiment.execute_candidate(candidate_id, mode="plan")
+            spec_id = await stage_invoke("design", lambda: self.experiment.execute_candidate(candidate_id, mode="plan"))
             spec = self.repository.get_experiment_spec(candidate_id)
             record("design", "replanned", spec_id=spec_id, gap_id=spec.gap_id,
                    methodology_freeze_id=spec.methodology_freeze_id,
                    previous_spec_id=spec_id)
         else:
-            spec_id = await self.experiment.execute_candidate(candidate_id, mode="plan")
+            spec_id = await stage_invoke("design", lambda: self.experiment.execute_candidate(candidate_id, mode="plan"))
             spec = self.repository.get_experiment_spec(candidate_id)
             record("design", "completed", spec_id=spec_id, gap_id=spec.gap_id,
                    methodology_freeze_id=spec.methodology_freeze_id)
@@ -233,7 +270,7 @@ class WorkflowService:
                                 note="Execution package prepared; approval required before any run.")
 
         try:
-            await self.experiment.execute_candidate(candidate_id, mode="execute")
+            await stage_invoke("experiment", lambda: self.experiment.execute_candidate(candidate_id, mode="execute"))
         except RuntimeError as exc:
             message = str(exc)
             record("experiment", "worker_unavailable" if "worker_unavailable" in message else "execution_failed",
@@ -262,8 +299,9 @@ class WorkflowService:
                                   "advance execution (with measurement ingestion and analysis) first",
                            candidate_id=candidate_id, spec_id=spec.id)
                 else:
+                    self._retire_stale_running(project, PipelineKind.MANUSCRIPT)
                     try:
-                        outcome = await self.manuscript.generate(project)
+                        outcome = await stage_invoke("manuscript", lambda: self.manuscript.generate(project))
                         record("manuscript", str(outcome.get("status", "unknown")),
                                manuscript_id=outcome.get("manuscript_id"),
                                decision=outcome.get("decision"),
@@ -274,6 +312,19 @@ class WorkflowService:
         return self._result(project, dispositions, stopped_at=until)
 
     # ------------------------------------------------------------------
+
+    def _retire_stale_running(self, project_id: str, kind: PipelineKind) -> None:
+        """Cancel orphaned 'running' runs of a kind before starting new work.
+
+        A killed process leaves its run marked running forever, which blocks
+        clean status and confuses reuse. Durable artifacts (candidates,
+        checkpoints, analyses) are reused across runs, so retiring an orphan
+        loses nothing."""
+        for row in self.repository.rows(
+            "SELECT id FROM pipeline_runs WHERE project_id=? AND kind=? AND status=?",
+            (project_id, kind.value, RunStatus.RUNNING.value),
+        ):
+            self.repository.cancel_run(row["id"])
 
     def _latest_report_for_candidate(self, candidate_id: str) -> dict[str, Any] | None:
         """Latest experiment report keyed through the candidate's spec run
