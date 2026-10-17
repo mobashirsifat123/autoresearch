@@ -252,12 +252,22 @@ def run_template_audit(
             body == expected,
             f"sections in template order: {body} (expected {expected})",
         )
-        record(
-            "abstract_keywords_before_introduction",
-            names.index("Abstract") < names.index("Introduction")
-            and names.index("Keywords") < names.index("Introduction"),
-            "Abstract and Keywords precede Introduction",
-        )
+        missing_front = [
+            name for name in ("Abstract", "Keywords", "Introduction") if name not in names
+        ]
+        if missing_front:
+            record(
+                "abstract_keywords_before_introduction",
+                False,
+                f"missing required section(s): {missing_front}",
+            )
+        else:
+            record(
+                "abstract_keywords_before_introduction",
+                names.index("Abstract") < names.index("Introduction")
+                and names.index("Keywords") < names.index("Introduction"),
+                "Abstract and Keywords precede Introduction",
+            )
         title_words = _word_count(title)
         record(
             "title_word_count",
@@ -792,8 +802,51 @@ class ManuscriptService:
             if writer_report.get("used_model_draft") and writer_report.get(
                 "markdown_path"
             ):
-                markdown_path = Path(str(writer_report["markdown_path"]))
-                markdown = markdown_path.read_text(encoding="utf-8")
+                candidate_path = Path(str(writer_report["markdown_path"]))
+                shipped_audit = run_template_audit(
+                    candidate_path.read_text(encoding="utf-8"),
+                    complete=True,
+                    literature_evidence=bool(papers or claims),
+                    figure_paths=tuple([figure_svg] if figure_svg else []),
+                )
+                if not shipped_audit.passed:
+                    # The sidecar audit must describe the SHIPPED text; a model
+                    # draft that fails the re-audit is discarded and the
+                    # deterministic draft restored — never shipped silently.
+                    writer_report["used_model_draft"] = False
+                    writer_report["fallback"] = "deterministic"
+                    writer_report["reason"] = (
+                        "template audit failed on the final model draft; "
+                        "deterministic draft restored"
+                    )
+                    markdown_path.write_text(markdown, encoding="utf-8")
+                    writer_report["markdown_path"] = None
+                else:
+                    markdown = candidate_path.read_text(encoding="utf-8")
+                    writer_report["template_audit"] = {
+                        "audited": "shipped manuscript.md (model draft)",
+                        "passed": shipped_audit.passed,
+                        "violations": shipped_audit.violations,
+                        "checks": shipped_audit.checks,
+                    }
+                    # template_audit.json always describes the shipped text.
+                    audit_path.write_text(
+                        json.dumps(
+                            {
+                                "kind": "template_audit",
+                                "template": "FastTrack Academic Research Paper Template",
+                                "spec": str(TEMPLATE_SPEC_PATH),
+                                "audited": "shipped manuscript.md (model draft, writer mode)",
+                                "passed": shipped_audit.passed,
+                                "violations": shipped_audit.violations,
+                                "checks": shipped_audit.checks,
+                                "inside_out_order": inside_out,
+                            },
+                            indent=2,
+                            ensure_ascii=False,
+                        ),
+                        encoding="utf-8",
+                    )
             audit_path = root / "writing_audit.json"
             audit_path.write_text(
                 json.dumps(writer_report, indent=2, default=str), encoding="utf-8"
@@ -2384,6 +2437,7 @@ class ManuscriptService:
             draft, literature_evidence=bool(papers), figure_svg=figure_svg
         )
         audit: dict[str, Any] = {"attempts": [], "fallback": None}
+        audit["attempts"].append({"violations": violations, "template": template_violations})
         if self._violation_total(violations, template_violations):
             revision_messages = draft_messages[:1] + [
                 draft_messages[1],
@@ -2414,9 +2468,9 @@ class ManuscriptService:
             template_violations = self._template_violations(
                 draft, literature_evidence=bool(papers), figure_svg=figure_svg
             )
-        audit["attempts"].append(
-            {"violations": violations, "template": template_violations}
-        )
+            audit["attempts"].append(
+                {"violations": violations, "template": template_violations}
+            )
         if self._violation_total(violations, template_violations):
             audit["fallback"] = "deterministic"
             return {

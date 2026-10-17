@@ -348,3 +348,139 @@ def test_title_construction_bounds_and_keyword():
     # No keywords available: honest fallback still avoids vague blocklist terms.
     bare = ManuscriptService._title(candidate, complete=True, keywords=[])
     assert "an evidence-backed evaluation" in bare
+
+
+# ----------------------------------------------------------------------
+# model-writer mode: deterministic template gate + bounded fallback
+# ----------------------------------------------------------------------
+
+class _StubRouter:
+    """Fake ModelRouter returning scripted texts in call order (outline,
+    draft, revision...)."""
+
+    def __init__(self, texts):
+        self.texts = list(texts)
+        self.calls = 0
+
+    async def complete(self, role, *, messages=None, project_id=None,
+                       prompt_version=None, operation=None):
+        text = self.texts[min(self.calls, len(self.texts) - 1)]
+        self.calls += 1
+        return SimpleNamespace(text=text)
+
+
+def _model_service(tmp_path, texts):
+    from autoresearch.storage.repository import ResearchRepository
+
+    repository = ResearchRepository(tmp_path / "state.sqlite3", tmp_path / "artifacts")
+    return ManuscriptService(repository, router=_StubRouter(texts), writer_mode="model")
+
+
+_TEMPLATE_VIOLATING_DRAFT = (
+    "# An Analysis of robustness\n\n"
+    "## Abstract\n\n**Background:** This abstract is far too short.\n\n"
+    "## Keywords\n\none, two\n\n"
+    "## 1. Introduction\n\nintroduction text\n\n"
+    "## 3. Methodology\n\nmethods\n\n"
+    "## 4. Results\n\n| Metric | Baseline |\n|---|---|\n| accuracy | row |\n\nDecision gates: PASS.\n\n"
+    "## 5. Discussion\n\n### Recap of what we found\n\nsupported.\n\n"
+    "### Study Limitations (at least 3)\n1. one\n2. two\n\n"
+    "### Strengths of this study\n\n- s\n\n### Implications for future research\n\n- f\n\n"
+    "### Possible interpretations and future work (speculative)\n\n- p\n\n### Conclusion\n\nDecision: supported.\n"
+    "## References\n\n- none.\n\n## Appendices\n\nappendix\n"
+)
+
+_SECTIONLESS_DRAFT = (
+    "# Bare: a preregistered evaluation of robustness\n\n"
+    "## Results\n\nDecision gates: PASS.\n\n"
+    "## Discussion\n\nsupported.\n"
+)
+
+
+def _model_kwargs(tmp_path):
+    return {
+        "root": tmp_path,
+        "project": SimpleNamespace(id="p1"),
+        "markdown": "deterministic draft text",
+        "analysis": None,
+        "spec": None,
+        "papers": [],
+        "keys": {},
+        "gap": None,
+        "counter_claims": [],
+        "methodology": None,
+        "report": None,
+        "gaps": [],
+        "tables_md": "",
+        "decision": "supported",
+        "limitations": ["limitation one", "limitation two", "limitation three"],
+        "keywords": ["robustness"],
+        "figure_svg": None,
+        "review_notes": {},
+        "seed": None,
+    }
+
+
+async def test_model_draft_template_violations_fall_back_after_one_revision(tmp_path):
+    service = _model_service(
+        tmp_path, ["outline text", _TEMPLATE_VIOLATING_DRAFT, _TEMPLATE_VIOLATING_DRAFT]
+    )
+    result = await service._model_draft(**_model_kwargs(tmp_path))
+    assert result["used_model_draft"] is False
+    assert result["audit"]["fallback"] == "deterministic"
+    assert "deterministic draft kept" in result["reason"]
+    # Both the pre- and post-revision attempts are recorded, never overwritten.
+    assert len(result["audit"]["attempts"]) == 2
+    first, second = result["audit"]["attempts"]
+    assert first["template"], "first attempt must record its template violations"
+    assert second["template"], "revision must record its template violations"
+
+
+async def test_model_draft_missing_sections_falls_back_without_crash(tmp_path):
+    """A draft missing whole sections (Abstract/Keywords/Introduction) must
+    be recorded as a template violation and fall back — never raise out of
+    the audit (regression for names.index(...) on missing sections)."""
+    service = _model_service(
+        tmp_path, ["outline text", _SECTIONLESS_DRAFT, _SECTIONLESS_DRAFT]
+    )
+    result = await service._model_draft(**_model_kwargs(tmp_path))
+    assert result["used_model_draft"] is False
+    assert result["audit"]["fallback"] == "deterministic"
+    assert len(result["audit"]["attempts"]) == 2
+    assert any(
+        "abstract_keywords_before_introduction" in violation
+        for violation in result["audit"]["attempts"][0]["template"]
+    )
+
+
+async def test_model_draft_conformant_draft_is_adopted(tmp_path):
+    papers = [{"id": "p1", "title": "Some Paper", "year": 2025, "method": "m", "abstract": ""}]
+    draft = _complete_manuscript()
+    draft = draft.replace("mean difference plus 0.0100", "mean difference measured")
+    draft = draft.replace("| accuracy | 0.8 | 0.81 |", "| accuracy | baseline | candidate |")
+    service = _model_service(tmp_path, ["outline text", draft])
+    kwargs = _model_kwargs(tmp_path)
+    kwargs["papers"] = papers
+    kwargs["keys"] = {"p1": "paper1"}
+    result = await service._model_draft(**kwargs)
+    assert result["used_model_draft"] is True, result["audit"]
+    assert result["markdown_path"]
+    assert Path(result["markdown_path"]).read_text(encoding="utf-8") == draft
+
+
+def test_violation_total_combines_audit_and_template(tmp_path):
+    clean = {"numbers": [], "citations": [], "overclaims": [], "decision_missing": False}
+    assert ManuscriptService._violation_total(clean, []) is False
+    assert ManuscriptService._violation_total(clean, ["template x"]) is True
+    assert ManuscriptService._violation_total({**clean, "numbers": ["1.5"]}, []) is True
+
+
+def test_template_violations_reports_none_for_conformant_draft(tmp_path):
+    service = _model_service(tmp_path, [])
+    assert service._template_violations(
+        _complete_manuscript(), literature_evidence=True, figure_svg=None
+    ) == []
+    violations = service._template_violations(
+        _TEMPLATE_VIOLATING_DRAFT, literature_evidence=False, figure_svg=None
+    )
+    assert violations, "the violating draft must produce template violations"
