@@ -145,7 +145,7 @@ def test_install_targets_are_validated():
     assert "Traceback" not in result.output
 
 
-def test_anthropic_unlimited_calls_use_model_maximum_not_8192():
+def test_anthropic_unlimited_calls_use_model_maximum_not_8192(monkeypatch):
     """Regression (owner-reported): the Anthropic protocol requires an explicit
     output cap; the old default of 8192 was eaten by glm-5.3's hidden reasoning
     and silently truncated every structured output — no skill could finish.
@@ -155,6 +155,8 @@ def test_anthropic_unlimited_calls_use_model_maximum_not_8192():
     import json as _json
 
     import httpx
+
+    monkeypatch.setenv("KEY_ENV", "hermetic-test-key")  # never rely on ambient credentials
 
     from autoresearch.providers.capabilities import Capability
     from autoresearch.providers.config import ProviderConfig
