@@ -534,6 +534,7 @@ def review(
 
     async def operation(c: ApplicationContainer) -> dict[str, Any]:
         outcome = await c.review.review(project, top_k=top_k, hierarchical=hierarchical, fresh=fresh, max_runtime_seconds=max_runtime_seconds)
+        from autoresearch.review.matrix import project_keywords
         return {
             "project_id": outcome.project_id,
             "review_run_id": outcome.run_id,
@@ -541,6 +542,7 @@ def review(
             "reused_reviews": outcome.reused,
             "failed_reviews": outcome.failed,
             "top_paper_ids": list(outcome.top_paper_ids),
+            "keywords": project_keywords(c.repository, project_id=project, run_id=outcome.run_id),
             "gap": _gap_summary(outcome.gap),
             "json_report": outcome.json_report,
             "markdown_report": outcome.markdown_report,

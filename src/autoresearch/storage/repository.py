@@ -54,7 +54,7 @@ from autoresearch.domain.models import (
 )
 
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 
 
 class ResearchRepository:
@@ -127,6 +127,9 @@ class ResearchRepository:
             if current < 14:
                 connection.executescript(_SCHEMA_V14)
                 connection.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(?,?)", (14, utc_now()))
+            if current < 15:
+                connection.executescript(_SCHEMA_V15)
+                connection.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(?,?)", (15, utc_now()))
             latest = int(connection.execute("SELECT COALESCE(MAX(version), 0) FROM schema_migrations").fetchone()[0])
             if latest != SCHEMA_VERSION:
                 raise RuntimeError(f"Unsupported database schema v{latest}; expected v{SCHEMA_VERSION}.")
@@ -691,13 +694,27 @@ class ResearchRepository:
 
     def save_execution_result(self, result: ExecutionResult) -> None:
         self.execute(
-            "INSERT INTO execution_results(id,project_id,run_id,job_id,exit_code,stdout,stderr,structured_metrics_json,gpu_telemetry_json,checkpoint_manifest_json,failure_classification,provenance_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-            (result.id, result.project_id, result.run_id, result.job_id, result.exit_code, result.stdout, result.stderr, _json(result.structured_metrics), _json(result.gpu_telemetry), _json(result.checkpoint_manifest), result.failure_classification, _json_provenance(result.provenance))
+            "INSERT INTO execution_results(id,project_id,run_id,job_id,exit_code,stdout,stderr,structured_metrics_json,gpu_telemetry_json,checkpoint_manifest_json,failure_classification,command_json,provenance_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (result.id, result.project_id, result.run_id, result.job_id, result.exit_code, result.stdout, result.stderr, _json(result.structured_metrics), _json(result.gpu_telemetry), _json(result.checkpoint_manifest), result.failure_classification, result.command_json, _json_provenance(result.provenance))
         )
 
     def get_execution_result(self, job_id: str) -> ExecutionResult | None:
         row = self.row("SELECT * FROM execution_results WHERE job_id=?", (job_id,))
         return _execution_result(row) if row else None
+
+    def execution_commands_for_spec(self, spec_id: str) -> list[str]:
+        """Exact executed commands for a spec, from the executor's recorded
+        argv. Empty when nothing was executed (e.g. legacy rows); callers must
+        report absence honestly, never substitute a reconstructed command."""
+        commands: list[str] = []
+        for job in self.execution_jobs(spec_id):
+            result = self.get_execution_result(job.id)
+            if result is None:
+                continue
+            argv = _loads(result.command_json, None)
+            if isinstance(argv, list) and argv:
+                commands.append(" ".join(str(part) for part in argv))
+        return commands
 
     def save_statistical_analysis(self, analysis: StatisticalAnalysis) -> None:
         self.execute(
@@ -712,7 +729,7 @@ class ResearchRepository:
     def save_experiment_report(self, report: ExperimentReport) -> None:
         self.execute(
             "INSERT INTO experiment_reports(id,project_id,run_id,analysis_id,literature_motivation,research_gap,hypothesis,proposed_method,implementation_diff,lineage,dataset_split,exact_commands_json,baseline_results_json,aggregated_results_json,uncertainty,ablations,robustness_tests,failed_runs,cost,limitations,reproducibility_instructions,decision,decision_evidence,provenance_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (report.id, report.project_id, report.run_id, report.analysis_id, report.literature_motivation, report.research_gap, report.hypothesis, report.proposed_method, report.implementation_diff, report.lineage, report.dataset_split, _json(report.exact_commands), _json(report.baseline_results), _json(report.aggregated_results), report.uncertainty, report.ablations, report.robustness_tests, report.failed_runs, report.cost, report.limitations, report.reproducibility_instructions, report.decision.value, report.decision_evidence, _json_provenance(report.provenance))
+            (report.id, report.project_id, report.run_id, report.analysis_id, report.literature_motivation, report.research_gap, report.hypothesis, report.proposed_method, report.implementation_diff, report.lineage, report.dataset_split, _json(report.exact_commands), _json(report.baseline_results), _json(report.aggregated_results), report.uncertainty, report.ablations, report.robustness_tests, report.failed_runs, report.cost, _json(report.limitations), report.reproducibility_instructions, report.decision.value, report.decision_evidence, _json_provenance(report.provenance))
         )
 
     def get_experiment_report(self, analysis_id: str) -> ExperimentReport | None:
@@ -970,7 +987,7 @@ def _execution_job(row: dict[str, Any]) -> ExecutionJob:
     return ExecutionJob(row["id"], row["project_id"], row["run_id"], row["spec_id"], row["worker"], row["stage"], RunStatus(row["status"]), row["started_at"], row["completed_at"], int(row["timeout_seconds"]), row["retry_policy"])
 
 def _execution_result(row: dict[str, Any]) -> ExecutionResult:
-    return ExecutionResult(row["id"], row["project_id"], row["run_id"], row["job_id"], int(row["exit_code"]), row["stdout"], row["stderr"], _loads(row["structured_metrics_json"], {}), _loads(row["gpu_telemetry_json"], {}), tuple(_loads(row["checkpoint_manifest_json"], [])), row["failure_classification"], _provenance(row["provenance_json"]))
+    return ExecutionResult(row["id"], row["project_id"], row["run_id"], row["job_id"], int(row["exit_code"]), row["stdout"], row["stderr"], _loads(row["structured_metrics_json"], {}), _loads(row["gpu_telemetry_json"], {}), tuple(_loads(row["checkpoint_manifest_json"], [])), row["failure_classification"], _provenance(row["provenance_json"]), command_json=str(row.get("command_json") or ""))
 
 def _finding(row: dict[str, Any]) -> ResearchFinding:
     return ResearchFinding(
@@ -1006,8 +1023,17 @@ def _statistical_analysis(row: dict[str, Any]) -> StatisticalAnalysis:
         evidence_status=str(row.get("evidence_status") or assessment or "INSUFFICIENT_EVIDENCE"),
     )
 
+def _report_limitations(value: Any) -> tuple[str, ...]:
+    """Limitations column: JSON list for new reports, legacy plain text for
+    pre-v15 rows. Never returns an invented entry."""
+    parsed = _loads(value, None)
+    if isinstance(parsed, list):
+        return tuple(str(item) for item in parsed if str(item).strip())
+    return (str(value),) if value else ()
+
+
 def _experiment_report(row: dict[str, Any]) -> ExperimentReport:
-    return ExperimentReport(row["id"], row["project_id"], row["run_id"], row["analysis_id"], row["literature_motivation"], row["research_gap"], row["hypothesis"], row["proposed_method"], row["implementation_diff"], row["lineage"], row["dataset_split"], tuple(_loads(row["exact_commands_json"], [])), _loads(row["baseline_results_json"], {}), _loads(row["aggregated_results_json"], {}), row["uncertainty"], row["ablations"], row["robustness_tests"], int(row["failed_runs"]), float(row["cost"]), row["limitations"], row["reproducibility_instructions"], ExperimentDecision(row["decision"]), row["decision_evidence"], _provenance(row["provenance_json"]))
+    return ExperimentReport(row["id"], row["project_id"], row["run_id"], row["analysis_id"], row["literature_motivation"], row["research_gap"], row["hypothesis"], row["proposed_method"], row["implementation_diff"], row["lineage"], row["dataset_split"], tuple(_loads(row["exact_commands_json"], [])), _loads(row["baseline_results_json"], {}), _loads(row["aggregated_results_json"], {}), row["uncertainty"], row["ablations"], row["robustness_tests"], int(row["failed_runs"]), float(row["cost"]), _report_limitations(row["limitations"]), row["reproducibility_instructions"], ExperimentDecision(row["decision"]), row["decision_evidence"], _provenance(row["provenance_json"]))
 
 
 def _reinvention_analysis(row: dict[str, Any]) -> ReinventionAnalysis:
@@ -1655,4 +1681,11 @@ provenance_json TEXT NOT NULL,
 created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS research_findings_project_idx ON research_findings(project_id, status, created_at);
+"""
+
+# V15 (additive): persist the executor's exact argv so the manuscript
+# Appendices can list exact commands from the durable record instead of
+# reconstructing (or inventing) them.
+_SCHEMA_V15 = """
+ALTER TABLE execution_results ADD COLUMN command_json TEXT NOT NULL DEFAULT '';
 """

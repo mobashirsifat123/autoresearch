@@ -155,7 +155,7 @@ def _responder(messages):
         return {"counter_evidence_claim_ids": [], "analysis": "No contradicting claims found."}
     if "gap-selection-v1" in prompt:
         return {"selected_index": 0, "selection_rationale": "Candidate 0 is precise and strongly supported."}
-    if "methodology-freeze-v1" in prompt:
+    if "methodology-freeze-v" in prompt:
         bracketed = re.findall(r"\[([^\]]+)\]", prompt)
         claim_ids = [b for b in bracketed if len(b) == 32 and re.fullmatch(r"[a-f0-9]+", b)]
         paper_ids = [b for b in bracketed if b not in claim_ids]
@@ -280,3 +280,101 @@ async def test_five_skill_loop_runs_end_to_end_offline(tmp_path):
     assert record is not None and Path(record.markdown_path).is_file()
     findings = repository.findings_for_project(first["project_id"])
     assert findings, "Findings Memory must record the analyzed outcome"
+
+
+@pytest.mark.anyio
+async def test_manuscript_satisfies_fasttrack_template_end_to_end(tmp_path):
+    """The generated manuscript must satisfy the FastTrack Academic Research
+    Paper Template (template-spec.json) — enforced deterministically, with
+    the audit persisted and the evidence bundle carrying keywords,
+    limitations, exact commands, and the figure."""
+    import json
+
+    from autoresearch.application.manuscript import run_template_audit
+    from autoresearch.review.matrix import project_keywords
+
+    repository, workflow, seed = _build_loop(tmp_path)
+    first = await workflow.run(seed=str(seed), until="design")
+    candidate_id = next(s for s in first["stages"] if s["stage"] == "methodology")["candidate_id"]
+    preview = workflow.experiment.approval_preview_for_candidate(candidate_id)
+    saved = repository.save_exact_approval({
+        "id": uuid4().hex, "run_id": preview["run_id"], "specification_checksum": str(preview["checksum"]),
+        "approver": "smoke-test", "approved_scope": "workspace", "approved_target": str(preview["worker"]),
+        "approved_budget": 60.0, "expires_at": "2099-01-01T00:00:00+00:00", "status": "pending",
+    })
+    repository.approve_exact(saved["id"], approver="smoke-test")
+    result = await workflow.run(project_id=first["project_id"], until="manuscript")
+    stages = {s["stage"]: s for s in result["stages"]}
+    assert stages["manuscript"]["status"] == "complete", stages["manuscript"]
+
+    record = repository.latest_manuscript(first["project_id"])
+    markdown = Path(record.markdown_path).read_text(encoding="utf-8")
+    root = Path(record.markdown_path).parent
+
+    # 1. Template audit persisted and passing.
+    audit_path = root / "template_audit.json"
+    assert audit_path.is_file(), "template_audit.json must be persisted"
+    audit_payload = json.loads(audit_path.read_text(encoding="utf-8"))
+    assert audit_payload["passed"], audit_payload["violations"]
+    assert audit_payload["inside_out_order"][:3] == ["Methodology", "Results", "Discussion"]
+    assert audit_payload["inside_out_order"].index("Introduction") < audit_payload["inside_out_order"].index("Abstract")
+
+    # 2. Abstract: six labeled parts, 150-250 words.
+    for label in ("Background", "Gap in Knowledge", "Contribution", "Population & Methods", "Results", "Conclusion"):
+        assert f"**{label}:**" in markdown, f"abstract missing part {label}"
+    abstract_words = len(re.findall(r"[A-Za-z0-9][A-Za-z0-9'’-]*", markdown.split("## Keywords")[0].split("## Abstract")[1]))
+    assert 150 <= abstract_words <= 250, abstract_words
+
+    # 3. Keywords: 3-6 terms.
+    keywords_section = markdown.split("## Keywords")[1].split("## 1. Introduction")[0]
+    terms = [t.strip().rstrip(";,") for t in re.split(r"[,\n]", keywords_section) if t.strip().rstrip(";,")]
+    assert 3 <= len(terms) <= 6, terms
+
+    # 4. Discussion: at least 3 numbered limitations + required subsections.
+    discussion = markdown.split("## 5. Discussion")[1].split("## References")[0]
+    limitations_block = re.search(r"### Study Limitations[^\n]*\n(.*?)(?=\n### |\Z)", discussion, re.DOTALL).group(1)
+    assert len(re.findall(r"^\d+\.\s", limitations_block, re.MULTILINE)) >= 3
+    for part in ("### Recap of what we found", "### Strengths of this study", "### Implications for future research"):
+        assert part in discussion
+
+    # 5. Section order follows the template.
+    headings = re.findall(r"^## (.+)$", markdown, re.MULTILINE)
+    body = [re.sub(r"^\d+\.\s*", "", h) for h in headings]
+    expected = ["Introduction", "Literature Review", "Methodology", "Results", "Discussion", "References", "Appendices"]
+    assert [h for h in body if h in expected] == expected, body
+
+    # 6. Results: table + deterministic figure artifact.
+    assert "| Metric |" in markdown
+    figure = root / "figures" / "effect-sizes.svg"
+    assert figure.is_file()
+    assert "figures/effect-sizes.svg" in markdown
+
+    # 7. Title: <= 20 words, contains a keyword, no vague blocklist.
+    title = markdown.splitlines()[0].removeprefix("# ").strip()
+    assert len(re.findall(r"[A-Za-z0-9][A-Za-z0-9'’-]*", title)) <= 20, title
+    assert any(re.search(rf"\b{re.escape(t.lower())}\b", title.lower()) for t in terms), title
+    for vague in ("an analysis", "a study of", "an investigation", "new insights"):
+        assert vague not in title.lower()
+
+    # 8. Results contains no interpretation words.
+    results_section = markdown.split("## 4. Results")[1].split("## 5. Discussion")[0].lower()
+    for word in ("shows that", "suggests", "demonstrates the importance", "because", "indicates", "implies"):
+        assert word not in results_section, word
+
+    # 9. Evidence bundle carries keywords, >= 3 limitations, figures.
+    bundle = json.loads(Path(record.evidence_bundle_path).read_text(encoding="utf-8"))
+    assert 3 <= len(bundle["keywords"]) <= 6
+    assert len(bundle["limitations"]) >= 3
+    assert bundle["figures"] == ["figures/effect-sizes.svg"]
+
+    # 10. Experiment report carries >= 3 limitation rows (list format).
+    spec = repository.get_experiment_spec(candidate_id)
+    analysis = repository.get_statistical_analysis(spec.id)
+    report = repository.get_experiment_report(analysis.id)
+    assert len(report.limitations) >= 3
+    assert all(item.strip() for item in report.limitations)
+
+    # 11. Review produced project keywords (3-6) in the evidence matrix.
+    review_run_id = next(s for s in first["stages"] if s["stage"] == "review")["run_id"]
+    keywords = project_keywords(repository, project_id=first["project_id"], run_id=review_run_id)
+    assert 3 <= len(keywords) <= 6, keywords

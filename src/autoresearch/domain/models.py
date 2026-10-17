@@ -601,6 +601,7 @@ class ExecutionResult:
     provenance: ArtifactProvenance
     identity: Mapping[str, Any] = field(default_factory=dict)
     artifacts: tuple[Mapping[str, Any], ...] = ()
+    command_json: str = ""
 
 
 @dataclass(frozen=True)
@@ -647,7 +648,7 @@ class ExperimentReport:
     robustness_tests: str
     failed_runs: int
     cost: float
-    limitations: str
+    limitations: tuple[str, ...]
     reproducibility_instructions: str
     decision: ExperimentDecision
     decision_evidence: str

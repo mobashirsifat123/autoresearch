@@ -63,6 +63,16 @@ claim novelty — it surfaces evidence of overlap and preserves ambiguity.
 5. **Diversity-aware portfolio selection** — up to 3 candidates that pass
    the scientific gates are selected as low-risk, balanced, and high-risk tiers.
 
+6. **Methodology freeze** — the selected candidate is frozen into a
+   versioned methodology (`methodology-v{N}.json`) that fills the manuscript
+   template's Methodology fields: `study_design`, `data_collection`,
+   `sample_and_eligibility`, `data_analysis`, `ethical_considerations`
+   (plus hypothesis, mechanism, falsification conditions, algorithm
+   outline, procedure, resource demands, uncertainty). A field the model
+   does not supply is stored verbatim as `"not specified at freeze time"`
+   — the manuscript's Methodology renders that marker and lists the field
+   as a study limitation; it never invents the content.
+
 ## Usage
 
 ```bash
@@ -127,6 +137,10 @@ invent a percentage before a progress line arrives; report stalls honestly.
   passing the scientific gates qualify for selection.
 - **Never present a candidate as definitively novel** — the backend explicitly
   prohibits the wording "proven novel", "definitively novel", "first-ever".
+- The freeze records *what will be tested*; it never certifies novelty or
+  scientific truth. Template Methodology fields that are not recorded are
+  stored as `"not specified at freeze time"` and reported as limitations —
+  never invented.
 - If `low_risk_candidate_id` is null (all candidates failed gates), report
   that the pipeline produced no candidate meeting the scientific requirements.
 - If the `scientific_critic` role is unconfigured (check `skill doctor`),

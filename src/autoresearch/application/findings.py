@@ -21,10 +21,10 @@ Honesty rules:
 from __future__ import annotations
 
 import json
-import re
 from typing import Any
 from uuid import uuid4
 
+from autoresearch.application.keywords import keyword_tokens
 from autoresearch.domain.models import (
     ArtifactProvenance,
     ExperimentSpec,
@@ -36,13 +36,6 @@ from autoresearch.storage.repository import ResearchRepository
 
 FINDINGS_PROMPT_VERSION = "findings-memory-v1"
 
-_STOPWORDS = {
-    "the", "a", "an", "of", "and", "or", "to", "in", "on", "for", "with", "without",
-    "by", "as", "is", "are", "can", "does", "do", "not", "how", "what", "which",
-    "that", "this", "these", "those", "it", "its", "from", "at", "be", "using",
-    "into", "than", "then", "when", "where", "who", "why", "will", "would", "there",
-}
-
 _DECISION_STATUS = {
     "SUPPORTED": FindingStatus.CONFIRMED_FINDING,
     "REFUTED": FindingStatus.REFUTED_HYPOTHESIS,
@@ -52,12 +45,7 @@ _DECISION_STATUS = {
 
 
 def _keywords(*texts: str, limit: int = 12) -> list[str]:
-    words: list[str] = []
-    for text in texts:
-        for token in re.findall(r"[A-Za-z][A-Za-z0-9_-]{2,}", str(text or "").lower()):
-            if token not in _STOPWORDS and token not in words:
-                words.append(token)
-    return words[:limit]
+    return keyword_tokens(*texts, limit=limit)
 
 
 def _open_questions(block: dict[str, Any]) -> list[str]:

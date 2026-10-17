@@ -206,6 +206,16 @@ invent a percentage before a progress line arrives; report stalls honestly.
   `implementation_failure`, `optimization_failure`, `data_limitation`,
   `evaluation_artifact`, `cost_prohibitive`, `domain_specific`, `mechanism_contradicted`.
 - `decision_evidence` — the specific evidence for the decision.
+- `limitations` — at least 3 study-limitation rows (measurement provenance,
+  dataset/split/seed bounds, unrun ablations/robustness). The manuscript
+  Discussion lists them; observations and interpretations stay in separate
+  fields and are never merged.
+- `exact_commands` — the executor's recorded argv per job. The manuscript
+  Appendices list these verbatim; when none were recorded, that absence is
+  reported honestly, never reconstructed.
+
+Raw seed observations (checksummed) feed the manuscript Appendices
+("Raw seed metrics") through the evidence bundle.
 
 ### What to tell the user after each step
 
@@ -235,3 +245,6 @@ invent a percentage before a progress line arrives; report stalls honestly.
   claim the experiment succeeded — report the failure honestly.
 - Surface `decision_evidence` to the user verbatim; do not paraphrase the
   scientific conclusions.
+- The report must carry at least 3 study-limitation rows so the manuscript
+  Discussion can list them (template requirement); every row is an
+  objective fact about the run, never an invented weakness.

@@ -25,7 +25,7 @@ from autoresearch.providers.router import ModelRouter
 from autoresearch.review.evidence_context import build_evidence_context
 from autoresearch.storage.repository import ResearchRepository
 
-PROMPT_VERSION = "methodology-freeze-v1"
+PROMPT_VERSION = "methodology-freeze-v2"
 
 METHODOLOGY_SCHEMA = {
     "type": "object",
@@ -57,6 +57,14 @@ METHODOLOGY_SCHEMA = {
         "expected_resource_demands": {"type": "string"},
         "supporting_evidence_claim_ids": {"type": "array", "items": {"type": "string"}},
         "uncertainty_statement": {"type": "string", "description": "What remains uncertain about novelty and scientific validity; never empty"},
+        # FastTrack template Methodology fields (template-spec.json T061-T069):
+        # the manuscript Methodology section renders these verbatim; missing
+        # values are filled with an honest marker and reported as limitations.
+        "study_design": {"type": "string", "description": "Qualitative, quantitative, or mixed-methods study design"},
+        "data_collection": {"type": "string", "description": "Databases, inclusion/exclusion criteria, and search strategy"},
+        "sample_and_eligibility": {"type": "string", "description": "Study population and selection process"},
+        "data_analysis": {"type": "string", "description": "Analytical approach (thematic analysis, statistical tests, ...)"},
+        "ethical_considerations": {"type": "string", "description": "Ethical approvals or considerations (informed consent, ...)"},
     },
     "required": [
         "hypothesis_statement", "predicted_observations", "proposed_mechanism",
@@ -83,7 +91,14 @@ _FIELD_CONTRACT = (
     "- expected_resource_demands: string\n"
     "- supporting_evidence_claim_ids: array of claim IDs from the supplied evidence only\n"
     "- uncertainty_statement: string (mandatory, non-empty)\n"
-    "Every key must be present. Do not invent paper or claim IDs that were not supplied."
+    "- study_design: string (qualitative/quantitative/mixed-methods; the FastTrack template's Study Design field)\n"
+    "- data_collection: string (databases, inclusion/exclusion criteria, search strategy; the template's Data Collection field)\n"
+    "- sample_and_eligibility: string (study population and selection process; the template's Sample & Eligibility field)\n"
+    "- data_analysis: string (analytical approach; the template's Data Analysis field)\n"
+    "- ethical_considerations: string (ethical approvals or considerations; the template's Ethical Considerations field)\n"
+    "Every key must be present. Do not invent paper or claim IDs that were not supplied.\n"
+    "If a template field genuinely does not apply to this computational study, write exactly "
+    "'not specified at freeze time' — the manuscript reports it as a limitation, never invents it."
 )
 
 
@@ -244,6 +259,19 @@ def _validate(payload: dict, evidence_context: dict) -> dict:
     }
     for field, default in _LOGISTICS_DEFAULTS.items():
         if not payload.get(field):
+            payload[field] = default
+    # FastTrack template Methodology fields: honest markers when the model
+    # omits them. The manuscript Methodology reports these as limitations
+    # rather than inventing content (template-spec.json T061-T069).
+    _TEMPLATE_FIELD_DEFAULTS = {
+        "study_design": "not specified at freeze time",
+        "data_collection": "not specified at freeze time",
+        "sample_and_eligibility": "not specified at freeze time",
+        "data_analysis": "not specified at freeze time",
+        "ethical_considerations": "not specified at freeze time",
+    }
+    for field, default in _TEMPLATE_FIELD_DEFAULTS.items():
+        if not str(payload.get(field) or "").strip():
             payload[field] = default
     required = METHODOLOGY_SCHEMA["required"]
     missing = [key for key in required if not payload.get(key)]

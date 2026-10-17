@@ -17,10 +17,41 @@ import json
 from typing import Any
 from uuid import uuid4
 
+from autoresearch.application.keywords import keyword_tokens, pick_keywords
 from autoresearch.domain.models import ArtifactReference, content_checksum
 from autoresearch.storage.repository import ResearchRepository
 
 MATRIX_PROMPT_VERSION = "evidence-matrix-v1"
+
+
+def project_keywords(
+    repository: ResearchRepository,
+    *,
+    project_id: str,
+    run_id: str,
+) -> list[str]:
+    """Deterministic 3-6 keyword terms per project for the manuscript
+    Keywords block (template-spec.json T28). Derived ONLY from the stored
+    seed metadata and top-ranked paper titles — never invented. Returns as
+    many as the durable record honestly provides."""
+    seed = repository.get_seed(project_id)
+    seed_texts: list[str] = []
+    if seed is not None:
+        seed_texts = [
+            str(seed.topic),
+            str(seed.research_question),
+            ", ".join(seed.methods),
+            ", ".join(seed.datasets),
+        ]
+    titles = [
+        str(row["title"] or "")
+        for row in repository.rows(
+            "SELECT p.title AS title FROM priority_scores s JOIN papers p ON p.id = s.paper_id "
+            "WHERE s.run_id=? ORDER BY s.total DESC LIMIT 5",
+            (run_id,),
+        )
+    ]
+    return pick_keywords([keyword_tokens(*seed_texts), keyword_tokens(*titles)])
 
 
 def build_evidence_matrix(
@@ -85,6 +116,7 @@ def build_evidence_matrix(
             "topic": str(seed_row["topic"]) if seed_row else "",
             "task_question": str(seed_row["research_question"]) if seed_row else "",
             "review_run_id": run_id,
+            "keywords": project_keywords(repository, project_id=project_id, run_id=run_id),
             "inclusion": f"top-ranked papers extracted this run (matrix rows: {len(matrix)}); "
                          "full discovery corpus remains in the papers table",
             "research_to_code": "explicit links only; deep source-function mapping is future work",

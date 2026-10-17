@@ -98,6 +98,10 @@ After a successful run, the JSON contains:
 - `reviewed` — number of papers with verifiable evidence extracted.
 - `failed_reviews` — papers that had no verbatim-verifiable quotes (not an error).
 - `top_paper_ids` — ordered list of top-ranked paper IDs.
+- `keywords` — 3-6 deterministic project keywords (seed metadata + top
+  paper titles) persisted in the evidence matrix's `scope.keywords`; the
+  manuscript Keywords block is generated from these and the Findings
+  Memory — never invented terms.
 - `gap` — the highest-confidence research gap:
   - `gap.id` — **persist this**; it is the `--gap-id` for the `novelty` skill.
   - `gap.statement` — the precise gap statement to show the user.
@@ -106,6 +110,15 @@ After a successful run, the JSON contains:
   - `gap.supporting_paper_ids`, `gap.supporting_claim_ids` — evidence provenance.
   - `gap.counter_evidence_claim_ids` — opposing evidence (may be empty).
 - `json_report` / `markdown_report` — absolute paths to durable cited reports.
+
+The gap is written so the manuscript's Introduction can quote it directly:
+`gap.statement` + the seed topic/research question (relevance now),
+`why_unsolved` + counter-evidence claims (existing knowledge + the gap
+built from the review's recorded critiques), and `missing_experiment` +
+falsification test (what a study would do to fill it). Per-paper datasets,
+study design/protocol, and limitations are already recorded in
+`paper_reviews` and surfaced deterministically in the evidence matrix —
+the manuscript's Literature Review and Discussion read them from there.
 
 ### What to tell the user after a successful review
 
@@ -145,6 +158,9 @@ invent a percentage before a progress line arrives; report stalls honestly.
   global token ceiling; omit model output and provider thinking budgets.
   Never launch duplicate work while the current run is still active.
 - Quote only claims that appear in the report evidence; **never invent citations**.
+- Keywords are deterministic derivations (seed metadata + paper titles);
+  never invent terms to reach a count. If the durable record honestly
+  provides fewer than 3 terms, report that instead of padding.
 - If `gap.classification` is `hypothesis`, say so — do not present it as a proven gap.
 - If `failed_reviews` significantly exceeds `reviewed`, warn the user (PDFs may be
   image-only or paywalled, causing no verbatim excerpts to be found).

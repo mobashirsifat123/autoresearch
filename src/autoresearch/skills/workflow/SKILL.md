@@ -64,6 +64,18 @@ with the exact missing prerequisite instead of fabricating content. Every
 analyzed outcome is persisted to the shared Findings Memory, which
 conditions later novelty runs (failures and refutations first).
 
+The manuscript stage enforces the FastTrack Academic Research Paper
+Template (bundled `template-spec.json`): six-part 150-250-word abstract,
+3-6 evidence-derived keywords, three-part Introduction, conditional
+Literature Review, five-field cookbook Methodology, objective Results with
+tables + deterministic figure, Discussion with ≥ 3 limitations, References,
+Appendices, and the Inside-Out writing order — audited deterministically
+and fail-closed (`template_audit.json`). The upstream stages supply the
+evidence those rules consume: review (quotable gap + project keywords +
+per-paper study design/datasets/limitations), novelty (the five Methodology
+fields or honest "not specified at freeze time" markers), experiment
+(≥ 3 limitation rows + raw seed metrics + exact commands).
+
 ## Progress reporting
 
 While the skill runs, the CLI writes one JSON line per completed step to
