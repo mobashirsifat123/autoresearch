@@ -31,7 +31,8 @@ _TEX_UNICODE = {
 
 
 def _tex_text(value: Any) -> str:
-    text = str(value).replace("\\", r"\textbackslash{}")
+    text = str(value).replace("{", r"\{").replace("}", r"\}")
+    text = text.replace("\\", r"\textbackslash{}")
     text = (
         text.replace("&", r"\&")
         .replace("%", r"\%")
@@ -40,8 +41,6 @@ def _tex_text(value: Any) -> str:
         .replace("_", r"\_")
         .replace("^", r"\textasciicircum{}")
         .replace("~", r"\textasciitilde{}")
-        .replace("{", r"\{")
-        .replace("}", r"\}")
     )
     for symbol, latex in _TEX_UNICODE.items():
         text = text.replace(symbol, latex)

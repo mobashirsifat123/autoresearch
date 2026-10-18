@@ -2036,7 +2036,12 @@ class ManuscriptService:
         Unicode symbols are converted to math macros (which deliberately
         introduce $ and braces).
         """
-        text = str(value).replace("\\", r"\textbackslash{}")
+        # Escape raw braces FIRST (no macro has been introduced yet), then the
+        # remaining plain-text characters; the ^/~ macros below deliberately
+        # introduce braces and must come after that pass (observed live:
+        # escaping after them produced '\textasciicircum\{\}').
+        text = str(value).replace("{", r"\{").replace("}", r"\}")
+        text = text.replace("\\", r"\textbackslash{}")
         text = (
             text.replace("&", r"\&")
             .replace("%", r"\%")
@@ -2045,8 +2050,6 @@ class ManuscriptService:
             .replace("_", r"\_")
             .replace("^", r"\textasciicircum{}")
             .replace("~", r"\textasciitilde{}")
-            .replace("{", r"\{")
-            .replace("}", r"\}")
         )
         for symbol, latex in ManuscriptService._TEX_UNICODE.items():
             text = text.replace(symbol, latex)
