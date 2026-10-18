@@ -663,11 +663,20 @@ class ExperimentReport:
 class ManuscriptRecord:
     """A versioned manuscript over one exact research lineage.
 
-    ``status`` is ``complete`` only when every lineage prerequisite (review
-    gap, methodology freeze, experiment spec, statistical analysis, report)
-    existed at generation time; otherwise ``incomplete`` and ``gaps_json``
-    lists the precise missing evidence. Paths point at editable artifacts
-    (Markdown, LaTeX, BibTeX, tables, manifest, optional compiled PDF).
+    ``status`` distinguishes three states:
+
+    * ``complete`` — every lineage prerequisite existed AND the publication
+      readiness gate, quality gate, venue lint, body hygiene, and reviewer
+      panel passed; the manuscript is submission-ready.
+    * ``draft`` — the lineage is complete but at least one publication gate
+      failed (simulation evidence, missing provenance, no external baselines,
+      no power, no style exemplars, or reviewer-required fixes). It is an
+      editable draft, not a submission.
+    * ``incomplete`` — a lineage prerequisite is missing; ``gaps_json`` lists
+      the precise missing evidence.
+
+    Paths point at editable artifacts (Markdown, LaTeX, BibTeX, tables,
+    manifest, optional compiled PDF, and the gate sidecars).
     """
 
     id: str

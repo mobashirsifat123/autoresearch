@@ -54,6 +54,7 @@ _PM_STD = re.compile(r"±|\\pm")
 _P_VALUE = re.compile(r"\bp\s*[<=]\s*[\d.]+|\bp-value", re.IGNORECASE)
 _SEED = re.compile(r"\bseeds?\b|\bruns?\s+with\b", re.IGNORECASE)
 _BRACKET_CITE = re.compile(r"\[(\d{1,3})\]")
+_KEY_CITE = re.compile(r"\[@[-\w]+\]")
 _ET_AL = re.compile(r"\bet\s+al\.")
 
 
@@ -115,7 +116,9 @@ class ExemplarExtractor:
         figure_refs = [int(m) for m in _FIGURE_REF.findall(text)]
         bracket_cites = [int(m) for m in _BRACKET_CITE.findall(text)]
         citation_estimate = (
-            max(bracket_cites) if bracket_cites else len(_ET_AL.findall(text))
+            max(bracket_cites)
+            if bracket_cites
+            else (len(_KEY_CITE.findall(text)) or len(_ET_AL.findall(text)))
         )
         return PaperFeatures(
             paper_id=paper_id,

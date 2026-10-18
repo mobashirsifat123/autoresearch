@@ -10,6 +10,7 @@ from autoresearch.providers.factory import build_router
 from autoresearch.storage.repository import ResearchRepository
 from autoresearch.workers.local_typed import LocalTypedWorker
 
+from .config import Settings
 from .services import DiscoveryService, LiteratureReviewService, NoveltyService, ExperimentService
 from .manuscript import ManuscriptService
 from .workflow import WorkflowService
@@ -38,7 +39,13 @@ class ApplicationContainer:
         self.novelty = NoveltyService(self.repository, self.router, self.search_pipeline)
         self.worker = LocalTypedWorker(self.repository, settings.data_root / "workspace")
         self.experiment = ExperimentService(self.repository, self.router, settings.data_root / "workspace", worker=self.worker)
-        self.manuscript = ManuscriptService(self.repository, self.router, writer_mode=settings.manuscript_writer)
+        self.manuscript = ManuscriptService(
+            self.repository,
+            self.router,
+            writer_mode=settings.manuscript_writer,
+            venue_profile=settings.manuscript_venue,
+            download_root=settings.download_root,
+        )
         self.workflow = WorkflowService(
             self.repository, self.router,
             discovery=self.discovery, review=self.review, novelty=self.novelty,

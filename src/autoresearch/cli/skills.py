@@ -103,7 +103,7 @@ SKILLS = {
     "manuscript": SkillMeta(
         name="manuscript",
         version="1.0.0",
-        description="Stage-4 manuscript: deterministic, evidence-grounded draft (Markdown + LaTeX + BibTeX + tables + manifest) over the exact review→novelty→experiment lineage. Reports evidence gaps honestly; never fabricates results.",
+        description="Stage-4 manuscript: evidence-grounded, publication-readiness-gated draft (Markdown + LaTeX + BibTeX + tables + manifest) over the exact review→novelty→experiment lineage. Distinguishes a complete evidence chain from a submission-ready paper; reports evidence gaps and simulation/provenance blockers honestly.",
         entry='autoresearch skill manuscript --project <id>  # or: autoresearch skill workflow --project <id> --until manuscript',
     ),
 }
@@ -542,7 +542,7 @@ def _manifest_summary(manifest: EnvironmentManifest | None) -> dict[str, Any] | 
 @skill_app.command("review")
 def review(
     project: str = typer.Option(..., "--project", help="Project ID returned by discover."),
-    top_k: int = typer.Option(5, "--top-k", min=1, max=15),
+    top_k: int = typer.Option(5, "--top-k", min=1, max=40),
     hierarchical: bool = typer.Option(False, "--hierarchical/--flat", help="Chunk-level hierarchical review for long PDFs."),
     fresh: bool = typer.Option(False, "--fresh", help="Re-extract every paper review even when a verified one is reusable."),
     max_runtime_seconds: float | None = typer.Option(None, "--max-runtime-seconds", min=1, help="Optional total review deadline; unlimited when omitted."),
@@ -628,9 +628,11 @@ def workflow(
     project: str = typer.Option("", "--project", help="Existing project ID to resume/extend."),
     until: str = typer.Option("design", "--until", help="Stop after: review, question, hypotheses, methodology, design, experiment, or manuscript."),
     limit: int = typer.Option(20, "--limit", min=1, max=100),
-    top_k: int = typer.Option(5, "--top-k", min=1, max=15),
+    top_k: int = typer.Option(5, "--top-k", min=1, max=40),
     max_cost_usd: float | None = typer.Option(None, "--max-cost-usd", min=0.0, help="Cumulative project provider-cost hard stop (applies to this and later invocations)."),
     max_tokens: int | None = typer.Option(None, "--max-tokens", min=1, help="Project total-token ceiling (prompt+completion) across all provider calls."),
+    publication: bool = typer.Option(False, "--publication", help="Publication track: stop early when review/novelty/design gaps make a submission-grade paper impossible."),
+    venue: str = typer.Option("generic_journal", "--venue", help="Venue profile used by the publication contract."),
 ) -> None:
     """Advance one project through the full durable research cycle, reusing completed stages."""
 
@@ -649,6 +651,7 @@ def workflow(
             seed=seed, project_id=project_id, until=until,
             limit=limit, top_k=top_k, max_cost_usd=max_cost_usd,
             max_total_tokens=max_tokens,
+            publication_track=publication, venue_name=venue,
         )
         return result
 
@@ -679,12 +682,15 @@ def experiment_plan(
         spec_id = await c.experiment.execute_candidate(candidate_id, mode="plan", max_runtime_seconds=max_runtime_seconds)
         spec = c.repository.get_experiment_spec_by_id(spec_id)
         preview = c.experiment.approval_preview_for_candidate(candidate_id)
+        from autoresearch.experiments.publication_design import publication_design_gaps
+
         return {
             "spec_id": spec_id,
             "candidate_id": candidate_id,
             "run_id": spec.run_id,
             "status": "planned",
             "executed": False,
+            "publication_gaps": publication_design_gaps(spec),
             "approval_required": True,
             "approval": {
                 "worker": preview["worker"],

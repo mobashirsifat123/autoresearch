@@ -65,6 +65,19 @@ METHODOLOGY_SCHEMA = {
         "sample_and_eligibility": {"type": "string", "description": "Study population and selection process"},
         "data_analysis": {"type": "string", "description": "Analytical approach (thematic analysis, statistical tests, ...)"},
         "ethical_considerations": {"type": "string", "description": "Ethical approvals or considerations (informed consent, ...)"},
+        # Publication-grade design (recorded at freeze; missing values become
+        # explicit publication_gaps, never fabricated later).
+        "contribution_statement": {"type": "string"},
+        "novelty_delta": {"type": "string"},
+        "datasets": {"type": "array", "items": {"type": "string"}},
+        "baselines": {"type": "array", "items": {"type": "string"}},
+        "ablations": {"type": "array", "items": {"type": "string"}},
+        "robustness_tests": {"type": "array", "items": {"type": "string"}},
+        "power_analysis": {"type": "string"},
+        "one_dataset_justification": {"type": "string"},
+        "expected_figures_tables": {"type": "array", "items": {"type": "string"}},
+        "failure_modes": {"type": "array", "items": {"type": "string"}},
+        "stop_conditions": {"type": "array", "items": {"type": "string"}},
     },
     "required": [
         "hypothesis_statement", "predicted_observations", "proposed_mechanism",
@@ -96,6 +109,17 @@ _FIELD_CONTRACT = (
     "- sample_and_eligibility: string (study population and selection process; the template's Sample & Eligibility field)\n"
     "- data_analysis: string (analytical approach; the template's Data Analysis field)\n"
     "- ethical_considerations: string (ethical approvals or considerations; the template's Ethical Considerations field)\n"
+    "- contribution_statement: string (one sentence: what this paper contributes)\n"
+    "- novelty_delta: string (closest prior work and the precise difference)\n"
+    "- datasets: array of strings (>=2, or one_dataset_justification)\n"
+    "- baselines: array of strings (>=2 named external baselines)\n"
+    "- ablations: array of strings (>=1)\n"
+    "- robustness_tests: array of strings (>=1)\n"
+    "- power_analysis: string (effect size, variance assumption, target power, required seeds)\n"
+    "- one_dataset_justification: string (required only when datasets has one item)\n"
+    "- expected_figures_tables: array of strings (main result, ablation, comparison)\n"
+    "- failure_modes: array of strings (the strongest ways this design can fail)\n"
+    "- stop_conditions: array of strings (when to stop or declare the study inconclusive)\n"
     "Every key must be present. Do not invent paper or claim IDs that were not supplied.\n"
     "If a template field genuinely does not apply to this computational study, write exactly "
     "'not specified at freeze time' — the manuscript reports it as a limitation, never invents it."
@@ -192,6 +216,7 @@ class MethodologyFreezer:
             )
             payload = _validate(payload, evidence_context)
 
+        publication_gaps = publication_design_gaps(payload)
         previous = self.repository.latest_methodology_freeze_for_candidate(candidate.id)
         version = (previous.version + 1) if previous else 1
 
@@ -211,6 +236,17 @@ class MethodologyFreezer:
             "version": version,
             "selection_rationale": selection_rationale,
             "methodology": payload,
+            "publication_gaps": publication_gaps,
+            "publication_design": {
+                key: payload.get(key)
+                for key in (
+                    "contribution_statement", "novelty_delta", "datasets",
+                    "baselines", "ablations", "robustness_tests",
+                    "power_analysis", "one_dataset_justification",
+                    "expected_figures_tables", "failure_modes",
+                    "stop_conditions",
+                )
+            },
             "provenance": {
                 "provider": provenance.provider, "model": provenance.model,
                 "prompt_version": PROMPT_VERSION, "created_at": utc_now(),
@@ -244,6 +280,67 @@ class MethodologyFreezer:
             prompt_version=PROMPT_VERSION, checksum=freeze.checksum,
         ))
         return freeze
+
+
+def publication_design_gaps(payload: dict) -> list[dict]:
+    """Publication-grade design gaps at freeze time.
+
+    These are reported, not fatal to the freeze: exploratory work remains
+    possible, but it cannot be presented as a top-venue empirical study.
+    """
+    gaps: list[dict] = []
+    block = payload.get("methodology", payload) if isinstance(payload, dict) else {}
+
+    def add(code: str, message: str, fatal: bool = True) -> None:
+        gaps.append({
+            "code": code, "stage": "novelty", "message": message, "fatal": fatal,
+        })
+
+    if not str(block.get("contribution_statement") or "").strip():
+        add("contribution_missing", "no one-sentence contribution statement")
+    if not str(block.get("novelty_delta") or "").strip():
+        add("novelty_delta_missing", "no explicit delta from the closest prior work")
+    baselines = [str(item) for item in block.get("baselines") or [] if str(item).strip()]
+    if len(baselines) < 2:
+        add("baselines_below_minimum", f"baselines {len(baselines)} < 2")
+    ablations = [str(item) for item in block.get("ablations") or [] if str(item).strip()]
+    if not ablations:
+        add("ablations_missing", "no ablation is planned")
+    robustness = [str(item) for item in block.get("robustness_tests") or [] if str(item).strip()]
+    if not robustness:
+        add("robustness_missing", "no robustness test is planned")
+    datasets = [str(item) for item in block.get("datasets") or [] if str(item).strip()]
+    if len(datasets) < 2 and not str(block.get("one_dataset_justification") or "").strip():
+        add("datasets_below_minimum", f"datasets {len(datasets)} < 2 and no justification")
+    power = " ".join(str(block.get("power_analysis") or "").split()).lower()
+    if len(power) < 20 or any(
+        phrase in power for phrase in ("not established", "not performed", "not computed", "no power")
+    ):
+        add("power_not_established", "no substantive power analysis")
+    if not [item for item in block.get("expected_figures_tables") or [] if str(item).strip()]:
+        add("figure_table_plan_missing", "no expected figure/table plan")
+    if not [item for item in block.get("failure_modes") or [] if str(item).strip()]:
+        add("failure_modes_missing", "no failure modes recorded")
+    if not [item for item in block.get("stop_conditions") or [] if str(item).strip()]:
+        add("stop_conditions_missing", "no stop conditions recorded")
+    return gaps
+
+
+def publication_gaps_for_freeze(freeze: "MethodologyFreeze") -> list[dict]:
+    """Read publication gaps from a frozen methodology artifact."""
+    import json
+    from pathlib import Path
+
+    try:
+        payload = json.loads(Path(freeze.artifact_path).read_text(encoding="utf-8"))
+        return list(payload.get("publication_gaps") or [])
+    except (OSError, ValueError, TypeError):
+        return [{
+            "code": "methodology_artifact_unreadable",
+            "stage": "novelty",
+            "message": "frozen methodology artifact is unreadable",
+            "fatal": True,
+        }]
 
 
 def _validate(payload: dict, evidence_context: dict) -> dict:

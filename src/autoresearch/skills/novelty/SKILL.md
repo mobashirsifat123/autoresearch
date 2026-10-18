@@ -73,6 +73,15 @@ claim novelty — it surfaces evidence of overlap and preserves ambiguity.
    — the manuscript's Methodology renders that marker and lists the field
    as a study limitation; it never invents the content.
 
+   The freeze also records a **publication-design slice**:
+   `contribution_statement`, `novelty_delta`, `datasets`, `baselines`,
+   `ablations`, `robustness_tests`, `power_analysis`,
+   `expected_figures_tables`, `failure_modes`, and `stop_conditions`.
+   Missing publication fields are written to `publication_gaps` in the same
+   artifact (for example `baselines_below_minimum` or
+   `power_not_established`). They do not block exploratory work, but they do
+   block a `submission_ready` manuscript. The freeze never certifies novelty.
+
 ## Usage
 
 ```bash

@@ -374,7 +374,10 @@ def _model_service(tmp_path, texts):
     from autoresearch.storage.repository import ResearchRepository
 
     repository = ResearchRepository(tmp_path / "state.sqlite3", tmp_path / "artifacts")
-    return ManuscriptService(repository, router=_StubRouter(texts), writer_mode="model")
+    return ManuscriptService(
+        repository, router=_StubRouter(texts), writer_mode="model",
+        venue_profile="fasttrack",
+    )
 
 
 _TEMPLATE_VIOLATING_DRAFT = (
@@ -469,6 +472,24 @@ async def test_model_draft_conformant_draft_is_adopted(tmp_path):
     assert Path(result["markdown_path"]).read_text(encoding="utf-8") == draft
 
 
+def test_decision_inversion_is_rejected(tmp_path):
+    service = _model_service(tmp_path, [])
+    clean = service._audit_draft(
+        "The result is supported by the preregistered test.",
+        set(), {"p1": "paper1"}, "supported",
+    )
+    assert clean["decision_inverted"] is False
+    inverted = service._audit_draft(
+        "The result is not supported by the preregistered test.",
+        set(), {"p1": "paper1"}, "supported",
+    )
+    assert inverted["decision_inverted"] is True
+    with pytest.raises(ValueError, match="negated/inverted"):
+        ManuscriptService._verify_consistency(
+            "The result is not supported by the preregistered test.", "supported"
+        )
+
+
 def test_violation_total_combines_audit_and_template(tmp_path):
     clean = {"numbers": [], "citations": [], "overclaims": [], "decision_missing": False}
     assert ManuscriptService._violation_total(clean, []) is False
@@ -501,7 +522,10 @@ async def test_shipped_reaudit_discards_model_draft_through_build(tmp_path, monk
 
     repository, workflow, seed = _build_loop(tmp_path)
     texts = ["outline", _complete_manuscript()]
-    service = ManuscriptService(repository, router=_StubRouter(texts), writer_mode="model")
+    service = ManuscriptService(
+        repository, router=_StubRouter(texts), writer_mode="model",
+        venue_profile="fasttrack",
+    )
     workflow.manuscript = service
 
     real_audit = manuscript_module.run_template_audit
@@ -521,8 +545,9 @@ async def test_shipped_reaudit_discards_model_draft_through_build(tmp_path, monk
     monkeypatch.setattr(
         service,
         "_audit_draft",
-        lambda draft, allowed, keys, decision: {
-            "numbers": [], "citations": [], "overclaims": [], "decision_missing": False,
+        lambda draft, allowed, keys, decision, **kwargs: {
+            "numbers": [], "number_details": [], "citations": [], "overclaims": [],
+            "decision_missing": False,
         },
     )
 
@@ -539,7 +564,9 @@ async def test_shipped_reaudit_discards_model_draft_through_build(tmp_path, monk
     result = await workflow.run(project_id=project, until="manuscript")
 
     stages = {s["stage"]: s for s in result["stages"]}
-    assert stages["manuscript"]["status"] == "complete"
+    # The fallback still ships the deterministic draft; the publication gate
+    # labels it a draft (the offline fixture is a simulation).
+    assert stages["manuscript"]["status"] == "draft"
     assert calls["n"] >= 3, f"expected the shipped re-audit to run; {calls['n']} calls"
     record = repository.latest_manuscript(project)
     report = json.loads(Path(record.evidence_bundle_path).parent.joinpath("writing_audit.json").read_text(encoding="utf-8"))
@@ -548,6 +575,74 @@ async def test_shipped_reaudit_discards_model_draft_through_build(tmp_path, monk
     assert "template audit failed on the final model draft" in report["reason"]
     shipped = Path(record.markdown_path).read_text(encoding="utf-8")
     assert "deterministic decision gates" in shipped  # deterministic draft restored
+
+
+async def test_model_draft_with_real_results_table_is_adopted(tmp_path):
+    """Regression for the AutoFID fallback: a draft that embeds the actual
+    results table and cited literature numbers must pass the numeric audit."""
+    from autoresearch.application.claim_ledger import build_claim_ledger
+
+    analysis = SimpleNamespace(
+        id="analysis1",
+        baseline_metrics={"accuracy": 0.80},
+        proposed_metrics={"accuracy": 0.81},
+        effect_size={"accuracy": 0.01},
+        confidence_intervals={"accuracy": (0.79, 0.82)},
+        seed_level_results=tuple(
+            {"seed": index, "baseline": {"accuracy": 0.80}, "candidate": {"accuracy": 0.81}}
+            for index in range(5)
+        ),
+        ablation_contributions={},
+        statistical_tests={
+            "accuracy": {
+                "test": "wilcoxon_signed_rank",
+                "p_value": 0.0625,
+                "status": "VALID",
+                "raw_observations": [{"baseline": 0.80, "candidate": 0.81}] * 5,
+            }
+        },
+    )
+    table = (
+        "| Metric | Baseline (mean±std) | Candidate (mean±std) | Δ mean | Cohen's d | exact p | n | Gate |\n"
+        "|---|---|---|---|---|---|---|---|\n"
+        "| accuracy | 0.8000 ±0.0000 | 0.8100 ±0.0063 | +0.0100 | +3.010 | 0.0625 | 5 | PASS |"
+    )
+    ledger = build_claim_ledger(
+        gap={"statement": "A question.", "supporting_paper_ids_json": '["p1"]'},
+        candidate=None,
+        spec=None,
+        analysis=analysis,
+        report=None,
+        papers=[{
+            "id": "p1", "title": "Some Paper", "year": 2025,
+            "abstract": "Prior work reported 40% success and 46.7 F1 (0.81-0.83).",
+        }],
+        keys={"p1": "paper1"},
+        tables_md=table,
+        decision="supported",
+    )
+    draft = _complete_manuscript().replace(
+        "| Metric | Baseline | Candidate |\n|---|---|---|\n| accuracy | 0.8 | 0.81 |",
+        table,
+    )
+    draft = draft.replace(
+        "Some Paper (2025) [@paper1]",
+        "Some Paper (2025) [@paper1] reported 40% success and 46.7 F1 (0.81-0.83)",
+    )
+    service = _model_service(tmp_path, ["outline text", draft])
+    kwargs = _model_kwargs(tmp_path)
+    kwargs.update({
+        "analysis": analysis,
+        "papers": [{"id": "p1", "title": "Some Paper", "year": 2025, "method": "m", "abstract": ""}],
+        "keys": {"p1": "paper1"},
+        "tables_md": table,
+        "limitations": ["Single dataset."],
+        "keywords": ["accuracy", "robustness", "calibration"],
+        "ledger": ledger,
+    })
+    result = await service._model_draft(**kwargs)
+    assert result["used_model_draft"] is True, result["audit"]
+    assert result["markdown_path"]
 
 
 def test_abstract_stays_in_window_with_huge_recorded_fields(tmp_path):
@@ -616,6 +711,25 @@ def test_author_names_normalizes_all_stored_shapes():
     ) == "Zhen Wang"
     assert ManuscriptService._author_names("[]") == "Unknown authors"
     assert ManuscriptService._author_names(None) == "Unknown authors"
+
+
+def test_bibtex_escapes_special_characters():
+    papers = [{
+        "id": "p1",
+        "title": "GPT_4 & 100% #1",
+        "authors_json": '["Ada & Bob"]',
+        "year": 2026,
+        "venue": "NeurIPS_2026",
+        "doi": "10.1/abc_def",
+        "url": "https://example.org/a_b",
+    }]
+    bib = ManuscriptService._bibtex(papers, {"p1": "paper1"})
+    assert "GPT\\_4" in bib
+    assert "100\\%" in bib
+    assert "\\#1" in bib
+    assert "Ada \\& Bob" in bib
+    assert "NeurIPS\\_2026" in bib
+    assert "abc\\_def" in bib
 
 
 def test_tex_escapes_unicode_and_markup_for_xetex():

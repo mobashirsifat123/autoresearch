@@ -9,20 +9,29 @@ review → novelty → experiment → manuscript
 
 - **review** — discovers real literature (Semantic Scholar, OpenAlex,
   Crossref, arXiv, OpenReview), extracts verbatim-verified evidence, and
-  surfaces a cited research question with counter-evidence.
+  surfaces a cited research question with counter-evidence. It writes a
+  review corpus and citation contexts, and reports publication gaps when
+  fewer than 20 papers are reviewed.
 - **novelty** — generates candidate methods grounded in the reviewed
   evidence, checks them against prior art, critiques them adversarially, and
-  freezes the selected methodology (versioned, checksummed).
+  freezes the selected methodology (versioned, checksummed) with a
+  publication-design slice: contribution, novelty delta, datasets,
+  baselines, ablations, robustness, and power.
 - **experiment** — turns the frozen methodology into working research code
   (generated + statically verified), plans a falsifiable spec, and executes
-  it only under an explicit, exact-checksum approval. Measurements are
-  ingested, identity-checked, recomputed from raw outputs where possible,
-  and analyzed deterministically. Negative and null results are valid
-  outcomes.
+  it only under an explicit, exact-checksum approval. It computes dataset
+  checksum and baseline commit from the real target, reports
+  publication-design gaps before execution, and ingests identity-checked
+  measurements. Negative and null results are valid outcomes.
 - **manuscript** — assembles the validated lineage into an editable,
-  cited manuscript (Markdown + LaTeX + BibTeX + tables + manifest). Every
-  number traces to a measurement artifact; missing evidence produces an
-  explicitly incomplete draft, never a fabricated one.
+  cited manuscript (Markdown + LaTeX + BibTeX + tables + manifest) behind a
+  publication-readiness gate. It distinguishes a complete evidence chain
+  from a submission-ready paper: provenance/simulation detection, a
+  contribution contract, a sentence-level claim ledger, a full-corpus
+  literature synthesis, a venue profile, and a deterministic reviewer panel.
+  Every number traces to a measurement artifact; missing evidence produces
+  an explicitly incomplete draft or a gated `draft`, never a fabricated
+  submission.
 - **workflow** — one durable loop over all four stages, reusing completed
   work and stopping where asked.
 
@@ -84,7 +93,18 @@ autoresearch skill review     --project <id>
 autoresearch skill novelty    --project <id>
 autoresearch skill experiment plan --candidate-id <id>
 autoresearch skill manuscript --project <id>
+
+# publication track: 20-40 reviewed papers, early publication gaps, venue gate
+autoresearch skill workflow --seed-paper <pdf|doi|url> \
+  --limit 40 --top-k 20 --publication --venue generic_journal --until manuscript
 ```
+
+The publication track writes `publication_contract.json` and
+`publication_gaps.json` after review, methodology freeze, and experiment
+design. It stops before the next expensive stage when the review corpus,
+novelty design, or experiment provenance cannot support a submission-grade
+paper. Without `--publication`, the workflow still records the contract and
+gaps but continues in exploratory mode.
 
 `autoresearch skill install --target opencode` (or `claude`) installs the
 five skills into your agent host as explicit slash commands

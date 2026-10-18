@@ -46,6 +46,11 @@ stages, so re-invoking with `--project` resumes instead of repeating.
 "${AUTORESEARCH_BIN:-autoresearch}" skill workflow \
   --project "<project_id>" --until design
 
+# Publication track: review 20-40 papers so the manuscript's generic_journal
+# profile can meet its >=20 reviewed-reference threshold.
+"${AUTORESEARCH_BIN:-autoresearch}" skill workflow \
+  --seed-paper "<pdf|doi|url>" --limit 40 --top-k 20 --until manuscript
+
 # Continue to execution (approval-gated) and inspect the package:
 "${AUTORESEARCH_BIN:-autoresearch}" skill workflow \
   --project "<project_id>" --until experiment
@@ -65,17 +70,22 @@ with the exact missing prerequisite instead of fabricating content. Every
 analyzed outcome is persisted to the shared Findings Memory, which
 conditions later novelty runs (failures and refutations first).
 
-The manuscript stage enforces the FastTrack Academic Research Paper
-Template (bundled `template-spec.json`): six-part 150-250-word abstract,
-3-6 evidence-derived keywords, three-part Introduction, conditional
-Literature Review, five-field cookbook Methodology, objective Results with
-tables + deterministic figure, Discussion with ≥ 3 limitations, References,
-Appendices, and the Inside-Out writing order — audited deterministically
-and fail-closed (`template_audit.json`). The upstream stages supply the
-evidence those rules consume: review (quotable gap + project keywords +
-per-paper study design/datasets/limitations), novelty (the five Methodology
-fields or honest "not specified at freeze time" markers), experiment
-(≥ 3 limitation rows + raw seed metrics + exact commands).
+The manuscript stage runs a **publication-readiness gate** before prose:
+it detects simulation/synthetic provenance, requires real dataset/commit
+identities for empirical work, and checks seeds, power, external baselines,
+ablations, and related-work coverage against the selected venue profile
+(`fasttrack`, `generic_journal`, `neurips`, `acl`, `cvpr`, `workshop`,
+`technical_report`). It then writes a contribution contract, a full-corpus
+themed literature synthesis, a sentence-level claim ledger, and a
+deterministic reviewer/venue/hygiene report. `status` is `complete` only when
+the lineage **and** every publication gate pass; otherwise it is `draft` or
+`incomplete`. `submission_ready` is the decision signal. The FastTrack
+template remains a profile, not a universal objective. The upstream stages
+supply the evidence those gates consume: review (quotable gap + project
+keywords + per-paper study design/datasets/limitations), novelty (the five
+Methodology fields or honest "not specified at freeze time" markers),
+experiment (verified provenance + ≥ 3 limitation rows + raw seed metrics +
+exact commands).
 
 ## Progress reporting
 
@@ -116,6 +126,16 @@ invent a percentage before a progress line arrives; report stalls honestly.
 - `executed_analysis_pending` is honest: a completed approved action is not a
   scientific result until artifacts are ingested and analyzed. Report that
   state; never infer a decision from an exit code.
+- `publication_gaps` — cumulative machine-readable blockers owned by review,
+  novelty, or experiment (for example `reviewed_papers_below_minimum`,
+  `baselines_below_minimum`, `execution_artifact_missing`).
+- `artifacts.publication_contract` / `artifacts.publication_gaps` /
+  `artifacts.stage_metrics` — the shared contract, cumulative gaps, and
+  per-stage wall-clock/token/cost metrics.
+- With `--publication`, the loop stops at `review_gate`,
+  `methodology_gate`, or `design_gate` when the corresponding slice cannot
+  support a submission-grade paper. That is an honest early stop, not a
+  workflow failure.
 
 ## Quality rules
 

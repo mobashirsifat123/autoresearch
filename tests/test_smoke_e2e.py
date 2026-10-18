@@ -13,6 +13,7 @@ it is not evidence of any scientific claim.
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 from uuid import uuid4
@@ -46,10 +47,17 @@ class DeterministicMetadataSource:
     name = "deterministic_source"
 
     async def search(self, query: str, *, limit: int, since_year: int | None = None) -> SourceSearchResult:
+        # Vary the abstracts so the review-corpus theme coverage test is
+        # meaningful (the old fixture was 25 copies of one topic).
+        abstract_variants = (
+            "Study {i} improves adaptive fusion robustness on Dataset-A. Scope is limited to one dataset.",
+            "Study {i} benchmarks agent evaluation on Dataset-A. Scope is limited to one dataset.",
+            "Study {i} uses a clinical decision model on Dataset-A. Scope is limited to one cohort.",
+        )
         papers = tuple(
             MetadataPaper(
                 title=f"Adaptive Fusion Study {index}",
-                abstract=f"Study {index} evaluates adaptive fusion on Dataset-A. Adaptive fusion improves robustness. Evaluation is limited to one dataset.",
+                abstract=abstract_variants[index % len(abstract_variants)].format(i=index),
                 authors=(f"Researcher {index}",), year=2026 - (index % 4), publication_date=f"{2026 - (index % 4)}-01-01",
                 doi=f"10.5555/study.{index}", url=f"https://example.org/study/{index}",
                 open_access_pdf_url=f"https://oa.example.org/study-{index}.pdf", is_open_access=True,
@@ -135,8 +143,14 @@ def _responder(messages):
     if "paper-review-v2" in prompt:
         source = prompt.split("SOURCE:\n", 1)[1].split("\n\nReturn one JSON object", 1)[0]
         sentences = re.findall(r"[^.!?]+[.!?]", source)
+        if "clinical" in source.lower():
+            problem, method, question = "Clinical decision support", "Clinical decision model", "Does clinical calibration improve reliability?"
+        elif "benchmark" in source.lower():
+            problem, method, question = "Agent benchmarking", "Benchmark evaluation", "Do benchmarks measure agent capability?"
+        else:
+            problem, method, question = "Cross-domain robustness", "Adaptive fusion", "Does adaptive fusion improve robustness?"
         return {
-            "problem": "Cross-domain robustness", "research_question": "Does adaptive fusion improve robustness?", "method": "Adaptive fusion",
+            "problem": problem, "research_question": question, "method": method,
             "datasets": ["Dataset-A"], "experimental_protocol": "Single-dataset controlled evaluation", "results": ["Improved robustness"],
             "ablations": ["Fusion removed"], "limitations": ["Evaluation uses one dataset"], "failure_modes": ["Unverified domain transfer"], "confidence": 0.86,
             "evidence_spans": [
@@ -242,7 +256,10 @@ def _build_loop(tmp_path: Path):
         review=LiteratureReviewService(repository, router),
         novelty=NoveltyService(repository, router, pipeline),
         experiment=ExperimentService(repository, router, workspace, worker=LocalTypedWorker(repository, workspace)),
-        manuscript=ManuscriptService(repository),
+        # The offline fixture exercises the bundled teaching template; the
+        # publication gate is tested separately with the generic journal and
+        # conference profiles.
+        manuscript=ManuscriptService(repository, venue_profile="fasttrack"),
     )
     seed = tmp_path / "seed.pdf"
     writer = PdfWriter(); writer.add_blank_page(width=200, height=200); writer.add_metadata({"/Title": "Seed Adaptive Fusion"})
@@ -275,11 +292,74 @@ async def test_five_skill_loop_runs_end_to_end_offline(tmp_path):
 
     stages = {s["stage"]: s for s in result["stages"]}
     assert stages["experiment"]["status"] == "completed", stages["experiment"]
-    assert stages["manuscript"]["status"] == "complete", stages["manuscript"]
+    # The offline fixture is a generated simulation, not an empirical run.
+    # The publication gate must therefore label it a draft, never a
+    # submission-ready paper.
+    assert stages["manuscript"]["status"] == "draft", stages["manuscript"]
     record = repository.latest_manuscript(first["project_id"])
     assert record is not None and Path(record.markdown_path).is_file()
+    readiness = json.loads(
+        Path(record.markdown_path).with_name("readiness_report.json").read_text(encoding="utf-8")
+    )
+    assert stages["manuscript"]["submission_ready"] is False
+    assert stages["manuscript"]["review"] != "accept"
+    # The FastTrack teaching profile is permissive about provenance; the
+    # reviewer panel and quality gate are what block submission here.
+    assert readiness["readiness"] in {"submission_ready", "workshop_ready", "technical_report"}
     findings = repository.findings_for_project(first["project_id"])
     assert findings, "Findings Memory must record the analyzed outcome"
+
+
+@pytest.mark.anyio
+async def test_default_manuscript_profile_blocks_simulated_submission(tmp_path):
+    """The default profile is publication-oriented: the offline simulation
+    must be a draft with explicit provenance blocking issues, not a
+    submission-ready paper."""
+    repository, workflow, seed = _build_loop(tmp_path)
+    workflow.manuscript = ManuscriptService(repository)  # default: generic_journal
+
+    first = await workflow.run(seed=str(seed), until="design")
+    candidate_id = next(s for s in first["stages"] if s["stage"] == "methodology")["candidate_id"]
+    preview = workflow.experiment.approval_preview_for_candidate(candidate_id)
+    saved = repository.save_exact_approval({
+        "id": uuid4().hex, "run_id": preview["run_id"], "specification_checksum": str(preview["checksum"]),
+        "approver": "smoke-test", "approved_scope": "workspace", "approved_target": str(preview["worker"]),
+        "approved_budget": 60.0, "expires_at": "2099-01-01T00:00:00+00:00", "status": "pending",
+    })
+    repository.approve_exact(saved["id"], approver="smoke-test")
+    result = await workflow.run(project_id=first["project_id"], until="manuscript")
+    stages = {s["stage"]: s for s in result["stages"]}
+    assert stages["manuscript"]["status"] == "draft", stages["manuscript"]
+    assert stages["manuscript"]["submission_ready"] is False
+    assert stages["manuscript"]["readiness"] == "technical_report"
+
+    record = repository.latest_manuscript(first["project_id"])
+    readiness = json.loads(
+        Path(record.markdown_path).with_name("readiness_report.json").read_text(encoding="utf-8")
+    )
+    assert readiness["venue"] == "generic_journal"
+    assert readiness["provenance"]["real_execution"] is False
+    assert any("provenance" in issue or "checksum" in issue or "commit" in issue or "simulated" in issue
+               for issue in readiness["blocking_issues"])
+    checklist = json.loads(
+        Path(record.markdown_path).with_name("submission_checklist.json").read_text(encoding="utf-8")
+    )
+    assert checklist["submission_ready"] is False
+    assert checklist["status"] == stages["manuscript"]["status"]
+    assert checklist["next_actions"]
+    assert (stages["manuscript"]["status"] == "complete") == stages["manuscript"]["submission_ready"]
+    # Production supplies a sqlite dict, not a dataclass; the readiness gate
+    # must read the actual decision from it.
+    spec = repository.get_experiment_spec(candidate_id)
+    analysis = repository.get_statistical_analysis(spec.id)
+    report = repository.get_experiment_report(analysis.id)
+    assert readiness["evidence"]["decision"] == report.decision.value
+    assert readiness["evidence"]["power_established"] is False
+    contract = json.loads(
+        Path(record.markdown_path).with_name("contribution_contract.json").read_text(encoding="utf-8")
+    )
+    assert contract.get("contributions"), contract
+    assert report.decision.value in contract["contributions"][1]["claim"]
 
 
 @pytest.mark.anyio
@@ -305,7 +385,9 @@ async def test_manuscript_satisfies_fasttrack_template_end_to_end(tmp_path):
     repository.approve_exact(saved["id"], approver="smoke-test")
     result = await workflow.run(project_id=first["project_id"], until="manuscript")
     stages = {s["stage"]: s for s in result["stages"]}
-    assert stages["manuscript"]["status"] == "complete", stages["manuscript"]
+    # The FastTrack template can pass while the publication gate honestly
+    # labels the offline simulation a draft. These are different questions.
+    assert stages["manuscript"]["status"] == "draft", stages["manuscript"]
 
     record = repository.latest_manuscript(first["project_id"])
     markdown = Path(record.markdown_path).read_text(encoding="utf-8")

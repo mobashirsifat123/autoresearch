@@ -58,8 +58,14 @@ require a standardized effect-size assumption; missing variance is explicit.
 ```
 
 **Output:** `spec` (hypothesis, falsification_condition, metrics, seeds,
-statistical_plan, ablations) + `approval` (worker, actions, checksum, budget).
-**Show this to the user verbatim before any approval.**
+statistical_plan, ablations) + `approval` (worker, actions, checksum, budget)
++ `publication_gaps` (for example `baselines_below_minimum`,
+`ablations_missing`, `power_not_established`, `dataset_checksum_missing`,
+`baseline_commit_missing`). The dataset checksum and baseline commit are
+computed from the real target when available; the model cannot supply them.
+**Show this to the user verbatim before any approval.** A publication-track
+plan with fatal design gaps should be fixed before execution; exploratory
+runs may proceed but cannot become `submission_ready`.
 
 ### Step 1b — Implement (research code generation; no execution)
 

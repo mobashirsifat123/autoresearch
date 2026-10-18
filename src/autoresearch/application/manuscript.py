@@ -31,10 +31,33 @@ import subprocess
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from uuid import uuid4
 
+from autoresearch.application.body_hygiene import HygieneReport, audit_body
+from autoresearch.application.claim_ledger import ClaimLedger, build_claim_ledger
+from autoresearch.application.contribution_contract import (
+    ContributionContract,
+    build_contribution_contract,
+    pick_title,
+)
 from autoresearch.application.keywords import keyword_tokens, pick_keywords
+from autoresearch.application.literature_synthesis import (
+    LiteratureSynthesis,
+    build_literature_synthesis,
+)
+from autoresearch.application.publication_readiness import (
+    ReadinessReport,
+    assess_publication_readiness,
+)
+from autoresearch.application.reviewer_panel import ReviewerReport, deterministic_review
+from autoresearch.application.venue_profiles import (
+    VenueLint,
+    VenueProfile,
+    get_venue_profile,
+    venue_lint,
+)
 from autoresearch.domain.models import (
     ArtifactProvenance,
     ManuscriptRecord,
@@ -45,8 +68,8 @@ from autoresearch.providers.capabilities import ModelRole
 from autoresearch.providers.redaction import redact_text
 from autoresearch.storage.repository import ResearchRepository
 
-MANUSCRIPT_PROMPT_VERSION = "manuscript-v2-template-deterministic"
-MANUSCRIPT_WRITER_PROMPT_VERSION = "manuscript-writer-v3-template-model"
+MANUSCRIPT_PROMPT_VERSION = "manuscript-v3-readiness-gated"
+MANUSCRIPT_WRITER_PROMPT_VERSION = "manuscript-writer-v4-evidence-ledger"
 
 # FastTrack Academic Research Paper Template: every instruction line is
 # transcribed into template-spec.json next to this package's manuscript
@@ -96,6 +119,16 @@ _TEMPLATE_METHODOLOGY_FIELDS = (
 )
 
 _NOT_SPECIFIED = "not specified at freeze time"
+
+# Generic words that make poor indexing terms. Domain terms (benchmark,
+# calibration, agent, forensics, ...) are deliberately not filtered.
+_KEYWORD_STOPWORDS = {
+    "add", "added", "fixed", "reference", "standardized", "standardised",
+    "using", "based", "method", "methods", "study", "studies", "paper",
+    "papers", "result", "results", "approach", "new", "proposed", "analysis",
+    "data", "model", "models", "system", "systems", "framework", "framework",
+    "our", "their", "this", "that", "from", "with", "into", "over", "under",
+}
 
 
 @lru_cache(maxsize=1)
@@ -159,6 +192,46 @@ def _manuscript_keyword_terms(markdown: str) -> list[str]:
         if term and "not available" not in term:
             terms.append(term)
     return terms
+
+
+def _as_list(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return list(value)
+    return [value]
+
+
+def _next_action(issue: str) -> str:
+    """Turn a machine-readable blocking issue into a concrete next action."""
+    if issue.startswith("simulated_evidence"):
+        return ("Reframe the study explicitly as a simulation study (workshop/technical report), "
+                "or run the claimed protocol on real benchmarks.")
+    if issue.startswith("dataset_checksum_missing"):
+        return "Record the dataset content checksum in the experiment spec and re-run the analysis."
+    if issue.startswith("implementation_commit_missing"):
+        return "Record the implementation commit hash and re-run the analysis."
+    if issue.startswith("execution_artifact_missing"):
+        return "Bind a completed execution result/worker job to the analyzed spec run before claiming empirical evidence."
+    if issue.startswith("real_execution_not_verified"):
+        return "Provide a verified execution identity (execution artifact + checksums), or label the study as a simulation."
+    if issue.startswith("power_not_established"):
+        return "Add a power analysis with a justified effect size and seed count."
+    if issue.startswith("external_baselines_missing"):
+        return "Add at least the venue-required number of external baselines and re-run."
+    if issue.startswith("ablations_missing"):
+        return "Run at least the venue-required number of ablations."
+    if issue.startswith("related_work_coverage_below_minimum"):
+        return "Expand the reviewed corpus and re-run the literature review before drafting."
+    if issue.startswith("venue lint:"):
+        return f"Fix or explicitly waive the venue lint violation: {issue.removeprefix('venue lint: ')}"
+    if issue.startswith("body hygiene:"):
+        return f"Remove the internal scaffolding from the body: {issue.removeprefix('body hygiene: ')}"
+    if "quality" in issue.lower():
+        return "Supply exemplar PDFs and revise the prose until the quality gate passes."
+    return issue
 
 
 def _parse_report_limitations(value: Any) -> list[str]:
@@ -297,9 +370,14 @@ def run_template_audit(
             if interpretation_hits
             else "no interpretation words in Results",
         )
+        results_body = sections.get("Results", "")
+        has_table = bool(
+            re.search(r"^\|.+\|\s*$", results_body, re.MULTILINE)
+            and re.search(r"^\|[\s:|-]+\|\s*$", results_body, re.MULTILINE)
+        )
         record(
             "results_has_table",
-            "|" in sections.get("Results", ""),
+            has_table,
             "Results contains a data table",
         )
         if figure_paths:
@@ -387,22 +465,43 @@ class ManuscriptService:
         repository: ResearchRepository,
         router=None,
         writer_mode: str = "deterministic",
+        venue_profile: str = "generic_journal",
+        download_root: Path | None = None,
     ) -> None:
         self.repository = repository
         self.router = router
-        # "deterministic" (default): field-assembled manuscript, zero model
+        # "deterministic" (default): field-assembled scaffold, zero model
         # calls. "model": model-assisted scientific argument through the
-        # router, gated by a deterministic numeric/citation/overclaim audit
-        # that falls back to the deterministic draft on any violation.
+        # router, gated by the evidence ledger and the publication readiness
+        # gate. A deterministic draft is never labelled submission-ready.
         self.writer_mode = (
             writer_mode
             if writer_mode in ("deterministic", "model")
             else "deterministic"
         )
+        self.venue: VenueProfile = get_venue_profile(venue_profile)
+        self.download_root = Path(download_root).expanduser().resolve() if download_root else None
 
     # ------------------------------------------------------------------
     # Public entry
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _delivery_state(
+        checklist: dict[str, Any] | None, manuscript_status: str
+    ) -> tuple[str, bool]:
+        """One invariant for DB status, checklist, and returned JSON.
+
+        ``complete`` requires ``submission_ready``; a stale/edited checklist
+        that says otherwise is downgraded to draft and reported as not ready.
+        """
+        status = str((checklist or {}).get("status") or manuscript_status)
+        ready = bool((checklist or {}).get("submission_ready"))
+        if status == "complete" and not ready:
+            status = "draft"
+        if status != "complete":
+            ready = False
+        return status, ready
 
     async def generate(self, project_id: str) -> dict[str, Any]:
         project = self.repository.get_project(project_id)
@@ -422,7 +521,62 @@ class ManuscriptService:
             manuscript = await self._build(project, run.id, lineage, gaps)
             self.repository.save_manuscript(manuscript)
             self.repository.finish_run(run.id)
-            quality = self._quality_report(manuscript, project_id)
+            root = Path(manuscript.markdown_path).parent
+
+            def _sidecar(name: str) -> tuple[dict[str, Any] | None, str | None]:
+                path = root / name
+                if not path.is_file():
+                    return None, None
+                try:
+                    return json.loads(path.read_text(encoding="utf-8")), str(path)
+                except (OSError, ValueError):
+                    return None, str(path)
+
+            readiness_payload, readiness_path = _sidecar("readiness_report.json")
+            contract_payload, contract_path = _sidecar("contribution_contract.json")
+            synthesis_payload, synthesis_path = _sidecar("literature_synthesis.json")
+            review_payload, review_path = _sidecar("review_report.json")
+            venue_lint_payload, venue_lint_path = _sidecar("venue_lint.json")
+            hygiene_payload, hygiene_path = _sidecar("body_hygiene.json")
+            ledger_payload, ledger_path = _sidecar("claim_ledger.json")
+            publication_gaps_payload, publication_gaps_path = _sidecar("publication_gaps.json")
+            checklist_payload, checklist_path = _sidecar("submission_checklist.json")
+            quality, quality_path = _sidecar("quality_report.json")
+            if quality is None:
+                quality = {
+                    "kind": "quality_report",
+                    "gate": {
+                        "passed": False,
+                        "verdict": "MISSING",
+                        "reason": "quality_report.json is missing; failing closed",
+                    },
+                    "path": None,
+                }
+            elif quality_path:
+                quality["path"] = quality_path
+
+            # One authoritative decision: the persisted checklist computed by
+            # _build from every gate. generate() must never invent a different
+            # boolean from a subset of the gates.
+            effective_status, submission_ready = self._delivery_state(
+                checklist_payload, manuscript.status
+            )
+            if checklist_payload is not None and (
+                checklist_payload.get("status") != effective_status
+                or bool(checklist_payload.get("submission_ready")) != submission_ready
+            ):
+                checklist_payload["status"] = effective_status
+                checklist_payload["submission_ready"] = submission_ready
+                if checklist_path:
+                    Path(checklist_path).write_text(
+                        json.dumps(checklist_payload, indent=2, sort_keys=True),
+                        encoding="utf-8",
+                    )
+            if effective_status != manuscript.status:
+                self.repository.execute(
+                    "UPDATE manuscripts SET status=? WHERE id=?",
+                    (effective_status, manuscript.id),
+                )
             template_audit: dict[str, Any] = {
                 "passed": None,
                 "violations": [],
@@ -446,13 +600,23 @@ class ManuscriptService:
                 "manuscript_id": manuscript.id,
                 "project_id": project_id,
                 "run_id": run.id,
-                "status": manuscript.status,
+                "status": effective_status,
                 "title": manuscript.title,
                 "decision": manuscript.decision,
                 "keywords": _manuscript_keyword_terms(markdown_text),
                 "template_audit": template_audit,
                 "lineage": lineage,
                 "evidence_gaps": json.loads(manuscript.gaps_json),
+                "submission_ready": submission_ready,
+                "readiness": readiness_payload,
+                "contribution_contract": contract_payload,
+                "literature_synthesis": synthesis_payload,
+                "review": review_payload,
+                "venue_lint": venue_lint_payload,
+                "body_hygiene": hygiene_payload,
+                "claim_ledger": ledger_payload,
+                "publication_gaps": publication_gaps_payload,
+                "submission_checklist": checklist_payload,
                 "quality": quality,
                 "artifacts": {
                     "markdown": manuscript.markdown_path,
@@ -471,6 +635,15 @@ class ManuscriptService:
                         if audit_file.is_file()
                         else {}
                     ),
+                    **({"readiness_report": readiness_path} if readiness_path else {}),
+                    **({"contribution_contract": contract_path} if contract_path else {}),
+                    **({"literature_synthesis": synthesis_path} if synthesis_path else {}),
+                    **({"review_report": review_path} if review_path else {}),
+                    **({"venue_lint": venue_lint_path} if venue_lint_path else {}),
+                    **({"body_hygiene": hygiene_path} if hygiene_path else {}),
+                    **({"claim_ledger": ledger_path} if ledger_path else {}),
+                    **({"publication_gaps": publication_gaps_path} if publication_gaps_path else {}),
+                    **({"submission_checklist": checklist_path} if checklist_path else {}),
                 },
             }
         except BaseException as exc:
@@ -548,9 +721,14 @@ class ManuscriptService:
                     "experiment: no validated statistical analysis (measurement ingestion/analysis pending)"
                 )
         if spec is not None:
-            report = self.repository.row(
-                "SELECT * FROM experiment_reports WHERE run_id=? ORDER BY rowid DESC LIMIT 1",
-                (spec.run_id,),
+            report = (
+                self.repository.row(
+                    "SELECT * FROM experiment_reports WHERE analysis_id=? "
+                    "ORDER BY rowid DESC LIMIT 1",
+                    (analysis.id,),
+                )
+                if analysis is not None
+                else None
             )
             if report is None:
                 gaps.append("experiment: no report for the analyzed specification")
@@ -586,16 +764,26 @@ class ManuscriptService:
             if lineage.get("gap_id")
             else None
         )
-        papers = self._lineage_papers(gap)
+        lineage_papers = self._lineage_papers(gap)
+        # The literature review must synthesize the reviewed corpus, not only
+        # the gap's supporting set. Lineage papers stay first so the gap is
+        # never detached from its own evidence.
+        review_run_id = str(lineage.get("review_run_id") or "") or None
+        corpus_papers = self._corpus_papers(
+            project.id, lineage_papers, review_run_id=review_run_id
+        )
+        papers = corpus_papers or lineage_papers
         claims = self._lineage_claims(gap)
         counter_claims = self._counter_claims(gap)
-        review_notes = self._paper_review_notes(papers)
+        review_notes = self._paper_review_notes(papers, review_run_id=review_run_id)
         candidate = (
             self.repository.get_novelty_candidate(lineage["candidate_id"])
             if lineage.get("candidate_id")
             else None
         )
         methodology = self._methodology_record(lineage)
+        if methodology is None and lineage.get("methodology_freeze_id"):
+            gaps.append("methodology: frozen artifact unreadable")
         spec = (
             self.repository.get_experiment_spec(lineage["candidate_id"])
             if lineage.get("candidate_id")
@@ -623,6 +811,62 @@ class ManuscriptService:
         }
         bib = self._bibtex(papers, keys)
         tables_md, tables_tex = self._tables(analysis)
+        keywords = self._keywords(project.id, papers, gap=gap, candidate=candidate, spec=spec)
+
+        # Publication readiness comes BEFORE prose. It decides whether this is
+        # an empirical submission, a workshop paper, a simulation report, or
+        # not ready at all. The gate never turns a simulation into evidence.
+        readiness = assess_publication_readiness(
+            project_id=project.id,
+            spec=spec,
+            analysis=analysis,
+            report=report,
+            papers=papers,
+            corpus_papers=corpus_papers or papers,
+            venue=self.venue,
+            execution_verified=self._execution_verified(spec),
+        )
+        # Freeze-time publication gaps are a shared-contract slice; a missing
+        # baseline/power/delta at freeze must still block a submission.
+        freeze_gaps = [
+            gap for gap in (methodology or {}).get("publication_gaps", [])
+            if isinstance(gap, dict)
+        ]
+        shared_ready = not any(gap.get("fatal", True) for gap in freeze_gaps)
+        synthesis = build_literature_synthesis(
+            self.repository,
+            project.id,
+            gap=gap,
+            candidate=candidate,
+            spec=spec,
+            keys=keys,
+            limit=24,
+            review_run_id=review_run_id,
+        )
+        contract = build_contribution_contract(
+            gap=gap,
+            candidate=candidate,
+            spec=spec,
+            analysis=analysis,
+            report=report,
+            synthesis=synthesis,
+            readiness=readiness,
+            keywords=keywords,
+            seed=seed,
+            venue=self.venue,
+        )
+        ledger = build_claim_ledger(
+            gap=gap,
+            candidate=candidate,
+            spec=spec,
+            analysis=analysis,
+            report=report,
+            papers=papers,
+            review_notes=review_notes,
+            keys=keys,
+            tables_md=tables_md,
+            decision=decision,
+        )
 
         # Inside-Out Writing Method (template-spec.json T13-T18, T130-T131):
         # methods → results → discussion → introduction → abstract → title.
@@ -637,28 +881,65 @@ class ManuscriptService:
             analysis, report, tables_md, figure_svg, complete
         )
         inside_out.append("Results")
-        limitations = self._study_limitations(report, methodology, spec, analysis)
+        limitations = self._study_limitations(
+            report, methodology, spec, analysis, readiness=readiness
+        )
         discussion_lines = self._discussion_markdown(
             decision, report, limitations, gap, methodology, spec, analysis,
             review_notes, papers, complete, gaps,
+            synthesis=synthesis, contract=contract, readiness=readiness,
         )
+        conclusion_lines: list[str] = []
+        if self.venue.template != "fasttrack":
+            conclusion_lines += [
+                "## Conclusion",
+                "",
+                self._sanitize(contract.takeaway) or f"The preregistered decision is {decision}.",
+                "",
+            ]
+            for statement in self.venue.required_statements:
+                if statement.lower() == "limitations":
+                    continue
+                conclusion_lines += [f"### {statement}", ""]
+                if statement.lower() == "data and code availability":
+                    conclusion_lines += [
+                        "The evidence bundle, manifest, exact commands, and tables are "
+                        "stored with this manuscript; restricted data are not redistributed.",
+                        "",
+                    ]
+                elif statement.lower() == "broader impact":
+                    conclusion_lines += [
+                        "The study evaluates a computational method; its broader impact "
+                        "is bounded by the limitations and scope stated in the Discussion.",
+                        "",
+                    ]
+                elif statement.lower() == "ethics":
+                    conclusion_lines += [
+                        "Ethical considerations are recorded in the Methodology; fields "
+                        "not specified at freeze time are reported as limitations rather "
+                        "than invented.",
+                        "",
+                    ]
+                else:
+                    conclusion_lines += [
+                        f"{statement} is reported in the evidence bundle and the Discussion.",
+                        "",
+                    ]
         inside_out.append("Discussion")
         introduction_lines = self._introduction_markdown(
-            gap, counter_claims, review_notes, candidate, spec, seed, complete, gaps
+            gap, counter_claims, review_notes, candidate, spec, seed, complete, gaps,
+            synthesis=synthesis,
         )
         inside_out.append("Introduction")
-        literature_lines = self._literature_review_markdown(
-            papers, claims, counter_claims, review_notes, keys, gap
-        )
+        literature_lines = synthesis.to_markdown_lines() if synthesis.papers else []
         inside_out.append("Literature Review")
         abstract_lines = self._abstract_markdown(
             gap, counter_claims, candidate, methodology, spec, analysis, report,
-            complete, gaps, seed,
+            complete, gaps, seed, contract=contract, synthesis=synthesis,
         )
         inside_out.append("Abstract")
-        keywords = self._keywords(project.id, papers)
         inside_out.append("Keywords")
-        title = self._title(candidate, complete, keywords)
+        title = self._title(candidate, complete, keywords, contract=contract)
         inside_out.append("Title")
         references_lines = self._references_markdown(papers, keys)
         appendices_lines = self._appendices_markdown(
@@ -676,6 +957,7 @@ class ManuscriptService:
                 *methodology_lines,
                 *results_lines,
                 *discussion_lines,
+                *conclusion_lines,
                 *references_lines,
                 *appendices_lines,
             ]
@@ -721,6 +1003,25 @@ class ManuscriptService:
         (root / "tables").mkdir(exist_ok=True)
         (root / "tables" / "results.md").write_text(tables_md, encoding="utf-8")
         (root / "tables" / "results.tex").write_text(tables_tex, encoding="utf-8")
+
+        # Gate artifacts are written before prose is judged so every later
+        # stage (writer, reviewer, human) sees the same exact evidence.
+        (root / "readiness_report.json").write_text(
+            json.dumps(readiness.to_dict(), indent=2, sort_keys=True), encoding="utf-8"
+        )
+        (root / "contribution_contract.json").write_text(
+            json.dumps(contract.to_dict(), indent=2, sort_keys=True), encoding="utf-8"
+        )
+        (root / "literature_synthesis.json").write_text(
+            json.dumps(synthesis.to_dict(), indent=2, sort_keys=True), encoding="utf-8"
+        )
+        (root / "claim_ledger.json").write_text(
+            json.dumps(ledger.to_dict(), indent=2, sort_keys=True), encoding="utf-8"
+        )
+        (root / "publication_gaps.json").write_text(
+            json.dumps({"gaps": freeze_gaps}, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
         from autoresearch.application.progress import report as _progress
 
         _progress(
@@ -731,20 +1032,48 @@ class ManuscriptService:
         self._verify_citations(markdown, latex, bib, keys)
         if complete:
             self._verify_consistency(markdown, decision)
-        template_audit = run_template_audit(
-            markdown,
-            complete=complete,
-            literature_evidence=bool(papers or claims),
-            figure_paths=tuple([figure_svg] if figure_svg else []),
-            inside_out_order=tuple(inside_out),
-        )
+        if self.venue.template == "fasttrack":
+            template_audit = run_template_audit(
+                markdown,
+                complete=complete,
+                literature_evidence=bool(papers or claims),
+                figure_paths=tuple([figure_svg] if figure_svg else []),
+                inside_out_order=tuple(inside_out),
+            )
+            if complete and not template_audit.passed:
+                # Fail-closed: a template violation in the deterministic draft
+                # is a generation bug or a sparse evidence chain — never
+                # silently shipped as a complete manuscript.
+                raise ValueError(
+                    "manuscript_template_error: deterministic draft violates the FastTrack "
+                    f"template: {'; '.join(template_audit.violations)}"
+                )
+        else:
+            # Venue profiles replace the FastTrack checklist as the format
+            # gate; the venue lint is run after the shipped text is final.
+            template_audit = TemplateAudit(
+                checks=[{
+                    "check": "venue_profile",
+                    "ok": True,
+                    "detail": f"FastTrack audit skipped; venue profile '{self.venue.name}' is the format gate",
+                }],
+                violations=[],
+            )
         audit_path = root / "template_audit.json"
         audit_path.write_text(
             json.dumps(
                 {
                     "kind": "template_audit",
-                    "template": "FastTrack Academic Research Paper Template",
-                    "spec": str(TEMPLATE_SPEC_PATH),
+                    "template": (
+                        "FastTrack Academic Research Paper Template"
+                        if self.venue.template == "fasttrack"
+                        else self.venue.name
+                    ),
+                    "spec": (
+                        str(TEMPLATE_SPEC_PATH)
+                        if self.venue.template == "fasttrack"
+                        else None
+                    ),
                     "passed": template_audit.passed,
                     "violations": template_audit.violations,
                     "checks": template_audit.checks,
@@ -755,14 +1084,6 @@ class ManuscriptService:
             ),
             encoding="utf-8",
         )
-        if complete and not template_audit.passed:
-            # Fail-closed: a template violation in the deterministic draft is
-            # a generation bug or a sparse evidence chain — never silently
-            # shipped as a complete manuscript.
-            raise ValueError(
-                "manuscript_template_error: deterministic draft violates the FastTrack "
-                f"template: {'; '.join(template_audit.violations)}"
-            )
 
         # Model-assisted scientific writing (optional): a model drafts the
         # argument; a deterministic audit keeps numerical/citation authority
@@ -798,17 +1119,30 @@ class ManuscriptService:
                 figure_svg=figure_svg,
                 review_notes=review_notes,
                 seed=seed,
+                contract=contract,
+                synthesis=synthesis,
+                ledger=ledger,
             )
             if writer_report.get("used_model_draft") and writer_report.get(
                 "markdown_path"
             ):
                 candidate_path = Path(str(writer_report["markdown_path"]))
-                shipped_audit = run_template_audit(
-                    candidate_path.read_text(encoding="utf-8"),
-                    complete=True,
-                    literature_evidence=bool(papers or claims),
-                    figure_paths=tuple([figure_svg] if figure_svg else []),
-                )
+                if self.venue.template == "fasttrack":
+                    shipped_audit = run_template_audit(
+                        candidate_path.read_text(encoding="utf-8"),
+                        complete=True,
+                        literature_evidence=bool(papers or claims),
+                        figure_paths=tuple([figure_svg] if figure_svg else []),
+                    )
+                else:
+                    shipped_audit = TemplateAudit(
+                        checks=[{
+                            "check": "venue_profile",
+                            "ok": True,
+                            "detail": f"venue profile '{self.venue.name}' is the format gate",
+                        }],
+                        violations=[],
+                    )
                 if not shipped_audit.passed:
                     # The sidecar audit must describe the SHIPPED text; a model
                     # draft that fails the re-audit is discarded and the
@@ -823,6 +1157,9 @@ class ManuscriptService:
                     writer_report["markdown_path"] = None
                 else:
                     markdown = candidate_path.read_text(encoding="utf-8")
+                    self._verify_citations(markdown, latex, bib, keys)
+                    self._verify_consistency(markdown, decision)
+                    template_audit = shipped_audit
                     writer_report["template_audit"] = {
                         "audited": "shipped manuscript.md (model draft)",
                         "passed": shipped_audit.passed,
@@ -834,8 +1171,16 @@ class ManuscriptService:
                         json.dumps(
                             {
                                 "kind": "template_audit",
-                                "template": "FastTrack Academic Research Paper Template",
-                                "spec": str(TEMPLATE_SPEC_PATH),
+                                "template": (
+                                    "FastTrack Academic Research Paper Template"
+                                    if self.venue.template == "fasttrack"
+                                    else self.venue.name
+                                ),
+                                "spec": (
+                                    str(TEMPLATE_SPEC_PATH)
+                                    if self.venue.template == "fasttrack"
+                                    else None
+                                ),
                                 "audited": "shipped manuscript.md (model draft, writer mode)",
                                 "passed": shipped_audit.passed,
                                 "violations": shipped_audit.violations,
@@ -852,20 +1197,89 @@ class ManuscriptService:
                 json.dumps(writer_report, indent=2, default=str), encoding="utf-8"
             )
 
+        # The shipped text is re-audited after an optional model draft. Body
+        # hygiene, venue lint, the deterministic reviewer panel, and the prose
+        # quality report all describe the same text the user receives.
+        hygiene = audit_body(markdown)
+        venue_lint_result = venue_lint(markdown, self.venue)
+        review = deterministic_review(
+            markdown,
+            readiness=readiness,
+            contract=contract,
+            synthesis=synthesis,
+            hygiene=hygiene,
+            venue_lint_result=venue_lint_result,
+            profile=self.venue,
+            has_exact_commands=bool(self._exact_commands(report)),
+        )
+        quality = self._quality_report(
+            SimpleNamespace(markdown_path=str(markdown_path)), project.id
+        )
+        quality_passed = bool((quality.get("gate") or {}).get("passed"))
+        submission_ready = bool(
+            complete
+            and readiness.submission_ready
+            and shared_ready
+            and quality_passed
+            and review.passed
+            and venue_lint_result.passed
+            and hygiene.passed
+            and template_audit.passed
+        )
+        status = "complete" if submission_ready else ("draft" if complete else "incomplete")
+        (root / "venue_lint.json").write_text(
+            json.dumps(venue_lint_result.to_dict(), indent=2, sort_keys=True), encoding="utf-8"
+        )
+        (root / "body_hygiene.json").write_text(
+            json.dumps(hygiene.to_dict(), indent=2, sort_keys=True), encoding="utf-8"
+        )
+        (root / "review_report.json").write_text(
+            json.dumps(review.to_dict(), indent=2, sort_keys=True), encoding="utf-8"
+        )
+        next_actions = list(dict.fromkeys(
+            _next_action(issue)
+            for issue in [*readiness.blocking_issues, *review.required_fixes]
+        ))
+        if not next_actions:
+            next_actions = ["Author review, then venue submission checks."]
+        (root / "submission_checklist.json").write_text(
+            json.dumps(
+                {
+                    "kind": "submission_checklist",
+                    "venue": self.venue.to_dict(),
+                    "status": status,
+                    "submission_ready": submission_ready,
+                    "readiness": readiness.readiness,
+                    "blocking_issues": list(readiness.blocking_issues),
+                    "publication_gaps": list(freeze_gaps),
+                    "required_fixes": list(review.required_fixes),
+                    "quality_gate": quality.get("gate"),
+                    "venue_lint_passed": venue_lint_result.passed,
+                    "body_hygiene_passed": hygiene.passed,
+                    "next_actions": next_actions,
+                },
+                indent=2,
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+
         from autoresearch.application.progress import report as _progress
 
         _progress(
-            "manuscript.steps", 4, 5, detail="template audit complete",
+            "manuscript.steps", 4, 5, detail="template, venue, hygiene, and reviewer gates complete",
             remaining=["manifest", "compile"],
         )
 
+        # Compile before hashing so the PDF (and any compiler sidecars) are
+        # covered by the manifest, not written after it.
+        pdf_path = self._compile(latex_path) if complete else None
         manifest = self._manifest(root, bundle)
         manifest_path = root / "manifest.json"
         manifest_path.write_text(
             json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8"
         )
 
-        pdf_path = self._compile(latex_path) if complete else None
         from autoresearch.application.progress import report as _progress
 
         _progress(
@@ -892,7 +1306,9 @@ class ManuscriptService:
             model="manuscript-writer",
             prompt_version=MANUSCRIPT_PROMPT_VERSION,
             content={
-                "status": "complete" if complete else "incomplete",
+                "status": status,
+                "submission_ready": submission_ready,
+                "readiness": readiness.readiness,
                 "decision": decision,
                 "gaps": gaps,
             },
@@ -902,7 +1318,7 @@ class ManuscriptService:
             project_id=project.id,
             run_id=run_id,
             title=title,
-            status="complete" if complete else "incomplete",
+            status=status,
             decision=decision,
             lineage_json=json.dumps(lineage, sort_keys=True),
             evidence_bundle_path=str(bundle_path),
@@ -929,8 +1345,12 @@ class ManuscriptService:
         """
         try:
             rows = self.repository.rows(
-                "SELECT pr.paper_id AS paper_id, p.checksum AS checksum FROM paper_reviews pr "
-                "JOIN papers p ON p.id = pr.paper_id WHERE pr.project_id=? "
+                "SELECT pr.paper_id AS paper_id, p.checksum AS checksum, "
+                "d.path AS download_path, d.checksum AS download_checksum "
+                "FROM paper_reviews pr "
+                "JOIN papers p ON p.id = pr.paper_id "
+                "LEFT JOIN download_records d ON d.paper_id = p.id AND d.status = 'downloaded' "
+                "WHERE pr.project_id=? "
                 "ORDER BY pr.confidence DESC, pr.paper_id ASC",
                 (project_id,),
             )
@@ -938,8 +1358,19 @@ class ManuscriptService:
             return []
         if not rows:
             return []
-        downloads = Path(".autoresearch/data/downloads")
-        if not downloads.is_dir():
+        roots: list[Path] = []
+        if self.download_root is not None:
+            roots.append(self.download_root)
+        roots.extend([
+            Path(self.repository.artifact_root).parent / "downloads",
+            Path(self.repository.artifact_root) / "downloads",
+            Path(".autoresearch/data/downloads").resolve(),
+        ])
+        database_path = getattr(self.repository, "path", None)
+        if database_path is not None:
+            roots.append(Path(database_path).parent / "downloads")
+        downloads_roots = list(dict.fromkeys(root for root in roots if root.is_dir()))
+        if not downloads_roots:
             return []
         from autoresearch.ingestion.document_parser import DocumentParser
 
@@ -948,12 +1379,20 @@ class ManuscriptService:
         for row in rows:
             if len(texts) >= limit:
                 break
-            checksum = str(row["checksum"] or "")
-            if len(checksum) < 12:
-                continue
-            candidates = list(downloads.glob(f"**/{checksum[:12]}*.pdf")) or list(
-                downloads.glob(f"{checksum[:32]}/*.pdf")
-            )
+            candidates: list[Path] = []
+            download_path = str(row.get("download_path") or "")
+            if download_path and Path(download_path).is_file():
+                candidates = [Path(download_path)]
+            if not candidates:
+                checksum = str(row.get("download_checksum") or row["checksum"] or "")
+                if len(checksum) < 12:
+                    continue
+                for downloads in downloads_roots:
+                    candidates = list(downloads.glob(f"**/{checksum[:12]}*.pdf")) or list(
+                        downloads.glob(f"{checksum[:32]}/*.pdf")
+                    )
+                    if candidates:
+                        break
             if not candidates:
                 continue
             try:
@@ -986,17 +1425,27 @@ class ManuscriptService:
                     "verdict": "INCONCLUSIVE",
                     "reason": f"unreadable_markdown:{type(exc).__name__}",
                 },
+                "gate": {
+                    "passed": False,
+                    "verdict": "INCONCLUSIVE",
+                    "reason": "unreadable manuscript",
+                },
             }
 
         exemplar_texts = self._exemplar_texts(project_id)
         audit = prose_audit(markdown, exemplar_texts)
+        guidance = (
+            list(audit.rewrite_guidance)
+            if not isinstance(audit.rewrite_guidance, str)
+            else [audit.rewrite_guidance]
+        )
         report["prose_audit"] = {
             "verdict": audit.verdict,
             "heuristic": audit.heuristic,
             "tell_density": audit.metrics.tell_density if audit.metrics else None,
             "tells": [dict(t) for t in audit.tells],
             "band_deviations": [dict(d) for d in audit.band_deviations],
-            "rewrite_guidance": list(audit.rewrite_guidance),
+            "rewrite_guidance": guidance,
             "notes": list(audit.notes),
         }
         if exemplar_texts:
@@ -1021,6 +1470,24 @@ class ManuscriptService:
                 "n_exemplars": 0,
                 "notes": ["no_exemplar_pdfs_resolved: parity not assessed"],
             }
+        parity_passed = bool(
+            report["exemplar_parity"].get("parity")
+        ) if exemplar_texts else False
+        gate_passed = audit.verdict == "PASS" and parity_passed
+        if gate_passed:
+            gate_reason = "prose audit and exemplar parity passed"
+        elif not exemplar_texts:
+            gate_reason = "no exemplar PDFs resolved; style evidence is absent"
+        elif audit.verdict != "PASS":
+            gate_reason = "prose audit did not pass"
+        else:
+            gate_reason = "exemplar parity gaps remain"
+        report["gate"] = {
+            "passed": gate_passed,
+            "verdict": audit.verdict,
+            "parity": parity_passed,
+            "reason": gate_reason,
+        }
         try:
             out_path = Path(manuscript.markdown_path).with_name("quality_report.json")
             out_path.write_text(
@@ -1048,6 +1515,53 @@ class ManuscriptService:
             if row:
                 papers.append(row)
         return papers
+
+    def _execution_verified(self, spec) -> bool:
+        """True only when a durable execution artifact is bound to the spec run."""
+        if spec is None:
+            return False
+        try:
+            row = self.repository.row(
+                "SELECT COUNT(*) AS n FROM execution_results WHERE run_id=?",
+                (spec.run_id,),
+            )
+            return bool(row and int(row["n"]) > 0)
+        except Exception:  # noqa: BLE001 - absent table/column is honestly unverified
+            return False
+
+    def _corpus_papers(
+        self,
+        project_id: str,
+        lineage_papers: list[dict[str, Any]],
+        limit: int = 24,
+        review_run_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """The *reviewed* corpus for the literature synthesis.
+
+        Downloaded-but-unreviewed papers are not counted as related-work
+        coverage. Lineage papers come first; the rest are ordered by citation
+        count and recency.
+        """
+        limit = max(limit, len(lineage_papers))
+        rows = self.repository.rows(
+            "SELECT p.* FROM papers p JOIN paper_reviews pr ON pr.paper_id=p.id "
+            "WHERE p.project_id=? AND (? IS NULL OR pr.run_id=?) "
+            "GROUP BY p.id ORDER BY p.citation_count DESC, p.year DESC, p.title ASC LIMIT ?",
+            (project_id, review_run_id, review_run_id, limit),
+        )
+        result: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for paper in lineage_papers:
+            paper_id = str(paper.get("id"))
+            if paper_id not in seen:
+                seen.add(paper_id)
+                result.append(paper)
+        for row in rows:
+            paper_id = str(row.get("id"))
+            if paper_id not in seen:
+                seen.add(paper_id)
+                result.append(dict(row))
+        return result[:limit]
 
     def _lineage_claims(self, gap) -> list[dict[str, Any]]:
         if gap is None:
@@ -1082,7 +1596,13 @@ class ManuscriptService:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _title(candidate, complete: bool, keywords: list[str]) -> str:
+    def _title(
+        candidate, complete: bool, keywords: list[str], contract=None
+    ) -> str:
+        if contract is not None:
+            base = pick_title(contract, keywords)
+            suffix = "" if complete else " (incomplete draft)"
+            return base + suffix
         method = (
             " ".join(str(candidate.method).split())
             if candidate
@@ -1090,7 +1610,8 @@ class ManuscriptService:
         )
         method_words = method.split()
         if len(method_words) > 12:
-            method = " ".join(method_words[:12]).rstrip(".,;:") + "…"
+            # Drop words; never append a truncation ellipsis to a title.
+            method = " ".join(method_words[:12]).rstrip(".,;:")
         method = method.rstrip(".,;:")
         keyword = next(
             (term for term in keywords if term.lower() not in method.lower()),
@@ -1104,9 +1625,23 @@ class ManuscriptService:
         suffix = "" if complete else " (incomplete draft)"
         return base + suffix
 
-    def _keywords(self, project_id: str, papers: list[dict[str, Any]]) -> list[str]:
-        """Keywords block: Findings Memory keywords + paper metadata only
-        (template-spec.json T28). Never invented."""
+    def _keywords(
+        self,
+        project_id: str,
+        papers: list[dict[str, Any]],
+        *,
+        gap=None,
+        candidate=None,
+        spec=None,
+    ) -> list[str]:
+        """Keywords block: Findings Memory + paper/seed metadata only.
+
+        Method fragments ("add", "fixed", "standardized", model names) are
+        filtered; domain terms from the gap, candidate, and dataset identity
+        rank first. If the durable record honestly provides fewer than three
+        useful terms, the unfiltered extracted terms are retained rather than
+        inventing new ones.
+        """
         sources: list[list[str]] = []
         try:
             findings = self.repository.findings_for_project(project_id, limit=50)
@@ -1119,8 +1654,30 @@ class ManuscriptService:
                 stored = []
             if isinstance(stored, list):
                 sources.append([str(item) for item in stored])
-        sources.append(keyword_tokens(*[str(p.get("title") or "") for p in papers]))
-        return pick_keywords(sources)
+        sources.append(keyword_tokens(
+            str((gap or {}).get("statement") or "") if isinstance(gap, dict) else "",
+            str(getattr(candidate, "method", "") or ""),
+            str(getattr(spec, "dataset_identity", "") or ""),
+            *[str(p.get("title") or "") for p in papers],
+        ))
+        merged = pick_keywords(sources, maximum=16)
+        filtered: list[str] = []
+        for term in merged:
+            lowered = term.lower().strip()
+            if not lowered or lowered in _KEYWORD_STOPWORDS:
+                continue
+            if len(lowered) < 3 or re.search(r"\d", lowered):
+                continue
+            if lowered not in filtered:
+                filtered.append(lowered)
+        if len(filtered) < 3:
+            for term in merged:
+                lowered = term.lower().strip()
+                if lowered and lowered not in filtered:
+                    filtered.append(lowered)
+                if len(filtered) >= 3:
+                    break
+        return filtered[:6]
 
     @staticmethod
     def _keywords_lines(keywords: list[str], complete: bool) -> list[str]:
@@ -1147,17 +1704,18 @@ class ManuscriptService:
                 claims.append(row)
         return claims
 
-    def _paper_review_notes(self, papers) -> dict[str, dict[str, Any]]:
-        """Per-paper review fields (problem, method, protocol, limitations)
-        already recorded by the review stage — surfaced into the evidence
-        matrix and reused here verbatim."""
+    def _paper_review_notes(
+        self, papers, review_run_id: str | None = None
+    ) -> dict[str, dict[str, Any]]:
+        """Per-paper review fields from the exact review run."""
         notes: dict[str, dict[str, Any]] = {}
         for paper in papers:
             row = self.repository.row(
                 "SELECT problem, research_question, method, experimental_protocol, "
-                "limitations_json FROM paper_reviews WHERE paper_id=? "
+                "results_json, limitations_json FROM paper_reviews "
+                "WHERE paper_id=? AND (? IS NULL OR run_id=?) "
                 "ORDER BY rowid DESC LIMIT 1",
-                (paper["id"],),
+                (paper["id"], review_run_id, review_run_id),
             )
             if row:
                 notes[str(paper["id"])] = dict(row)
@@ -1170,6 +1728,27 @@ class ManuscriptService:
         block = methodology.get("methodology", methodology)
         value = str(block.get(field) or "").strip() if isinstance(block, dict) else ""
         return value or _NOT_SPECIFIED
+
+    @staticmethod
+    def _sanitize(text: Any) -> str:
+        """Remove internal lineage identifiers from prose.
+
+        The evidence bundle and appendices keep the exact ids; the body must
+        read like a paper, not like a database row. This is a presentation
+        sanitizer, not a provenance rewrite: the stored evidence is unchanged.
+        """
+        value = str(text or "")
+        value = re.sub(r"\b(?:claim|claims)\s+[0-9a-fA-F]{8,}\b", "", value, flags=re.IGNORECASE)
+        value = re.sub(r"\((?:review run|ID)\s+[0-9a-fA-F-]+\)", "", value, flags=re.IGNORECASE)
+        value = re.sub(r"\(checksum prefix[^)]*\)", "", value, flags=re.IGNORECASE)
+        value = re.sub(r"\b[0-9a-fA-F]{16,}\b", "", value)
+        value = re.sub(r"\bpaper\s*\)", ")", value, flags=re.IGNORECASE)
+        value = re.sub(r"\bpaper\s*(?=[,;])", "", value, flags=re.IGNORECASE)
+        value = re.sub(r"\s+([,.;:])", r"\1", value)
+        value = re.sub(r"\(\s*,\s*\)", "", value)
+        value = re.sub(r",\s*\)", ")", value)
+        value = re.sub(r"\(\s*\)", "", value)
+        return " ".join(value.split()).strip()
 
     @staticmethod
     def _period_join(*parts: str) -> str:
@@ -1194,6 +1773,9 @@ class ManuscriptService:
         complete,
         gaps,
         seed,
+        *,
+        contract=None,
+        synthesis=None,
     ) -> list[str]:
         lines = ["## Abstract", ""]
         if not (complete and analysis is not None and report is not None and gap is not None):
@@ -1212,11 +1794,11 @@ class ManuscriptService:
             """Deterministic bounded snippet (first N words) so a single long
             recorded field can never blow the abstract past the template's
             150-250 word window."""
-            joined = " ".join(str(text).split())
+            joined = " ".join(self._sanitize(text).split())
             tokens = joined.split()
             if len(tokens) <= words:
                 return joined
-            return " ".join(tokens[:words]) + "…"
+            return " ".join(tokens[:words]).rstrip(".,;:") + "."
 
         # The six labeled parts are rebuilt with progressively tighter caps
         # until the whole abstract lands inside the template's word window —
@@ -1244,6 +1826,9 @@ class ManuscriptService:
                 str(candidate.difference_from_existing) if candidate and candidate.difference_from_existing else "not recorded",
                 cap(25),
             )
+            if contract is not None and contract.contributions:
+                method = _snip(contract.contributions[0].claim, cap(30))
+                difference = _snip(contract.contributions[0].novelty_delta, cap(25))
             metric_names = ", ".join(sorted({_short_metric(m) for m in analysis.proposed_metrics}))
             effects = "; ".join(
                 f"{_short_metric(name)}: mean difference {value:+.4f}"
@@ -1261,28 +1846,40 @@ class ManuscriptService:
             )
             seed_question = _snip(str(seed["research_question"]), cap(25)) if seed else ""
             procedure = "; ".join(
-                str(step) for step in (block.get("procedure") or []) if str(step).strip()
+                str(step) for step in _as_list(block.get("procedure")) if str(step).strip()
             ) or "not recorded"
-            procedure = _snip(procedure, cap(35))
+            procedure = _snip(procedure, cap(25))
             gap_part = self._period_join(
-                f"Existing work does not close this question: {_snip(gap['why_unsolved'] or 'not recorded', cap(45))}{counter_text}",
+                f"Existing work does not close this question: {_snip(gap['why_unsolved'] or 'not recorded', cap(35))}{counter_text}",
                 f"The recorded falsification test is: {_snip(gap['falsification_test'] or 'not recorded', cap(35))}",
             )
-            contribution_part = self._period_join(
-                f"To fill this gap we froze a methodology around {method} (difference: {difference}) and tested the preregistered hypothesis: {_snip(spec.hypothesis, cap(30)) if spec else 'not recorded'}",
-                _snip(str(block.get("hypothesis_statement") or ""), cap(30)),
-                f"Mechanism: {_snip(str(block.get('proposed_mechanism') or 'not recorded'), cap(25))}",
-            )
+            if contract is not None and len(contract.contributions) >= 2:
+                contribution_part = self._period_join(
+                    _snip(contract.contributions[0].claim, cap(18)),
+                    _snip(contract.contributions[1].claim, cap(15)),
+                    _snip(contract.contributions[2].claim, cap(12)) if len(contract.contributions) >= 3 else "",
+                )
+            else:
+                contribution_part = self._period_join(
+                    f"To fill this gap we froze a methodology around {method} (difference: {difference}) and tested the preregistered hypothesis: {_snip(spec.hypothesis, cap(30)) if spec else 'not recorded'}",
+                    _snip(str(block.get("hypothesis_statement") or ""), cap(30)),
+                    f"Mechanism: {_snip(str(block.get('proposed_mechanism') or 'not recorded'), cap(25))}",
+                )
             methods_part = self._period_join(
                 f"Study design: {_snip(self._methodology_field(methodology, 'study_design'), cap(25))}",
-                f"Data: {_snip(spec.dataset_identity, cap(15))} (checksum prefix {spec.dataset_checksum[:16]})",
+                f"Data: {_snip(spec.dataset_identity, cap(15))}",
                 f"split: {_snip(spec.split_definition, cap(15))}",
                 f"Sample: {len(spec.random_seeds)} seed(s)",
                 f"inclusion criteria: {spec.required_seed_count} seed(s) required",
                 f"Analysis: {_snip(spec.statistical_plan, cap(30))}",
                 f"Frozen procedure: {procedure}",
             )
-            if factor <= 0.25:
+            if contract is not None and contract.takeaway:
+                conclusion_part = self._period_join(
+                    _snip(contract.takeaway, cap(20)),
+                    "Limitations and threats to validity are reported in the Discussion.",
+                )
+            elif factor <= 0.25:
                 conclusion_part = self._period_join(
                     "Future research should address the limitations listed in the Discussion.",
                     f"Uncertainty recorded: {_snip(str(report['uncertainty']), cap(15))}",
@@ -1294,7 +1891,7 @@ class ManuscriptService:
                     f"Uncertainty recorded: {_snip(str(report['uncertainty']), cap(20))}",
                 )
             lines += [
-                f"**Background:** The question under study is: {_snip(str(gap['statement']), cap(55))} "
+                f"**Background:** The question under study is: {_snip(str(gap['statement']), cap(45))} "
                 + (f"(research program: {seed_question})" if seed_question else ""),
                 "",
                 f"**Gap in Knowledge:** {gap_part}",
@@ -1345,7 +1942,7 @@ class ManuscriptService:
             ):
                 if text and text not in "\n".join(lines):
                     text = " ".join(str(text).split()[:35])
-                    lines += [f"Additional recorded evidence — {field}: {text}", ""]
+                    lines += [f"Context — {field}: {text}", ""]
                     added = True
                     break
             if not added:
@@ -1359,7 +1956,7 @@ class ManuscriptService:
         while _word_count("\n".join(lines)) > max_words:
             stripped = False
             for index in range(len(lines) - 1, -1, -1):
-                if lines[index].startswith("Additional recorded evidence"):
+                if lines[index].startswith("Context —"):
                     del lines[index : index + 2]
                     stripped = True
                     break
@@ -1377,6 +1974,8 @@ class ManuscriptService:
         seed,
         complete,
         gaps,
+        *,
+        synthesis=None,
     ) -> list[str]:
         lines = ["## 1. Introduction", ""]
         if gap is None:
@@ -1389,7 +1988,7 @@ class ManuscriptService:
         lines += [
             "### Why this topic is relevant now",
             "",
-            f"The research question (ID {gap['id']}): {gap['statement']}",
+            f"The research question: {self._sanitize(gap['statement'])}",
             "",
         ]
         if seed_topic:
@@ -1397,20 +1996,20 @@ class ManuscriptService:
         lines += [
             "### Existing state of knowledge and the gap",
             "",
-            f"What remains unresolved: {gap['why_unsolved'] or 'not recorded'}",
+            f"What remains unresolved: {self._sanitize(gap['why_unsolved']) or 'not recorded'}",
             "",
         ]
         if counter_claims:
             lines += ["Recorded critiques and counter-evidence from the review:", ""]
             for item in counter_claims[:4]:
-                lines.append(f"- [{item['claim_type']}] {item['statement']}")
+                lines.append(f"- [{item['claim_type']}] {self._sanitize(item['statement'])}")
             lines.append("")
         recorded_limitations: list[str] = []
         for notes in review_notes.values():
             try:
                 for item in json.loads(notes.get("limitations_json") or "[]"):
                     if str(item).strip():
-                        recorded_limitations.append(str(item))
+                        recorded_limitations.append(self._sanitize(item))
             except (ValueError, TypeError):
                 continue
         if recorded_limitations:
@@ -1420,12 +2019,15 @@ class ManuscriptService:
             lines.append("")
         lines += [
             self._period_join(
-                f"The gap emerges from these recorded critiques and counter-evidence "
-                f"(review run {gap['run_id']})",
-                f"the falsification test recorded with the gap is: "
-                f"{gap['falsification_test'] or 'not recorded'}",
+                "The gap emerges from these recorded critiques and counter-evidence",
+                f"the falsification test is: "
+                f"{self._sanitize(gap['falsification_test']) or 'not recorded'}",
             ),
             "",
+        ]
+        if synthesis is not None and synthesis.positioning:
+            lines += [synthesis.positioning, ""]
+        lines += [
             "### What this study did to fill the gap",
             "",
         ]
@@ -1439,10 +2041,10 @@ class ManuscriptService:
             f"preregistered experiment. "
             + (
                 self._period_join(
-                    f"Hypothesis: {spec.hypothesis}",
-                    f"Falsification condition: {spec.falsification_condition}",
-                    f"The experiment was executed only after exact-specification "
-                    f"approval (worker {spec.target_worker})",
+                    f"Hypothesis: {self._sanitize(spec.hypothesis)}",
+                    f"Falsification condition: {self._sanitize(spec.falsification_condition)}",
+                    "The experiment was executed only after exact-specification "
+                    "approval",
                 )
                 if spec
                 else "No experiment specification was recorded."
@@ -1451,81 +2053,6 @@ class ManuscriptService:
         ]
         if not complete:
             lines.append(f"This draft is INCOMPLETE. Missing evidence: {'; '.join(gaps)}")
-            lines.append("")
-        return lines
-
-    def _literature_review_markdown(
-        self, papers, claims, counter_claims, review_notes, keys, gap
-    ) -> list[str]:
-        """Template: Literature Review, optional — included only when
-        literature evidence exists. PEER-structured entries."""
-        if not papers and not claims:
-            return []
-        lines = ["## 2. Literature Review", ""]
-        if not papers:
-            lines += ["No supporting papers recorded.", ""]
-            return lines
-        counter_by_paper: dict[str, list[dict[str, Any]]] = {}
-        for item in counter_claims:
-            counter_by_paper.setdefault(str(item["paper_id"]), []).append(item)
-        for index, paper in enumerate(papers):
-            key = keys[paper["id"]]
-            notes = review_notes.get(str(paper["id"]), {})
-            year = f" ({paper['year']})" if paper.get("year") else ""
-            lines.append(f"### {paper['title']}{year} [@{key}]")
-            lines.append("")
-            point = (
-                str(notes.get("problem") or notes.get("research_question") or "").strip()
-                or str(paper.get("abstract") or "")[:400]
-                or "no problem statement recorded"
-            )
-            lines.append(f"- **Point:** {point}")
-            paper_claims = [
-                item for item in claims if str(item["paper_id"]) == str(paper["id"])
-            ]
-            if paper_claims:
-                lines.append(
-                    f"- **Evidence:** "
-                    + "; ".join(
-                        str(item.get("excerpt") or item.get("statement"))[:300]
-                        for item in paper_claims[:2]
-                    )
-                )
-            else:
-                lines.append(
-                    "- **Evidence:** no verified excerpt stored for this paper."
-                )
-            lines.append(
-                f"- **Explanation:** Cited as evidence for the research gap "
-                f"(review run {gap['run_id'] if gap else 'n/a'})."
-            )
-            contradictions = counter_by_paper.get(str(paper["id"]), [])
-            if contradictions:
-                lines.append(
-                    f"- **Repeat/Link:** Contradiction recorded: "
-                    + "; ".join(str(item["statement"])[:200] for item in contradictions[:2])
-                )
-            else:
-                lines.append(
-                    f"- **Repeat/Link:** Next study in the review ranking follows."
-                )
-            try:
-                paper_limitations = [
-                    str(item)
-                    for item in json.loads(notes.get("limitations_json") or "[]")
-                    if str(item).strip()
-                ]
-            except (ValueError, TypeError):
-                paper_limitations = []
-            if paper_limitations:
-                lines.append(
-                    f"- **Gap in the literature (recorded critique):** "
-                    + "; ".join(paper_limitations[:3])
-                )
-            if notes.get("experimental_protocol"):
-                lines.append(
-                    f"- **Study design (as reviewed):** {notes['experimental_protocol']}"
-                )
             lines.append("")
         return lines
 
@@ -1552,9 +2079,8 @@ class ManuscriptService:
         ]
         if spec is not None:
             lines += [
-                f"Recorded data configuration: dataset '{spec.dataset_identity}' "
-                f"(checksum prefix {spec.dataset_checksum[:16]}); recorded in experiment "
-                f"specification {spec.id}.",
+                f"Recorded data configuration: dataset '{self._sanitize(spec.dataset_identity)}' "
+                f"(split '{self._sanitize(spec.split_definition)}').",
                 "",
             ]
         lines += [
@@ -1567,7 +2093,7 @@ class ManuscriptService:
             lines += [
                 f"Recorded sample configuration: seeds {', '.join(str(s) for s in spec.random_seeds)} "
                 f"({len(spec.random_seeds)} of {spec.required_seed_count} required); "
-                f"split: {spec.split_definition}.",
+                f"split: {self._sanitize(spec.split_definition)}.",
                 "",
             ]
         lines += [
@@ -1579,9 +2105,9 @@ class ManuscriptService:
         if spec is not None:
             lines += [
                 self._period_join(
-                    f"Statistical plan (preregistered): {spec.statistical_plan}",
+                    f"Statistical plan (preregistered): {self._sanitize(spec.statistical_plan)}",
                     f"Interpretation rules (preregistered): "
-                    f"{'; '.join(spec.interpretation_rules) or 'not recorded'}",
+                    f"{self._sanitize('; '.join(spec.interpretation_rules)) or 'not recorded'}",
                 ),
                 "",
             ]
@@ -1592,7 +2118,7 @@ class ManuscriptService:
             "",
         ]
         procedure = [
-            str(step) for step in (block.get("procedure") or []) if str(step).strip()
+            str(step) for step in _as_list(block.get("procedure")) if str(step).strip()
         ]
         lines += ["### Cookbook procedure (frozen, linear order)", ""]
         if procedure:
@@ -1615,14 +2141,14 @@ class ManuscriptService:
             lines += [f"Falsification conditions: {falsification}", ""]
         if block.get("expected_resource_demands"):
             lines += [f"Expected resource demands: {block['expected_resource_demands']}", ""]
-        freeze_id = lineage.get("methodology_freeze_id")
         lines += [
             "### Why these choices (selection rationale)",
             "",
             f"Every choice above traces to the frozen methodology artifact "
-            f"(freeze {freeze_id}, version {lineage.get('methodology_version')}) "
-            f"in the review → novelty → freeze lineage; it is a recorded design, "
-            f"not a post-hoc justification.",
+            f"(version {lineage.get('methodology_version')}) in the review → "
+            f"novelty → freeze lineage; it is a recorded design, not a post-hoc "
+            f"justification. The exact artifact identifiers are listed in "
+            f"Appendix A.",
             "",
         ]
         for field in _TEMPLATE_METHODOLOGY_FIELDS:
@@ -1653,19 +2179,32 @@ class ManuscriptService:
                 "",
                 f"Figure 1 — Effect sizes (mean difference, candidate minus baseline) per "
                 f"metric, derived deterministically from the validated seed observations "
-                f"(analysis {analysis.id}).",
+                f"(analysis record in Appendix A).",
                 "",
             ]
         gates = ", ".join(
             f"{name}: {'PASS' if passed else 'FAIL'}"
             for name, passed in dict(analysis.decision_gates).items()
         )
+        lines += [f"Decision gates: {gates}.", "", "### Statistical tests", ""]
+        tests = dict(analysis.statistical_tests)
+        if tests:
+            lines += ["| Metric | Test | exact p | n | Status |", "|---|---|---:|---:|---|"]
+            for metric, test in sorted(tests.items()):
+                if not isinstance(test, dict):
+                    continue
+                observations = test.get("raw_observations") or []
+                p_value = test.get("p_value")
+                p_text = "—" if p_value is None else p_value
+                n_text = test.get("n") or len(observations) or "—"
+                lines.append(
+                    f"| {metric} | {test.get('test', '—')} | "
+                    f"{p_text} | {n_text} | {test.get('status', '—')} |"
+                )
+            lines.append("")
+        else:
+            lines += ["No statistical test record was available.", ""]
         lines += [
-            f"Decision gates: {gates}.",
-            "",
-            f"Statistical tests (deterministic, exact): "
-            f"{json.dumps(dict(analysis.statistical_tests), sort_keys=True)}",
-            "",
             f"Hypothesis support: {analysis.hypothesis_support_assessment} "
             f"(report decision: {report['decision'] if report else 'n/a'}).",
             "",
@@ -1680,18 +2219,54 @@ class ManuscriptService:
         lines.append("")
         return lines
 
-    def _study_limitations(self, report, methodology, spec, analysis) -> list[str]:
+    def _study_limitations(
+        self, report, methodology, spec, analysis, *, readiness=None
+    ) -> list[str]:
         """Study Limitations for the Discussion (template-spec.json T90):
-        at least 3 distinct entries, every one an objective fact about this
-        run — report limitations, uncertainty, dataset bounds, unrun
-        ablations/robustness, and unspecified methodology fields."""
+        at least 3 distinct, substantive entries. Integrity statements
+        ("no fixture was used") are strengths, not limitations; duplicates
+        and unsupported boilerplate are removed."""
         limitations: list[str] = []
         seen: set[str] = set()
+        semantic_seen: set[str] = set()
 
         def add(text: str) -> None:
-            compact = " ".join(str(text).split())
-            if compact and compact not in seen:
-                seen.add(compact)
+            compact = " ".join(self._sanitize(text).split())
+            lowered = compact.lower()
+            if not compact or len(compact.split()) < 4:
+                return
+            if any(phrase in lowered for phrase in (
+                "no model prediction",
+                "no result is fabricated",
+                "fixture, or incompatible cached",
+            )):
+                return
+            words = compact.split()
+            if len(words) > 55:
+                compact = " ".join(words[:55]).rstrip(".,;:") + "."
+                lowered = compact.lower()
+            if "derived statistics are limited" in lowered:
+                if "derived_stats" in semantic_seen:
+                    return
+                semantic_seen.add("derived_stats")
+            if "findings are bounded to dataset" in lowered:
+                if "dataset_bounds" in semantic_seen:
+                    return
+                semantic_seen.add("dataset_bounds")
+            if "findings are bounded to dataset" in lowered:
+                key = "dataset_bounds"
+            elif "derived statistics are limited" in lowered:
+                key = "derived_bounds"
+            elif "ablation" in lowered and any(
+                marker in lowered for marker in ("not run", "not measured", "unmeasured")
+            ):
+                key = "ablations"
+            elif "robustness" in lowered and "not" in lowered:
+                key = "robustness"
+            else:
+                key = re.sub(r"[^a-z0-9]+", " ", lowered).strip()
+            if key and key not in seen:
+                seen.add(key)
                 limitations.append(compact)
 
         if report is not None:
@@ -1700,8 +2275,8 @@ class ManuscriptService:
             add(str(report.get("uncertainty") or ""))
         if spec is not None:
             add(
-                f"Findings are bounded to dataset '{spec.dataset_identity}' "
-                f"(split '{spec.split_definition}', "
+                f"Findings are bounded to dataset '{self._sanitize(spec.dataset_identity)}' "
+                f"(split '{self._sanitize(spec.split_definition)}', "
                 f"{len(spec.random_seeds)} seed(s)); generalization beyond this "
                 f"configuration is unverified."
             )
@@ -1718,6 +2293,36 @@ class ManuscriptService:
                 )
         if analysis is not None and not dict(analysis.ablation_contributions):
             add("Ablation contributions were not measured in this lineage.")
+        if readiness is not None:
+            if readiness.provenance.simulated:
+                add(
+                    "The reported measurements were generated by a simulation, "
+                    "not by running the claimed protocol on real benchmarks; "
+                    "empirical claims are limited to the simulation model."
+                )
+            if not readiness.provenance.real_execution and not readiness.provenance.simulated:
+                add(
+                    "The measurement provenance is unverified: a real execution "
+                    "identity (dataset checksum and implementation commit) was "
+                    "not available."
+                )
+            if not readiness.evidence.power_established:
+                add(
+                    "The study was not powered to detect the claimed effect; "
+                    "negative and null results are inconclusive rather than "
+                    "evidence of absence."
+                )
+            if readiness.evidence.external_baselines == 0:
+                add(
+                    "No external baseline was evaluated; the comparison is "
+                    "internal to the study and does not establish superiority "
+                    "over prior methods."
+                )
+            if readiness.evidence.ablations == 0:
+                add(
+                    "Ablations were not run; the contribution of individual "
+                    "components is unmeasured."
+                )
         return limitations
 
     def _discussion_markdown(
@@ -1733,6 +2338,10 @@ class ManuscriptService:
         papers,
         complete,
         gaps,
+        *,
+        synthesis=None,
+        contract=None,
+        readiness=None,
     ) -> list[str]:
         lines = ["## 5. Discussion", ""]
         if report is None:
@@ -1745,21 +2354,36 @@ class ManuscriptService:
             "### Recap of what we found",
             "",
             f"The deterministic decision gates classified the outcome as **{decision}**: "
-            f"{report['decision_evidence']}",
+            f"{self._sanitize(report['decision_evidence'])}",
             "",
-            f"Observed uncertainty: {report['uncertainty']}",
+            f"Observed uncertainty: {self._sanitize(report['uncertainty'])}",
             "",
         ]
         if str(report["decision"]).lower() in {
             "refuted",
             "no_effect",
-            "partially_supported",
+            "mechanism_contradicted",
         }:
             lines += [
-                "This is a negative/null-leaning result and is reported as a valid "
+                "This is a negative or null result and is reported as a valid "
                 "scientific outcome; it is not a failure of the workflow.",
                 "",
             ]
+        if synthesis is not None and synthesis.papers:
+            lines += ["### Comparison with prior work", ""]
+            if synthesis.positioning:
+                lines += [synthesis.positioning, ""]
+            closest = [paper for paper in synthesis.papers if paper.is_gap_support][:4]
+            if closest:
+                lines += [
+                    "The gap's supporting studies are: "
+                    + "; ".join(
+                        f"{paper.title} [@{paper.key}]" if paper.key else paper.title
+                        for paper in closest
+                    )
+                    + ".",
+                    "",
+                ]
         lines += ["### Study Limitations (at least 3)", ""]
         for number, item in enumerate(limitations, start=1):
             lines.append(f"{number}. {item}")
@@ -1769,7 +2393,7 @@ class ManuscriptService:
             try:
                 for item in json.loads(notes.get("limitations_json") or "[]"):
                     if str(item).strip():
-                        reviewed_limitations.append(str(item))
+                        reviewed_limitations.append(self._sanitize(item))
             except (ValueError, TypeError):
                 continue
         if reviewed_limitations:
@@ -1791,8 +2415,8 @@ class ManuscriptService:
             "- Exact lineage: review gap → methodology freeze → specification → "
             "analysis → report are linked by durable ids and checksums.",
             "- Deterministic numerics: every reported number derives from "
-            "checksummed seed observations through the deterministic analysis; "
-            "no model-generated number appears anywhere.",
+            "stored seed observations through the deterministic analysis; no "
+            "number is invented by the writer.",
             "",
             "### Implications for future research",
             "",
@@ -1800,15 +2424,15 @@ class ManuscriptService:
         if spec is not None:
             lines += [
                 f"Future work should address the limitations above, in particular the "
-                f"bounds of dataset '{spec.dataset_identity}' and split "
-                f"'{spec.split_definition}', and run the ablations and robustness "
+                f"bounds of dataset '{self._sanitize(spec.dataset_identity)}' and split "
+                f"'{self._sanitize(spec.split_definition)}', and run the ablations and robustness "
                 f"tests named in the specification.",
                 "",
             ]
         if gap is not None and gap.get("missing_experiment"):
             lines += [
                 f"The review's missing experiment remains open for future work: "
-                f"{gap['missing_experiment']}",
+                f"{self._sanitize(gap['missing_experiment'])}",
                 "",
             ]
         lines += [
@@ -1823,11 +2447,18 @@ class ManuscriptService:
             competing = block["competing_explanations"]
             if isinstance(competing, list):
                 competing = "; ".join(str(item) for item in competing)
-            lines += [f"Competing explanations recorded at freeze time: {competing}", ""]
+            lines += [f"Competing explanations recorded at freeze time: {self._sanitize(competing)}", ""]
         if block.get("uncertainty_statement"):
-            lines += [f"Uncertainty recorded at freeze time: {block['uncertainty_statement']}", ""]
-        lines += ["### Conclusion", ""]
-        lines += [f"Decision: {decision}.", ""]
+            lines += [f"Uncertainty recorded at freeze time: {self._sanitize(block['uncertainty_statement'])}", ""]
+        if self.venue.template == "fasttrack":
+            lines += ["### Conclusion", ""]
+            if contract is not None and contract.takeaway:
+                lines += [
+                    f"{contract.takeaway} The preregistered decision is {decision}.",
+                    "",
+                ]
+            else:
+                lines += [f"Decision: {decision}.", ""]
         return lines
 
     def _references_markdown(self, papers, keys) -> list[str]:
@@ -1858,14 +2489,17 @@ class ManuscriptService:
     ) -> list[str]:
         lines = ["## Appendices", ""]
         lines += ["### Appendix A. Evidence bundle", ""]
+        def _id(key: str) -> str:
+            return str(lineage.get(key) or "not recorded")
+
         lines += [
-            f"- Research gap: {lineage.get('gap_id')} (review run {lineage.get('review_run_id')})",
-            f"- Novelty portfolio: {lineage.get('portfolio_id')}",
-            f"- Methodology freeze: {lineage.get('methodology_freeze_id')} "
-            f"(version {lineage.get('methodology_version')})",
-            f"- Experiment specification: {lineage.get('spec_id')}",
-            f"- Statistical analysis: {lineage.get('analysis_id')}",
-            f"- Experiment report: {lineage.get('report_id')}",
+            f"- Research gap: {_id('gap_id')} (review run {_id('review_run_id')})",
+            f"- Novelty portfolio: {_id('portfolio_id')}",
+            f"- Methodology freeze: {_id('methodology_freeze_id')} "
+            f"(version {_id('methodology_version')})",
+            f"- Experiment specification: {_id('spec_id')}",
+            f"- Statistical analysis: {_id('analysis_id')}",
+            f"- Experiment report: {_id('report_id')}",
             "",
         ]
         if papers:
@@ -1991,17 +2625,19 @@ class ManuscriptService:
         for index, (metric, value) in enumerate(zip(metrics, values)):
             label = self._tex(metric)
             bar = max(abs(value) * 3.0, 0.1)
+            origin = 3.0 + min(value, 0.0) * 3.0
+            end = origin + bar
             color = "blue!60" if value >= 0 else "orange!70"
             tikz_lines.append(
                 f"\\node[anchor=east,font=\\small] at (2.7,{3.0 - index * 0.7:.2f}) "
                 f"{{{label}}};"
             )
             tikz_lines.append(
-                f"\\filldraw[fill={color}] (3.0,{2.65 - index * 0.7:.2f}) "
-                f"rectangle ({3.0 + bar:.3f},{3.05 - index * 0.7:.2f});"
+                f"\\filldraw[fill={color}] ({origin:.3f},{2.65 - index * 0.7:.2f}) "
+                f"rectangle ({end:.3f},{3.05 - index * 0.7:.2f});"
             )
             tikz_lines.append(
-                f"\\node[anchor=west,font=\\small] at ({3.0 + bar + 0.15:.3f},"
+                f"\\node[anchor=west,font=\\small] at ({end + 0.15:.3f},"
                 f"{2.85 - index * 0.7:.2f}) {{{value:+.4f}}};"
             )
         tikz_lines += [
@@ -2096,7 +2732,7 @@ class ManuscriptService:
                 for name, passed in dict(analysis.decision_gates).items()
             )
             procedure = "; ".join(
-                str(step) for step in (block.get("procedure") or []) if str(step).strip()
+                str(step) for step in _as_list(block.get("procedure")) if str(step).strip()
             )
             abstract = (
                 "\\textbf{Background.} "
@@ -2172,7 +2808,7 @@ class ManuscriptService:
             )
             procedure_tex = "\n".join(
                 f"\\item {self._tex(step)}"
-                for step in (block.get("procedure") or [])
+                for step in _as_list(block.get("procedure"))
                 if str(step).strip()
             )
             method_text = (
@@ -2224,6 +2860,13 @@ class ManuscriptService:
             "\n".join(f"\\item {self._tex(paper['title'])}" for paper in papers)
             or "\\item None."
         )
+        conclusion_tex = ""
+        if self.venue.template != "fasttrack":
+            conclusion_tex = (
+                "\\section{Conclusion}\n"
+                + self._tex(str(report["decision_evidence"] if report else decision))
+                + "\n"
+            )
         return (
             "\\documentclass[11pt]{article}\n"
             "\\usepackage[margin=1in]{geometry}\n"
@@ -2257,7 +2900,8 @@ class ManuscriptService:
             )
             + "\n"
             "\\section{Discussion}\n" + discussion + "\n"
-            "\\section{References}\n\\begin{itemize}\n" + references_tex + "\n\\end{itemize}\n"
+            + conclusion_tex
+            + "\\section{References}\n\\begin{itemize}\n" + references_tex + "\n\\end{itemize}\n"
             "\\section{Appendices}\n"
             "\\textbf{Appendix A. Evidence bundle.} Lineage: gap "
             + str(lineage.get("gap_id"))
@@ -2329,20 +2973,32 @@ class ManuscriptService:
         return " and ".join(names) or "Unknown authors"
 
     @staticmethod
+    def _bibtex_escape(value: Any) -> str:
+        text = str(value)
+        text = text.replace("\\", r"\textbackslash{}")
+        text = text.replace("{", r"\{").replace("}", r"\}")
+        text = (
+            text.replace("&", r"\&")
+            .replace("%", r"\%")
+            .replace("#", r"\#")
+            .replace("_", r"\_")
+            .replace("$", r"\$")
+            .replace("~", r"\textasciitilde{}")
+            .replace("^", r"\textasciicircum{}")
+        )
+        return text
+
+    @staticmethod
     def _bibtex(papers: list[dict[str, Any]], keys: dict[str, str]) -> str:
         entries = []
+        escape = ManuscriptService._bibtex_escape
         for paper in papers:
             key = keys[paper["id"]]
-            authors = (
+            authors = escape(
                 ManuscriptService._author_names(paper.get("authors_json"))
                 or "Unknown authors"
             )
-            title = (
-                str(paper.get("title") or "Untitled")
-                .replace("&", "\\&")
-                .replace("{", "\\{")
-                .replace("}", "\\}")
-            )
+            title = escape(str(paper.get("title") or "Untitled"))
             year = paper.get("year") or "n.d."
             venue = str(paper.get("venue") or "").strip()
             doi = str(paper.get("doi") or "").strip()
@@ -2355,11 +3011,11 @@ class ManuscriptService:
                 f"year = {{{year}}}",
             ]
             if venue and venue.lower() not in ("unknown", "none"):
-                fields.append(f"journal = {{{venue}}}")
+                fields.append(f"journal = {{{escape(venue)}}}")
             if doi:
-                fields.append(f"doi = {{{doi}}}")
+                fields.append(f"doi = {{{escape(doi)}}}")
             if url:
-                fields.append(f"url = {{{url}}}")
+                fields.append(f"url = {{{escape(url)}}}")
             kind = (
                 "article"
                 if venue and venue.lower() not in ("unknown", "none")
@@ -2465,6 +3121,9 @@ class ManuscriptService:
         figure_svg,
         review_notes,
         seed,
+        contract=None,
+        synthesis=None,
+        ledger=None,
     ) -> dict[str, Any]:
         """Outline → draft → deterministic audit → bounded revision.
 
@@ -2478,14 +3137,30 @@ class ManuscriptService:
         back to the deterministic draft — the audit failure is recorded,
         never masked.
         """
-        allowed = self._allowed_numbers(analysis, spec, papers)
+        allowed = (
+            set(ledger.allowed_numbers)
+            if ledger is not None and ledger.allowed_numbers
+            else self._allowed_numbers(analysis, spec, papers)
+        )
         deterministic_path = root / "manuscript_deterministic.md"
         deterministic_path.write_text(markdown, encoding="utf-8")
         facts = self._evidence_pack(
             analysis, spec, gap, methodology, report, papers, keys, tables_md,
             decision, limitations=limitations, keywords=keywords,
-            figure_svg=figure_svg,
+            figure_svg=figure_svg, review_notes=review_notes,
         )
+        if contract is not None:
+            facts += "\n\nCONTRIBUTION CONTRACT (the paper's argument):\n" + contract.to_markdown()
+        if synthesis is not None and synthesis.papers:
+            facts += (
+                "\n\nLITERATURE SYNTHESIS (themed, from the reviewed corpus; use these "
+                "citation keys and only these recorded claims):\n"
+                + "\n".join(synthesis.to_markdown_lines())
+            )
+        if ledger is not None:
+            facts += "\n\nCLAIM LEDGER (every factual sentence must trace here):\n" + json.dumps(
+                ledger.to_dict(), indent=2, ensure_ascii=False
+            )
         template_rules = (
             "The manuscript MUST follow the FastTrack Academic Research Paper "
             "Template (template-spec.json) — these are enforceable rules, not "
@@ -2556,11 +3231,17 @@ class ManuscriptService:
             operation="manuscript_draft",
         )
         draft = draft_result.text
-        violations = self._audit_draft(draft, allowed, keys, decision)
+        attempt_one_path = root / "manuscript_model_attempt_1.md"
+        attempt_one_path.write_text(draft, encoding="utf-8")
+        violations = self._audit_draft(draft, allowed, keys, decision, ledger=ledger)
         template_violations = self._template_violations(
             draft, literature_evidence=bool(papers), figure_svg=figure_svg
         )
-        audit: dict[str, Any] = {"attempts": [], "fallback": None}
+        audit: dict[str, Any] = {
+            "attempts": [],
+            "fallback": None,
+            "attempt_paths": [str(attempt_one_path)],
+        }
         audit["attempts"].append({"violations": violations, "template": template_violations})
         if self._violation_total(violations, template_violations):
             revision_messages = draft_messages[:1] + [
@@ -2571,9 +3252,11 @@ class ManuscriptService:
                     "content": (
                         "AUDIT REJECTIONS (fix every one; change nothing else):\n"
                         f"- unsupported numbers: {violations['numbers'][:20]}\n"
+                        f"- offending sentences: {violations.get('number_details', [])[:10]}\n"
                         f"- unknown citation keys: {violations['citations']}\n"
                         f"- overclaim phrases: {violations['overclaims']}\n"
                         f"- decision missing/changed: {violations['decision_missing']}\n"
+                        f"- decision inverted/negated: {violations.get('decision_inverted', False)}\n"
                         f"- template violations: {template_violations}\n"
                         "Rewrite the manuscript obeying the hard rules and the "
                         "FastTrack template rules."
@@ -2588,7 +3271,10 @@ class ManuscriptService:
                 operation="manuscript_revision",
             )
             draft = revised_result.text
-            violations = self._audit_draft(draft, allowed, keys, decision)
+            attempt_two_path = root / "manuscript_model_attempt_2.md"
+            attempt_two_path.write_text(draft, encoding="utf-8")
+            audit["attempt_paths"].append(str(attempt_two_path))
+            violations = self._audit_draft(draft, allowed, keys, decision, ledger=ledger)
             template_violations = self._template_violations(
                 draft, literature_evidence=bool(papers), figure_svg=figure_svg
             )
@@ -2597,12 +3283,15 @@ class ManuscriptService:
             )
         if self._violation_total(violations, template_violations):
             audit["fallback"] = "deterministic"
+            rejected_path = root / "manuscript_model_rejected.md"
+            rejected_path.write_text(draft, encoding="utf-8")
             return {
                 "mode": "model",
                 "used_model_draft": False,
                 "audit": audit,
                 "reason": "audit violations survived one revision; deterministic draft kept",
                 "deterministic_path": str(deterministic_path),
+                "rejected_draft_path": str(rejected_path),
             }
         draft_path = root / "manuscript.md"
         draft_path.write_text(draft, encoding="utf-8")
@@ -2656,30 +3345,44 @@ class ManuscriptService:
         return allowed
 
     def _audit_draft(
-        self, draft: str, allowed: set[float], keys: dict[str, str], decision: str
+        self,
+        draft: str,
+        allowed: set[float],
+        keys: dict[str, str],
+        decision: str,
+        *,
+        ledger: ClaimLedger | None = None,
     ) -> dict[str, Any]:
         violations: dict[str, Any] = {
             "numbers": [],
+            "number_details": [],
             "citations": [],
             "overclaims": [],
             "decision_missing": False,
+            "decision_inverted": False,
         }
-        for match in re.finditer(r"-?\d+(?:\.\d+)?", draft):
-            token = match.group(0)
-            value = float(token)
-            # Accept the signed value (negative effect sizes / interval bounds)
-            # or, as a fallback for date/label ranges like "2019-2023", the
-            # unsigned value; both must trace to the allowed evidence set.
-            candidates = (value, abs(value))
-            if any(c.is_integer() and c <= _STRUCTURAL_INT_MAX for c in candidates):
-                continue
-            if any(
-                abs(candidate - allowed_value) < 1e-9
-                for candidate in candidates
-                for allowed_value in allowed
-            ):
-                continue
-            violations["numbers"].append(token)
+        if ledger is not None:
+            details = ledger.audit_text(draft)
+            violations["number_details"] = details
+            violations["numbers"] = list(dict.fromkeys(item["token"] for item in details))
+        else:
+            for match in re.finditer(r"-?\d+(?:\.\d+)?", draft):
+                token = match.group(0)
+                value = float(token)
+                # Accept the signed value (negative effect sizes / interval
+                # bounds) or, as a fallback for date/label ranges like
+                # "2019-2023", the unsigned value; both must trace to the
+                # allowed evidence set.
+                candidates = (value, abs(value))
+                if any(c.is_integer() and c <= _STRUCTURAL_INT_MAX for c in candidates):
+                    continue
+                if any(
+                    abs(candidate - allowed_value) < 1e-9
+                    for candidate in candidates
+                    for allowed_value in allowed
+                ):
+                    continue
+                violations["numbers"].append(token)
         cited = set(re.findall(r"\[@([A-Za-z0-9_-]+)\]", draft))
         violations["citations"] = sorted(cited - set(keys.values()) - {"unknown"})
         lowered = draft.lower()
@@ -2687,37 +3390,31 @@ class ManuscriptService:
             pattern for pattern in _OVERCLAIM_PATTERNS if pattern in lowered
         ]
         violations["decision_missing"] = decision.lower() not in lowered
-        return (
-            violations
-            if (
-                violations["numbers"]
-                or violations["citations"]
-                or violations["overclaims"]
-                or violations["decision_missing"]
+        violations["decision_inverted"] = bool(
+            re.search(
+                r"\b(?:not|no|never)\s+(?:\w+\s+){0,2}" + re.escape(decision.lower()),
+                lowered,
             )
-            else {
-                "numbers": [],
-                "citations": [],
-                "overclaims": [],
-                "decision_missing": False,
-            }
         )
+        return violations
 
     @staticmethod
     def _violation_total(violations: dict[str, Any], template_violations: list[str]) -> bool:
         return bool(
-            violations["numbers"]
-            or violations["citations"]
-            or violations["overclaims"]
-            or violations["decision_missing"]
+            violations.get("numbers")
+            or violations.get("citations")
+            or violations.get("overclaims")
+            or violations.get("decision_missing")
+            or violations.get("decision_inverted")
             or template_violations
         )
 
     def _template_violations(
         self, draft: str, *, literature_evidence: bool, figure_svg: str | None
     ) -> list[str]:
-        """Run the same FastTrack template audit on a model draft; any
-        violation contributes to the fallback decision."""
+        """Run the selected format gate on a model draft."""
+        if self.venue.template != "fasttrack":
+            return venue_lint(draft, self.venue).violations
         audit = run_template_audit(
             draft,
             complete=True,
@@ -2741,6 +3438,7 @@ class ManuscriptService:
         limitations: list[str] | None = None,
         keywords: list[str] | None = None,
         figure_svg: str | None = None,
+        review_notes: dict[str, dict[str, Any]] | None = None,
     ) -> str:
         """The ONLY facts and numbers a model draft may use — pre-formatted."""
         block = (methodology or {}).get("methodology", methodology or {})
@@ -2770,8 +3468,19 @@ class ManuscriptService:
                 f"EXACT COMMANDS (Appendix C): {self._exact_commands(report) or 'no command recorded'}"
             )
         for paper in papers:
+            paper_id = str(paper.get("id"))
+            notes = (review_notes or {}).get(paper_id, {})
+            abstract = " ".join(str(paper.get("abstract") or "").split())[:900]
             lines.append(
-                f"PAPER [{keys[paper['id']]}] title='{paper['title']}' year={paper.get('year') or 'n.d.'} method='{str(paper.get('method') or '')[:200]}'"
+                f"PAPER [{keys[paper['id']]}] title='{paper['title']}' "
+                f"year={paper.get('year') or 'n.d.'} "
+                f"venue='{paper.get('venue') or ''}' "
+                f"abstract='{abstract}' "
+                f"problem='{str(notes.get('problem') or notes.get('research_question') or '')[:300]}' "
+                f"method='{str(notes.get('method') or paper.get('method') or '')[:300]}' "
+                f"protocol='{str(notes.get('experimental_protocol') or '')[:300]}' "
+                f"limitations='{str(notes.get('limitations_json') or '')[:300]}' "
+                f"results='{str(notes.get('results_json') or '')[:300]}'"
             )
         return "\n".join(lines)
 
@@ -2807,9 +3516,17 @@ class ManuscriptService:
 
     @staticmethod
     def _verify_consistency(markdown: str, decision: str) -> None:
-        if decision not in markdown:
+        lowered = markdown.lower()
+        if decision.lower() not in lowered:
             raise ValueError(
                 "manuscript_consistency_error: decision missing from manuscript body"
+            )
+        if re.search(
+            r"\b(?:not|no|never)\s+(?:\w+\s+){0,2}" + re.escape(decision.lower()),
+            lowered,
+        ):
+            raise ValueError(
+                "manuscript_consistency_error: decision is negated/inverted in the manuscript body"
             )
 
     # ------------------------------------------------------------------
@@ -2832,11 +3549,16 @@ class ManuscriptService:
                 [compiler, "-interaction=nonstopmode", latex_path.name],
             ]
         )
-        for command in commands:
-            completed = subprocess.run(
-                command, cwd=str(workdir), capture_output=True, timeout=180
-            )
-            if completed.returncode != 0 and "bibtex" not in command[0]:
-                return None
-        pdf = workdir / "manuscript.pdf"
-        return pdf if pdf.is_file() and pdf.stat().st_size > 0 else None
+        try:
+            for command in commands:
+                completed = subprocess.run(
+                    command, cwd=str(workdir), capture_output=True, timeout=180
+                )
+                if completed.returncode != 0 and "bibtex" not in command[0]:
+                    return None
+            pdf = workdir / "manuscript.pdf"
+            return pdf if pdf.is_file() and pdf.stat().st_size > 0 else None
+        except (OSError, subprocess.SubprocessError):
+            # A missing/broken compiler or a timeout is reported as "no
+            # verified PDF", never as a crash after the manuscript was written.
+            return None

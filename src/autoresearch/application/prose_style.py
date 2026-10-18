@@ -114,7 +114,9 @@ AI_TELL_PATTERNS: tuple[tuple[str, re.Pattern[str], float, int], ...] = (
 
 _SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+")
 _WORD = re.compile(r"[A-Za-z][A-Za-z'-]*")
-_CITATION = re.compile(r"\[\w+[-\w]*\]|\([^)]*\d{4}[a-z]?\)|\\cite\{[^}]*\}")
+_CITATION = re.compile(
+    r"\[@[-\w]+\]|\[\w+[-\w]*\]|\([^)]*\d{4}[a-z]?\)|\\cite\{[^}]*\}"
+)
 _NUMBER = re.compile(r"\b\d+(?:\.\d+)?%?\b")
 _PASSIVE = re.compile(r"\b(is|are|was|were|be|been)\s+\w+(ed|en)\b", re.IGNORECASE)
 
@@ -273,8 +275,11 @@ def prose_audit(
             metrics=metrics,
             tells=tuple(tells),
             band_deviations=(),
-            rewrite_guidance=tuple(guidance)
-            or ("no exemplar texts supplied; band comparison skipped"),
+            rewrite_guidance=(
+                tuple(guidance)
+                if guidance
+                else ("no exemplar texts supplied; band comparison skipped",)
+            ),
             notes=(
                 "no_exemplars: style band cannot be computed; verdict is not a pass",
             ),
@@ -284,6 +289,8 @@ def prose_audit(
     deviations: list[Mapping[str, Any]] = []
     values = metrics.as_dict()
     for name, band in bands.items():
+        if values.get(name) is None:
+            continue
         value = float(values[name])
         if not band.within(value):
             deviations.append(

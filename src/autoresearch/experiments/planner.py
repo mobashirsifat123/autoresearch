@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
+import subprocess
 from pathlib import Path
 from statistics import NormalDist
 from uuid import uuid4
@@ -86,13 +88,53 @@ PROMPT_VERSION = "experiment-planner-v5"
 # code copied (the upstream repository carries no license file).
 _BASELINE_CONTRACT = (
     "Ground the design in the reviewed literature supplied below when present. "
-    "baseline_configuration MUST name at least one established method from the "
-    "supplied corpus (by [paper_id]) or an explicitly named standard baseline; "
-    "do not invent baselines. Prefer metrics that make results comparable with "
-    "the supplied claims. Do not invent papers, claims, or datasets."
+    "baseline_configuration MUST name at least TWO established methods from the "
+    "supplied corpus (by [paper_id]) or explicitly named standard baselines, "
+    "separated by ';'. Do not invent baselines. Prefer metrics that make results "
+    "comparable with the supplied claims. Do not invent papers, claims, or datasets."
 )
 
 # json_object mode drops the schema, so the prompt must enumerate the contract.
+def _git_commit(path: str) -> str:
+    """Real baseline commit, or empty when the target is not a git repo."""
+    try:
+        completed = subprocess.run(
+            ["git", "-C", path, "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=10,
+        )
+        return completed.stdout.strip() if completed.returncode == 0 else ""
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def _dataset_checksum(identity: str) -> str:
+    """Content hash of a real dataset path; empty for prose descriptions."""
+    raw = str(identity or "").strip()
+    if not raw:
+        return ""
+    path = Path(raw).expanduser()
+    if not path.exists():
+        return ""
+    digest = hashlib.sha256()
+    if path.is_file():
+        try:
+            digest.update(path.read_bytes())
+        except OSError:
+            return ""
+        return digest.hexdigest()
+    if path.is_dir():
+        for child in sorted(path.rglob("*")):
+            if not child.is_file():
+                continue
+            digest.update(str(child.relative_to(path)).encode("utf-8"))
+            try:
+                digest.update(child.read_bytes())
+            except OSError:
+                return ""
+        return digest.hexdigest()
+    return ""
+
+
 _FIELD_CONTRACT = (
     "Return ONLY a JSON object with exactly these keys:\n"
     "- hypothesis: string\n"
@@ -100,7 +142,7 @@ _FIELD_CONTRACT = (
     "- falsification_condition: string\n"
     "- repository: string\n"
     "- baseline_commit: string\n"
-    "- dataset_identity: string\n"
+    "- dataset_identity: string (separate multiple datasets with ';')\n"
     "- dataset_checksum: string\n"
     "- split_definition: string\n"
     "- baseline_configuration: string\n"
@@ -230,9 +272,13 @@ class ExperimentSpecGenerator:
             causal_mechanism=selected.get("causal_mechanism", ""),
             falsification_condition=selected.get("falsification_condition", ""),
             repository=repository,
-            baseline_commit=selected.get("baseline_commit", ""),
+            # Prefer computed provenance from the real target. Fall back to
+            # the drafted value only when the target cannot be inspected
+            # (e.g. an offline fixture); the publication gate still rejects
+            # placeholder values, so this cannot become a false pass.
+            baseline_commit=_git_commit(repository) or selected.get("baseline_commit", ""),
             dataset_identity=selected.get("dataset_identity", ""),
-            dataset_checksum=selected.get("dataset_checksum", ""),
+            dataset_checksum=_dataset_checksum(str(selected.get("dataset_identity", ""))) or selected.get("dataset_checksum", ""),
             split_definition=selected.get("split_definition", ""),
             baseline_configuration=selected.get("baseline_configuration", ""),
             proposed_change=selected.get("proposed_change", ""),

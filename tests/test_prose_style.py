@@ -37,6 +37,8 @@ def test_metrics_extract_concrete_densities() -> None:
     assert metrics.numeric_density > 5  # concrete numbers throughout
     assert metrics.citation_density > 1  # [3], Smith et al. (2019)
     assert metrics.avg_sentence_length > 5
+    # The project's own citation syntax must count too.
+    assert extract_prose_metrics("Prior work [@paper1] is relevant.").citation_density > 0
 
 
 def test_ai_tells_detected_in_garbage_not_in_exemplar() -> None:

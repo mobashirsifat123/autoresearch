@@ -62,6 +62,10 @@ a new discovery run.
 "${AUTORESEARCH_BIN:-autoresearch}" skill review \
   --project "<project_id>" \
   [--top-k 5] [--hierarchical]
+
+# Publication track: a manuscript targeting `generic_journal` needs >=20
+# reviewed papers. The CLI accepts --top-k up to 40; pair it with --limit so
+# enough candidates are discovered, e.g. --limit 40 --top-k 20.
 ```
 
 ### Mode B — New seed paper (discover + review + gap in one shot)
@@ -87,6 +91,10 @@ a new discovery run.
 3. If the user provides a catalog JSON, use Mode C.
 4. If none of the above, ask the user to provide a seed paper or catalog.
 
+For a publication-track manuscript, review 20–40 papers:
+`--limit 40 --top-k 20`. A five-paper review is a valid exploratory result,
+but it cannot satisfy the manuscript's `generic_journal` related-work gate.
+
 Exit codes: `0` success · `1` internal · `2` usage · `4` not found · `5` insufficient evidence.
 
 ## Interpreting the JSON result
@@ -110,6 +118,13 @@ After a successful run, the JSON contains:
   - `gap.supporting_paper_ids`, `gap.supporting_claim_ids` — evidence provenance.
   - `gap.counter_evidence_claim_ids` — opposing evidence (may be empty).
 - `json_report` / `markdown_report` — absolute paths to durable cited reports.
+- `review_corpus_path` — coverage summary: reviewed ids, full-text ratio,
+  themes, method families, datasets, years, closest prior work.
+- `citation_contexts_path` — exact quote/page/section/relationship for every
+  cited claim; the manuscript cites only through these contexts.
+- `publication_gaps` — exact blockers such as `reviewed_papers_below_minimum`
+  (<20 for `generic_journal`), `closest_prior_work_missing`, or
+  `full_text_ratio_below_threshold`. They are reported, never hidden.
 
 The gap is written so the manuscript's Introduction can quote it directly:
 `gap.statement` + the seed topic/research question (relevance now),

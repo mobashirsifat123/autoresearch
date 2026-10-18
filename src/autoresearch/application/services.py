@@ -186,6 +186,9 @@ class ReviewOutcome:
     json_report: str
     markdown_report: str
     reused: int = 0
+    review_corpus_path: str | None = None
+    citation_contexts_path: str | None = None
+    publication_gaps: tuple[dict[str, Any], ...] = ()
 
 
 class SearchStrategyGenerator:
@@ -820,8 +823,10 @@ class LiteratureReviewService:
         fresh: bool = False,
     ) -> ReviewOutcome:
         require_model_role(self.router, ModelRole.LITERATURE_EXTRACTION)
-        if not 1 <= top_k <= 15:
-            raise ValueError("top_k must be between 1 and 15.")
+        # Publication-track reviews need 20-40 papers to satisfy venue
+        # related-work thresholds; exploratory runs can still use 5.
+        if not 1 <= top_k <= 40:
+            raise ValueError("top_k must be between 1 and 40.")
         project = self.repository.get_project(project_id)
         seed = self.repository.get_seed(project_id)
         if not project or not seed:
@@ -1123,6 +1128,29 @@ class LiteratureReviewService:
                     "markdown": markdown_artifact.path,
                 },
             )
+            from autoresearch.application.review_publication import (
+                build_review_publication,
+            )
+
+            publication = build_review_publication(
+                self.repository,
+                project_id=project_id,
+                run_id=run_id,
+                papers=reviewed_papers,
+                reviews=reviews,
+                claims=claims,
+                top_paper_ids=[score.paper_id for score in top_scores],
+                gap=gap,
+            )
+            self.repository.complete_checkpoint(
+                run_id,
+                "review_publication",
+                payload={
+                    "review_corpus": publication.corpus_path,
+                    "citation_contexts": publication.contexts_path,
+                    "publication_gaps": publication.gaps_path,
+                },
+            )
             # Decision-useful evidence matrix + coverage record (deterministic
             # assembly; failures never block the review itself).
             try:
@@ -1157,6 +1185,9 @@ class LiteratureReviewService:
                 json_artifact.path,
                 markdown_artifact.path,
                 reused,
+                publication.corpus_path,
+                publication.contexts_path,
+                tuple(publication.gaps),
             )
         except BaseException as exc:
             if isinstance(exc, asyncio.CancelledError):
@@ -1296,6 +1327,17 @@ class LiteratureReviewService:
         failures = self.repository.review_failures(run_id)
         run = self.repository.get_run(run_id)
         top_k = int(run.input_data.get("top_k", 5)) if run else 5
+        checkpoint = self.repository.checkpoint(run_id, "review_publication")
+        payload = dict((checkpoint or {}).get("payload") or {})
+        corpus_path = payload.get("review_corpus")
+        contexts_path = payload.get("citation_contexts")
+        gaps_path = payload.get("publication_gaps")
+        publication_gaps: tuple[dict[str, Any], ...] = ()
+        if gaps_path:
+            try:
+                publication_gaps = tuple(json.loads(Path(gaps_path).read_text(encoding="utf-8")).get("gaps") or ())
+            except (OSError, ValueError):
+                publication_gaps = ()
         return ReviewOutcome(
             project_id,
             run_id,
@@ -1305,6 +1347,10 @@ class LiteratureReviewService:
             gap,
             json_artifacts[-1].path,
             markdown_artifacts[-1].path,
+            0,
+            str(corpus_path) if corpus_path else None,
+            str(contexts_path) if contexts_path else None,
+            publication_gaps,
         )
 
 
@@ -2007,6 +2053,13 @@ class ExperimentService:
                 async with asyncio.timeout(max_runtime_seconds):
                     spec = await self.pipeline.plan_for_candidate(run_candidate)
                 self.repository.save_experiment_spec(spec)
+            from autoresearch.experiments.publication_design import (
+                publication_design_gaps,
+                write_publication_gaps,
+            )
+
+            design_gaps = publication_design_gaps(spec)
+            write_publication_gaps(self.repository, spec, design_gaps)
             if mode in {"inspect", "validate"}:
                 manifest = self.repository.get_environment_manifest(spec.id)
                 if manifest is None:
