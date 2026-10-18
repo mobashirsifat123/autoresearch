@@ -55,8 +55,12 @@ def _contract(**overrides):
         "full_text_ratio": 1.0,
         "execution_provenance": {
             "execution_verified": True,
+            "analysis_id": "analysis1",
+            "report_id": "report1",
             "dataset_checksum": "9f2c" * 16,
+            "dataset_checksum_source": "computed",
             "baseline_commit": "3b7cccd9a1f2e4d6c8b0a2f4e6d8c0b2a4f6e8d0",
+            "baseline_commit_source": "computed",
             "study_type": "empirical",
         },
         "reviewer_threshold": 3.5,
@@ -89,6 +93,114 @@ def test_contract_missing_fields_produce_exact_gaps():
 def test_contract_accepts_a_complete_empirical_slice():
     contract = _contract()
     assert assess_contract(contract, get_venue_profile("generic_journal")) == []
+
+
+def test_contract_rejects_format_valid_but_unverified_provenance():
+    contract = _contract()
+    contract.execution_provenance = {
+        **contract.execution_provenance,
+        "dataset_checksum": "deadbeef" * 8,
+        "dataset_checksum_source": "model",
+        "baseline_commit": "cafebabe" * 5,
+        "baseline_commit_source": "model",
+    }
+    codes = {gap.code for gap in assess_contract(contract, get_venue_profile("generic_journal"))}
+    assert "dataset_checksum_unverified" in codes
+    assert "baseline_commit_unverified" in codes
+
+
+def test_contract_rejects_missing_contribution_and_unestablished_power():
+    contract = _contract(
+        contribution_statement="",
+        novelty_delta="",
+        power_analysis="Power is not established.",
+        power_established=False,
+    )
+    codes = {gap.code for gap in assess_contract(contract, get_venue_profile("generic_journal"))}
+    assert "contribution_missing" in codes
+    assert "novelty_delta_missing" in codes
+    assert "power_not_established" in codes
+
+
+def test_contract_rejects_zero_full_text_and_too_few_seeds():
+    contract = _contract(full_text_ratio=0.0, required_seeds=1)
+    codes = {gap.code for gap in assess_contract(contract, get_venue_profile("generic_journal"))}
+    assert "full_text_ratio_below_threshold" in codes
+    assert "seeds_below_minimum" in codes
+
+
+def test_contract_does_not_resurrect_freeze_values_when_spec_is_empty():
+    spec = SimpleNamespace(
+        dataset_identity="dataset A",
+        dataset_checksum="9f2c4e7a1b3d5f608c9e0a4b7d2f6e8c1a3b5d7f9e0c2a4b6d8f0e1c3a5b7d9f",
+        baseline_commit="3b7cccd9a1f2e4d6c8b0a2f4e6d8c0b2a4f6e8d0",
+        baseline_configuration="",
+        ablations=(),
+        robustness_tests=(),
+        statistical_plan="",
+        required_seed_count=1,
+        metrics=(),
+    )
+    methodology = {
+        "methodology": {
+            "contribution_statement": "A contribution.",
+            "novelty_delta": "A delta.",
+            "datasets": ["a", "b"],
+            "baselines": ["A", "B"],
+            "ablations": ["remove X"],
+            "robustness_tests": ["seed variance"],
+            "power_analysis": "Power analysis establishes 0.8 power.",
+        }
+    }
+    contract = build_contract(
+        project_id="p",
+        venue=get_venue_profile("generic_journal"),
+        review_corpus={"reviewed_papers": 20, "full_text_ratio": 1.0, "closest_prior_work": ["p1"]},
+        methodology=methodology,
+        spec=spec,
+    )
+    codes = {gap.code for gap in contract.gaps}
+    assert "baselines_below_minimum" in codes
+    assert "ablations_missing" in codes
+    assert "robustness_missing" in codes
+    assert "power_not_established" in codes
+
+
+def test_workshop_profile_allows_a_workshop_design():
+    spec = _spec(
+        dataset_identity="Dataset A",
+        baseline_configuration="Baseline A",
+        ablations=(),
+        robustness_tests=(),
+        statistical_plan="Power is not established.",
+        required_seed_count=3,
+    )
+    assert publication_design_gaps(
+        spec, profile=get_venue_profile("workshop")
+    ) == []
+    assert publication_design_gaps(
+        spec, profile=get_venue_profile("generic_journal")
+    )
+
+
+def test_workshop_contract_accepts_a_workshop_slice():
+    contract = _contract(
+        target_venue="workshop",
+        datasets=("Dataset A",),
+        baselines=("Baseline A",),
+        ablations=(),
+        robustness_tests=(),
+        power_analysis="",
+        power_established=False,
+        required_seeds=3,
+        related_work_coverage=8,
+        full_text_ratio=1.0,
+        execution_provenance={
+            "execution_verified": False,
+            "study_type": "empirical",
+        },
+    )
+    assert assess_contract(contract, get_venue_profile("workshop")) == []
 
 
 def test_build_contract_reads_dict_and_object_slices():
@@ -184,7 +296,8 @@ async def test_publication_track_stops_before_novelty_on_small_review(tmp_path):
 
     repository, workflow, seed = _build_loop(tmp_path)
     result = await workflow.run(
-        seed=str(seed), until="design", limit=10, top_k=5, publication_track=True,
+        seed=str(seed), until="design", limit=10, top_k=5,
+        publication_track=True, venue_name="generic_journal",
     )
     assert result["stopped_at"] == "review"
     assert any(item["stage"] == "review_gate" for item in result["stages"])

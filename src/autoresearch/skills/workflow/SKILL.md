@@ -49,7 +49,8 @@ stages, so re-invoking with `--project` resumes instead of repeating.
 # Publication track: review 20-40 papers so the manuscript's generic_journal
 # profile can meet its >=20 reviewed-reference threshold.
 "${AUTORESEARCH_BIN:-autoresearch}" skill workflow \
-  --seed-paper "<pdf|doi|url>" --limit 40 --top-k 20 --until manuscript
+  --seed-paper "<pdf|doi|url>" --limit 40 --top-k 20 \
+  --publication --venue generic_journal --until manuscript
 
 # Continue to execution (approval-gated) and inspect the package:
 "${AUTORESEARCH_BIN:-autoresearch}" skill workflow \

@@ -137,6 +137,7 @@ class MethodologyFreezer:
         *,
         selection_rationale: str,
         portfolio_id: str | None = None,
+        venue_profile=None,
     ) -> MethodologyFreeze:
         """Freeze the candidate's methodology as the next version.
 
@@ -216,7 +217,7 @@ class MethodologyFreezer:
             )
             payload = _validate(payload, evidence_context)
 
-        publication_gaps = publication_design_gaps(payload)
+        publication_gaps = publication_design_gaps(payload, profile=venue_profile)
         previous = self.repository.latest_methodology_freeze_for_candidate(candidate.id)
         version = (previous.version + 1) if previous else 1
 
@@ -282,12 +283,15 @@ class MethodologyFreezer:
         return freeze
 
 
-def publication_design_gaps(payload: dict) -> list[dict]:
+def publication_design_gaps(payload: dict, profile=None) -> list[dict]:
     """Publication-grade design gaps at freeze time.
 
     These are reported, not fatal to the freeze: exploratory work remains
     possible, but it cannot be presented as a top-venue empirical study.
     """
+    from autoresearch.application.venue_profiles import get_venue_profile
+
+    venue = profile or get_venue_profile("generic_journal")
     gaps: list[dict] = []
     block = payload.get("methodology", payload) if isinstance(payload, dict) else {}
 
@@ -301,20 +305,21 @@ def publication_design_gaps(payload: dict) -> list[dict]:
     if not str(block.get("novelty_delta") or "").strip():
         add("novelty_delta_missing", "no explicit delta from the closest prior work")
     baselines = [str(item) for item in block.get("baselines") or [] if str(item).strip()]
-    if len(baselines) < 2:
-        add("baselines_below_minimum", f"baselines {len(baselines)} < 2")
+    if len(baselines) < venue.min_baselines:
+        add("baselines_below_minimum", f"baselines {len(baselines)} < {venue.min_baselines}")
     ablations = [str(item) for item in block.get("ablations") or [] if str(item).strip()]
-    if not ablations:
-        add("ablations_missing", "no ablation is planned")
+    if len(ablations) < venue.min_ablations:
+        add("ablations_missing", f"ablations {len(ablations)} < {venue.min_ablations}")
     robustness = [str(item) for item in block.get("robustness_tests") or [] if str(item).strip()]
-    if not robustness:
-        add("robustness_missing", "no robustness test is planned")
+    if len(robustness) < venue.min_robustness:
+        add("robustness_missing", f"robustness tests {len(robustness)} < {venue.min_robustness}")
     datasets = [str(item) for item in block.get("datasets") or [] if str(item).strip()]
-    if len(datasets) < 2 and not str(block.get("one_dataset_justification") or "").strip():
-        add("datasets_below_minimum", f"datasets {len(datasets)} < 2 and no justification")
+    if len(datasets) < venue.min_datasets and not str(block.get("one_dataset_justification") or "").strip():
+        add("datasets_below_minimum", f"datasets {len(datasets)} < {venue.min_datasets} and no justification")
     power = " ".join(str(block.get("power_analysis") or "").split()).lower()
-    if len(power) < 20 or any(
-        phrase in power for phrase in ("not established", "not performed", "not computed", "no power")
+    if venue.require_power and (
+        len(power) < 20
+        or any(phrase in power for phrase in ("not established", "not performed", "not computed", "no power"))
     ):
         add("power_not_established", "no substantive power analysis")
     if not [item for item in block.get("expected_figures_tables") or [] if str(item).strip()]:

@@ -18,6 +18,7 @@ from autoresearch.application.publication_readiness import (
     dataset_names,
     power_established,
 )
+from autoresearch.application.venue_profiles import VenueProfile, get_venue_profile
 
 _CHECKSUM = re.compile(r"^[0-9a-fA-F]{32,128}$")
 _COMMIT = re.compile(r"^[0-9a-fA-F]{7,40}$")
@@ -36,8 +37,15 @@ def _commit_ok(value: str) -> bool:
     return bool(_COMMIT.fullmatch(value.strip())) and not _placeholder(value)
 
 
-def publication_design_gaps(spec: Any, *, min_datasets: int = 2) -> list[dict[str, Any]]:
+def publication_design_gaps(
+    spec: Any,
+    *,
+    profile: VenueProfile | None = None,
+    min_datasets: int | None = None,
+) -> list[dict[str, Any]]:
     """Return exact publication-design gaps for a planned spec."""
+    venue = profile or get_venue_profile("generic_journal")
+    required_datasets = venue.min_datasets if min_datasets is None else min_datasets
     gaps: list[dict[str, Any]] = []
 
     def add(code: str, message: str, fatal: bool = True) -> None:
@@ -53,18 +61,18 @@ def publication_design_gaps(spec: Any, *, min_datasets: int = 2) -> list[dict[st
         return gaps
 
     baselines = baseline_names(spec)
-    if len(baselines) < 2:
-        add("baselines_below_minimum", f"baselines {len(baselines)} < 2")
+    if len(baselines) < venue.min_baselines:
+        add("baselines_below_minimum", f"baselines {len(baselines)} < {venue.min_baselines}")
     ablations = list(field(spec, "ablations", ()) or ())
-    if not ablations:
-        add("ablations_missing", "no ablation is planned")
+    if len(ablations) < venue.min_ablations:
+        add("ablations_missing", f"ablations {len(ablations)} < {venue.min_ablations}")
     robustness = list(field(spec, "robustness_tests", ()) or ())
-    if not robustness:
-        add("robustness_missing", "no robustness test is planned")
+    if len(robustness) < venue.min_robustness:
+        add("robustness_missing", f"robustness tests {len(robustness)} < {venue.min_robustness}")
     datasets = dataset_names(spec)
-    if len(datasets) < min_datasets:
-        add("datasets_below_minimum", f"datasets {len(datasets)} < {min_datasets}")
-    if not power_established(spec):
+    if len(datasets) < required_datasets:
+        add("datasets_below_minimum", f"datasets {len(datasets)} < {required_datasets}")
+    if venue.require_power and not power_established(spec):
         add("power_not_established", "no established power analysis")
     checksum = str(field(spec, "dataset_checksum", "") or "")
     if not _checksum_ok(checksum):
@@ -73,6 +81,31 @@ def publication_design_gaps(spec: Any, *, min_datasets: int = 2) -> list[dict[st
     if not _commit_ok(commit):
         add("baseline_commit_missing", "baseline commit is missing or not a commit hash")
     return gaps
+
+
+def provenance_sources(repository: Any, spec: Any) -> dict[str, str]:
+    """Read the planner's provenance-source record for this spec run."""
+    run_id = str(field(spec, "run_id", "") or "unknown")
+    path = Path(repository.artifact_root) / "experiments" / run_id / "provenance_sources.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        payload = {}
+    return {
+        "dataset_checksum_source": str(payload.get("dataset_checksum_source") or "model"),
+        "baseline_commit_source": str(payload.get("baseline_commit_source") or "model"),
+    }
+
+
+def write_provenance_sources(
+    repository: Any, spec: Any, sources: dict[str, str]
+) -> Path:
+    run_id = str(field(spec, "run_id", "") or "unknown")
+    root = Path(repository.artifact_root) / "experiments" / run_id
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / "provenance_sources.json"
+    path.write_text(json.dumps(sources, indent=2, sort_keys=True), encoding="utf-8")
+    return path
 
 
 def write_publication_gaps(repository: Any, spec: Any, gaps: list[dict[str, Any]]) -> Path:

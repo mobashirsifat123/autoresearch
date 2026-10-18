@@ -632,7 +632,7 @@ def workflow(
     max_cost_usd: float | None = typer.Option(None, "--max-cost-usd", min=0.0, help="Cumulative project provider-cost hard stop (applies to this and later invocations)."),
     max_tokens: int | None = typer.Option(None, "--max-tokens", min=1, help="Project total-token ceiling (prompt+completion) across all provider calls."),
     publication: bool = typer.Option(False, "--publication", help="Publication track: stop early when review/novelty/design gaps make a submission-grade paper impossible."),
-    venue: str = typer.Option("generic_journal", "--venue", help="Venue profile used by the publication contract."),
+    venue: str = typer.Option("", "--venue", help="Venue profile used by the publication contract (default: configured manuscript venue)."),
 ) -> None:
     """Advance one project through the full durable research cycle, reusing completed stages."""
 
@@ -651,7 +651,7 @@ def workflow(
             seed=seed, project_id=project_id, until=until,
             limit=limit, top_k=top_k, max_cost_usd=max_cost_usd,
             max_total_tokens=max_tokens,
-            publication_track=publication, venue_name=venue,
+            publication_track=publication, venue_name=venue or None,
         )
         return result
 
@@ -682,6 +682,7 @@ def experiment_plan(
         spec_id = await c.experiment.execute_candidate(candidate_id, mode="plan", max_runtime_seconds=max_runtime_seconds)
         spec = c.repository.get_experiment_spec_by_id(spec_id)
         preview = c.experiment.approval_preview_for_candidate(candidate_id)
+        from autoresearch.application.venue_profiles import get_venue_profile
         from autoresearch.experiments.publication_design import publication_design_gaps
 
         return {
@@ -690,7 +691,9 @@ def experiment_plan(
             "run_id": spec.run_id,
             "status": "planned",
             "executed": False,
-            "publication_gaps": publication_design_gaps(spec),
+            "publication_gaps": publication_design_gaps(
+                spec, profile=get_venue_profile(c.settings.manuscript_venue)
+            ),
             "approval_required": True,
             "approval": {
                 "worker": preview["worker"],

@@ -1132,25 +1132,37 @@ class LiteratureReviewService:
                 build_review_publication,
             )
 
-            publication = build_review_publication(
-                self.repository,
-                project_id=project_id,
-                run_id=run_id,
-                papers=reviewed_papers,
-                reviews=reviews,
-                claims=claims,
-                top_paper_ids=[score.paper_id for score in top_scores],
-                gap=gap,
-            )
-            self.repository.complete_checkpoint(
-                run_id,
-                "review_publication",
-                payload={
-                    "review_corpus": publication.corpus_path,
-                    "citation_contexts": publication.contexts_path,
-                    "publication_gaps": publication.gaps_path,
-                },
-            )
+            try:
+                publication = build_review_publication(
+                    self.repository,
+                    project_id=project_id,
+                    run_id=run_id,
+                    papers=reviewed_papers,
+                    reviews=reviews,
+                    claims=claims,
+                    top_paper_ids=[score.paper_id for score in top_scores],
+                    gap=gap,
+                )
+                self.repository.complete_checkpoint(
+                    run_id,
+                    "review_publication",
+                    payload={
+                        "review_corpus": publication.corpus_path,
+                        "citation_contexts": publication.contexts_path,
+                        "publication_gaps": publication.gaps_path,
+                    },
+                )
+            except Exception as exc:  # noqa: BLE001 - bookkeeping must not fail review
+                publication = None
+                self.repository.append_api_event(
+                    run_id,
+                    "review.publication_failed",
+                    {"error": redact_text(f"{type(exc).__name__}: {exc}")},
+                )
+                logger.warning(
+                    "Review publication artifacts failed for run %s", run_id,
+                    exc_info=True,
+                )
             # Decision-useful evidence matrix + coverage record (deterministic
             # assembly; failures never block the review itself).
             try:
@@ -1185,9 +1197,9 @@ class LiteratureReviewService:
                 json_artifact.path,
                 markdown_artifact.path,
                 reused,
-                publication.corpus_path,
-                publication.contexts_path,
-                tuple(publication.gaps),
+                publication.corpus_path if publication else None,
+                publication.contexts_path if publication else None,
+                tuple(publication.gaps) if publication else (),
             )
         except BaseException as exc:
             if isinstance(exc, asyncio.CancelledError):
@@ -2053,11 +2065,34 @@ class ExperimentService:
                 async with asyncio.timeout(max_runtime_seconds):
                     spec = await self.pipeline.plan_for_candidate(run_candidate)
                 self.repository.save_experiment_spec(spec)
+            from autoresearch.experiments.planner import (
+                _dataset_checksum,
+                _git_commit,
+            )
             from autoresearch.experiments.publication_design import (
                 publication_design_gaps,
+                write_provenance_sources,
                 write_publication_gaps,
             )
 
+            computed_checksum = _dataset_checksum(
+                str(spec.dataset_identity or ""), base=str(spec.repository or "")
+            )
+            computed_commit = _git_commit(str(spec.repository or ""))
+            write_provenance_sources(
+                self.repository,
+                spec,
+                {
+                    "dataset_checksum_source": (
+                        "computed" if computed_checksum and computed_checksum == spec.dataset_checksum
+                        else "model"
+                    ),
+                    "baseline_commit_source": (
+                        "computed" if computed_commit and computed_commit == spec.baseline_commit
+                        else "model"
+                    ),
+                },
+            )
             design_gaps = publication_design_gaps(spec)
             write_publication_gaps(self.repository, spec, design_gaps)
             if mode in {"inspect", "validate"}:

@@ -17,8 +17,11 @@ from typing import Any, Mapping
 from autoresearch.application.evidence_access import field as _field
 from autoresearch.application.publication_readiness import (
     baseline_names,
+    checksum_ok,
+    commit_ok,
     dataset_names,
     power_established,
+    power_text_established,
 )
 from autoresearch.application.venue_profiles import VenueProfile, get_venue_profile
 
@@ -176,7 +179,7 @@ def assess_contract(
             "review",
             f"reviewed papers {contract.related_work_coverage} < {profile.min_references}",
         )
-    if contract.full_text_ratio and contract.full_text_ratio < 0.5:
+    if contract.full_text_ratio < 0.5:
         add(
             "full_text_ratio_below_threshold",
             "review",
@@ -208,15 +211,31 @@ def assess_contract(
             "experiment",
             f"datasets {len(contract.datasets)} < {profile.min_datasets}",
         )
+    if contract.required_seeds < profile.min_seeds:
+        add(
+            "seeds_below_minimum",
+            "experiment",
+            f"required seeds {contract.required_seeds} < {profile.min_seeds}",
+        )
     provenance = contract.execution_provenance or {}
     if profile.require_real_execution:
         if str(provenance.get("study_type") or "") == "simulation":
             add("simulated_study", "experiment", "Simulation evidence cannot satisfy an empirical venue.")
-        if not provenance.get("dataset_checksum"):
-            add("dataset_checksum_missing", "experiment", "No real dataset checksum is recorded.")
-        if not provenance.get("baseline_commit"):
-            add("baseline_commit_missing", "experiment", "No real baseline commit is recorded.")
-        if not provenance.get("execution_verified"):
+        checksum = str(provenance.get("dataset_checksum") or "")
+        commit = str(provenance.get("baseline_commit") or "")
+        if not checksum_ok(checksum):
+            add("dataset_checksum_missing", "experiment", "No valid dataset content hash is recorded.")
+        elif str(provenance.get("dataset_checksum_source") or "model") != "computed":
+            add("dataset_checksum_unverified", "experiment", "Dataset hash was not computed from the dataset.")
+        if not commit_ok(commit):
+            add("baseline_commit_missing", "experiment", "No valid baseline commit hash is recorded.")
+        elif str(provenance.get("baseline_commit_source") or "model") != "computed":
+            add("baseline_commit_unverified", "experiment", "Baseline commit was not read from the repository.")
+        if (
+            not provenance.get("execution_verified")
+            or not provenance.get("analysis_id")
+            or not provenance.get("report_id")
+        ):
             add("execution_artifact_missing", "experiment", "No execution result is bound to the analysis.")
     return gaps
 
@@ -233,11 +252,14 @@ def build_contract(
     report: Any | None = None,
     execution_verified: bool = False,
     study_type: str = "empirical",
+    provenance_sources: Mapping[str, str] | None = None,
 ) -> PublicationContract:
     """Assemble one contract from the durable slices that exist."""
     profile = venue or get_venue_profile("generic_journal")
     block = _methodology_payload(methodology)
-    contribution = str(block.get("contribution_statement") or _field(candidate, "method", "") or "")
+    # Never turn a method name into a contribution claim; a missing
+    # contribution is a gap, not prose.
+    contribution = str(block.get("contribution_statement") or "")
     delta = str(block.get("novelty_delta") or _field(candidate, "difference_from_existing", "") or "")
     prior = _review_closest_prior(review_corpus)
     if not prior:
@@ -246,36 +268,43 @@ def build_contract(
             for entry in block.get("closest_prior_methods", [])
             if isinstance(entry, Mapping) and entry.get("paper_id")
         )
-    datasets = tuple(dataset_names(spec))
-    if not datasets:
+    if spec is not None:
+        # The spec is authoritative once it exists. An empty list means the
+        # design dropped that component; do not resurrect the freeze's plan.
+        datasets = tuple(dataset_names(spec))
+        baselines = tuple(baseline_names(spec))
+        ablations = tuple(str(item) for item in (_field(spec, "ablations", ()) or ()) if str(item).strip())
+        robustness = tuple(str(item) for item in (_field(spec, "robustness_tests", ()) or ()) if str(item).strip())
+        metrics = tuple(str(item) for item in (_field(spec, "metrics", ()) or ()) if str(item).strip())
+        required_seeds = int(_field(spec, "required_seed_count", 0) or 0)
+        power_text = str(_field(spec, "statistical_plan", "") or "")
+        power = power_established(spec, report)
+    else:
         configured = block.get("datasets")
-        if isinstance(configured, list):
-            datasets = tuple(str(item) for item in configured if str(item).strip())
-    baselines = tuple(baseline_names(spec)) if spec is not None else ()
-    if not baselines:
+        datasets = tuple(str(item) for item in configured if str(item).strip()) if isinstance(configured, list) else ()
         configured = block.get("baselines")
-        if isinstance(configured, list):
-            baselines = tuple(str(item) for item in configured if str(item).strip())
-    ablations = tuple(str(item) for item in (_field(spec, "ablations", ()) or ()) if str(item).strip())
-    robustness = tuple(str(item) for item in (_field(spec, "robustness_tests", ()) or ()) if str(item).strip())
-    if not ablations and isinstance(block.get("ablations"), list):
-        ablations = tuple(str(item) for item in block["ablations"] if str(item).strip())
-    if not robustness and isinstance(block.get("robustness_tests"), list):
-        robustness = tuple(str(item) for item in block["robustness_tests"] if str(item).strip())
-    metrics = tuple(str(item) for item in (_field(spec, "metrics", ()) or ()) if str(item).strip())
-    required_seeds = int(_field(spec, "required_seed_count", 0) or 0)
-    power_text = str(_field(spec, "statistical_plan", "") or block.get("power_analysis") or "")
-    power = power_established(spec, report) if spec is not None else bool(block.get("power_analysis"))
+        baselines = tuple(str(item) for item in configured if str(item).strip()) if isinstance(configured, list) else ()
+        configured = block.get("ablations")
+        ablations = tuple(str(item) for item in configured if str(item).strip()) if isinstance(configured, list) else ()
+        configured = block.get("robustness_tests")
+        robustness = tuple(str(item) for item in configured if str(item).strip()) if isinstance(configured, list) else ()
+        metrics = ()
+        required_seeds = 0
+        power_text = str(block.get("power_analysis") or "")
+        power = power_text_established(power_text)
     reviewed = int((review_corpus or {}).get("reviewed_papers") or 0)
     full_text_ratio = float((review_corpus or {}).get("full_text_ratio") or 0.0)
+    sources = dict(provenance_sources or {})
     provenance = {
         "execution_verified": bool(execution_verified),
         "analysis_id": str(_field(analysis, "id", "") or ""),
         "report_id": str(_field(report, "id", "") or ""),
         "dataset_checksum": str(_field(spec, "dataset_checksum", "") or ""),
+        "dataset_checksum_source": str(sources.get("dataset_checksum_source") or "model"),
         "baseline_commit": str(
             _field(spec, "baseline_commit", "") or _field(spec, "repository_commit", "") or ""
         ),
+        "baseline_commit_source": str(sources.get("baseline_commit_source") or "model"),
         "study_type": study_type,
     }
     contract = PublicationContract(

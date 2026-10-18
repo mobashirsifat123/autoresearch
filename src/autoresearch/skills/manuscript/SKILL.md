@@ -156,9 +156,10 @@ project's `.autoresearch/config.toml` before running.
 - `claim_ledger` — claims, numbers, evidence ids, citations.
 - `submission_checklist` — venue, status, blocking issues, required fixes,
   gate results, and next actions.
-- `publication_contract` / `publication_gaps` — the shared cross-stage
-  contract and the exact review/novelty/experiment gaps that prevent
-  `submission_ready`.
+- `shared_publication_contract` / `publication_gaps` — the workflow's
+  cross-stage contract (when passed in) and the exact review/novelty/
+  experiment gaps that prevent `submission_ready`. A false shared contract
+  forces `draft` even if the local manuscript checks pass.
 - `quality` — prose audit + exemplar parity; `quality.gate.passed` is true
   only when the prose audit is `PASS` and exemplar parity passes
   (`INCONCLUSIVE`/`REVISE` are never treated as a pass).

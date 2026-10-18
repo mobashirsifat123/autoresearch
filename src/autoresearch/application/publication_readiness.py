@@ -119,6 +119,7 @@ class EvidenceSufficiency:
     related_work_coverage: int
     reference_count: int
     decision: str
+    datasets: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -130,6 +131,7 @@ class EvidenceSufficiency:
             "related_work_coverage": self.related_work_coverage,
             "reference_count": self.reference_count,
             "decision": self.decision,
+            "datasets": self.datasets,
         }
 
 
@@ -261,6 +263,41 @@ def power_established(spec: Any, report: Any = None) -> bool:
     return _power_established(spec, report)
 
 
+def power_text_established(text: Any) -> bool:
+    lowered = str(text or "").lower()
+    if "power" not in lowered:
+        return False
+    return not any(
+        phrase in lowered
+        for phrase in (
+            "not established", "not computed", "not available",
+            "not performed", "not conducted", "no power analysis",
+            "power analysis was not",
+        )
+    )
+
+
+def checksum_ok(value: Any) -> bool:
+    return _checksum_ok(str(value or ""))
+
+
+def commit_ok(value: Any) -> bool:
+    return _commit_ok(str(value or ""))
+
+
+def detect_study_type(spec: Any) -> str:
+    """Cheap source-based study type for the shared contract."""
+    texts, source_path = _source_texts(spec)
+    joined = "\n".join(texts).lower()
+    if any(marker.lower() in joined for marker in _STRONG_SIMULATION_MARKERS):
+        return "simulation"
+    if source_path and not any(marker.lower() in joined for marker in _HAS_DATA_IO_MARKERS):
+        return "unverified"
+    if any(marker.lower() in joined for marker in _WEAK_SIMULATION_MARKERS):
+        return "unverified"
+    return "empirical"
+
+
 def dataset_names(spec: Any) -> list[str]:
     """Explicit datasets from a semicolon/newline-separated identity."""
     text = str(_field(spec, "dataset_identity", "") or "").strip()
@@ -385,6 +422,7 @@ def assess_publication_readiness(
     robustness = _robustness_count(report)
     corpus_count = len({str(paper.get("id")) for paper in corpus_papers})
     reference_count = len({str(paper.get("id")) for paper in list(papers) + list(corpus_papers)})
+    dataset_count = len(dataset_names(spec)) if spec is not None else 0
     decision = str(_field(report, "decision", "") or "INCOMPLETE") if report is not None else "INCOMPLETE"
 
     evidence = EvidenceSufficiency(
@@ -396,6 +434,7 @@ def assess_publication_readiness(
         related_work_coverage=corpus_count,
         reference_count=reference_count,
         decision=decision,
+        datasets=dataset_count,
     )
 
     blocking: list[str] = []
@@ -426,6 +465,10 @@ def assess_publication_readiness(
         blocking.append(f"external_baselines_missing ({baselines} < {profile.min_baselines})")
     if ablations < profile.min_ablations:
         blocking.append(f"ablations_missing ({ablations} < {profile.min_ablations})")
+    if robustness < profile.min_robustness:
+        blocking.append(f"robustness_missing ({robustness} < {profile.min_robustness})")
+    if dataset_count < profile.min_datasets:
+        blocking.append(f"datasets_below_minimum ({dataset_count} < {profile.min_datasets})")
     if corpus_count < profile.min_references:
         blocking.append(f"related_work_coverage_below_minimum ({corpus_count} < {profile.min_references})")
 

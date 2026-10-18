@@ -355,6 +355,14 @@ async def test_default_manuscript_profile_blocks_simulated_submission(tmp_path):
     report = repository.get_experiment_report(analysis.id)
     assert readiness["evidence"]["decision"] == report.decision.value
     assert readiness["evidence"]["power_established"] is False
+    shared = json.loads(
+        Path(result["artifacts"]["publication_contract"]).read_text(encoding="utf-8")
+    )
+    assert shared["execution_provenance"]["analysis_id"]
+    assert shared["execution_provenance"]["report_id"]
+    assert "execution_artifact_missing" not in {
+        gap["code"] for gap in shared["gaps"]
+    }
     contract = json.loads(
         Path(record.markdown_path).with_name("contribution_contract.json").read_text(encoding="utf-8")
     )

@@ -6,7 +6,7 @@
 
 ## Verdict
 
-P0 is implemented: the pipeline now has a shared publication contract, review corpus and citation contexts, publication-design gates at freeze and plan time, real provenance computation for dataset checksum and baseline commit, execution-artifact binding, workflow early stops on publication gaps, and per-stage metrics. The manuscript gate consumes the shared freeze gaps and remains fail-closed.
+P0 is implemented: the pipeline now has a shared publication contract, review corpus and citation contexts, publication-design gates at freeze and plan time, real provenance computation for dataset checksum and baseline commit (with computed-vs-model source tracking), execution-artifact binding, post-execution contract rebuild, workflow early stops on publication gaps, and per-stage metrics. The manuscript reads the shared contract and remains fail-closed.
 
 P1 (section-level model drafting, model reviewer ensemble, full venue package, human-calibration harness) is **not** implemented in this run. The existing deterministic reviewer panel and manuscript gate remain the fallback.
 
@@ -56,7 +56,7 @@ git diff --check
 autoresearch skill doctor
 ```
 
-Final result: **363 passed, 3 warnings** (warnings are pre-existing asyncio deprecations).
+Final result: **369 passed, 3 warnings** (warnings are pre-existing asyncio deprecations).
 `compileall`, `git diff --check`, and `skill doctor` are clean/healthy.
 
 ## AutoFID result
@@ -94,8 +94,40 @@ Unit-level strong fixtures pass:
 - `test_contract_accepts_a_complete_empirical_slice`
 - `test_readiness_accepts_a_real_powered_study` (real source/data I/O, computed-format checksum/commit, two labeled baselines, one ablation, robustness, power)
 - `test_delivery_state_enforces_complete_iff_submission_ready` (`complete`/`true` is representable)
+- `test_workshop_profile_allows_a_workshop_design` and
+  `test_workshop_contract_accepts_a_workshop_slice` (venue minima)
+- `test_contract_rejects_format_valid_but_unverified_provenance`
+- The smoke e2e asserts the post-execution contract binds `analysis_id`/
+  `report_id` and no longer reports `execution_artifact_missing`.
 
-A full end-to-end `submission_ready` manuscript fixture is **not** included: the quality gate requires exemplar PDFs and the venue lint requires a real 20-paper corpus, which the offline smoke fixture does not supply. This is deferred to P1 with the human-calibration harness.
+A full end-to-end `submission_ready` manuscript fixture is **not** included:
+the quality gate requires exemplar PDFs and the venue lint requires a real
+20-paper corpus, which the offline smoke fixture does not supply. This is
+deferred to P1 with the human-calibration harness.
+
+## Post-review hardening (P0 blockers)
+
+The independent P0 review found and this pass fixed:
+
+- The contract is now rebuilt after execution with `analysis`, `report`, and
+  `execution_verified=True`; the manuscript accepts a shared contract path
+  and cannot be `submission_ready` while that contract is false.
+- Provenance uses format checks plus a computed-vs-model source sidecar;
+  a format-valid but model-supplied hash is `*_unverified`, not a pass.
+- Cumulative gaps are rebuilt from the current contract + current stage
+  slices; satisfied codes are removed instead of accumulating.
+- `full_text_ratio=0.0` is now a gap, not a falsy pass.
+- Venue minima are parameterized through both design-gap functions and the
+  workflow/manuscript venue; `workshop`/`technical_report` designs are no
+  longer forced through generic-journal minima.
+- The spec is authoritative once it exists; the contract no longer
+  resurrects a freeze's planned baselines/ablations when the design dropped
+  them.
+- Missing contribution is no longer filled with a method name; power text is
+  checked for “not established” rather than mere presence.
+- Seeds, datasets, and robustness are now blocking in readiness/contract.
+- Review publication bookkeeping is nonfatal: a disk/schema failure records
+  `review.publication_failed` and finishes the review.
 
 ## P1 deferred
 

@@ -107,12 +107,14 @@ def _git_commit(path: str) -> str:
         return ""
 
 
-def _dataset_checksum(identity: str) -> str:
+def _dataset_checksum(identity: str, base: str | None = None) -> str:
     """Content hash of a real dataset path; empty for prose descriptions."""
     raw = str(identity or "").strip()
     if not raw:
         return ""
     path = Path(raw).expanduser()
+    if not path.is_absolute() and base:
+        path = Path(base).expanduser() / path
     if not path.exists():
         return ""
     digest = hashlib.sha256()
@@ -278,7 +280,9 @@ class ExperimentSpecGenerator:
             # placeholder values, so this cannot become a false pass.
             baseline_commit=_git_commit(repository) or selected.get("baseline_commit", ""),
             dataset_identity=selected.get("dataset_identity", ""),
-            dataset_checksum=_dataset_checksum(str(selected.get("dataset_identity", ""))) or selected.get("dataset_checksum", ""),
+            dataset_checksum=_dataset_checksum(
+                str(selected.get("dataset_identity", "")), base=repository
+            ) or selected.get("dataset_checksum", ""),
             split_definition=selected.get("split_definition", ""),
             baseline_configuration=selected.get("baseline_configuration", ""),
             proposed_change=selected.get("proposed_change", ""),

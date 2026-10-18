@@ -503,7 +503,11 @@ class ManuscriptService:
             ready = False
         return status, ready
 
-    async def generate(self, project_id: str) -> dict[str, Any]:
+    async def generate(
+        self,
+        project_id: str,
+        publication_contract_path: str | None = None,
+    ) -> dict[str, Any]:
         project = self.repository.get_project(project_id)
         if not project:
             raise ValueError(f"project_not_found: project '{project_id}' not found")
@@ -561,6 +565,23 @@ class ManuscriptService:
             effective_status, submission_ready = self._delivery_state(
                 checklist_payload, manuscript.status
             )
+            # The workflow's shared contract is authoritative across stages.
+            # A stale/manuscript-only pass cannot override a contract gap
+            # produced by review, novelty, or execution.
+            external_contract = None
+            external_contract_path = publication_contract_path
+            if publication_contract_path:
+                try:
+                    external_contract = json.loads(
+                        Path(publication_contract_path).read_text(encoding="utf-8")
+                    )
+                except (OSError, ValueError):
+                    external_contract = None
+            if external_contract is not None and not external_contract.get(
+                "submission_ready", False
+            ):
+                effective_status = "draft"
+                submission_ready = False
             if checklist_payload is not None and (
                 checklist_payload.get("status") != effective_status
                 or bool(checklist_payload.get("submission_ready")) != submission_ready
@@ -617,6 +638,7 @@ class ManuscriptService:
                 "claim_ledger": ledger_payload,
                 "publication_gaps": publication_gaps_payload,
                 "submission_checklist": checklist_payload,
+                "shared_publication_contract": external_contract,
                 "quality": quality,
                 "artifacts": {
                     "markdown": manuscript.markdown_path,
@@ -644,6 +666,7 @@ class ManuscriptService:
                     **({"claim_ledger": ledger_path} if ledger_path else {}),
                     **({"publication_gaps": publication_gaps_path} if publication_gaps_path else {}),
                     **({"submission_checklist": checklist_path} if checklist_path else {}),
+                    **({"shared_publication_contract": external_contract_path} if external_contract_path else {}),
                 },
             }
         except BaseException as exc:
@@ -828,10 +851,17 @@ class ManuscriptService:
         )
         # Freeze-time publication gaps are a shared-contract slice; a missing
         # baseline/power/delta at freeze must still block a submission.
-        freeze_gaps = [
-            gap for gap in (methodology or {}).get("publication_gaps", [])
-            if isinstance(gap, dict)
-        ]
+        # Recompute against THIS manuscript's venue profile rather than
+        # trusting a gap list frozen for another target.
+        from autoresearch.novelty.methodology import (
+            publication_design_gaps as methodology_design_gaps,
+        )
+
+        freeze_gaps = (
+            methodology_design_gaps(methodology, profile=self.venue)
+            if methodology
+            else []
+        )
         shared_ready = not any(gap.get("fatal", True) for gap in freeze_gaps)
         synthesis = build_literature_synthesis(
             self.repository,

@@ -25,7 +25,9 @@ from autoresearch.application.services import (
     NoveltyService,
 )
 from autoresearch.application.publication_contract import build_contract
+from autoresearch.application.publication_readiness import assess_publication_readiness
 from autoresearch.application.venue_profiles import get_venue_profile
+from autoresearch.experiments.publication_design import provenance_sources
 from autoresearch.domain.models import PipelineKind, RunStatus
 from autoresearch.novelty.methodology import MethodologyFreezer
 from autoresearch.providers.router import ModelRouter
@@ -77,7 +79,7 @@ class WorkflowService:
         max_cost_usd: float | None = None,
         max_total_tokens: int | None = None,
         publication_track: bool = False,
-        venue_name: str = "generic_journal",
+        venue_name: str | None = None,
     ) -> dict[str, Any]:
         if until not in _STAGE_ORDER:
             raise ValueError(f"until must be one of {STOP_STAGES}")
@@ -89,10 +91,19 @@ class WorkflowService:
         dispositions: list[dict[str, Any]] = []
         self._workflow_id = uuid4().hex[:12]
         self._publication_gaps: list[dict[str, Any]] = []
+        self._freeze_gaps: list[dict[str, Any]] = []
+        self._design_gaps: list[dict[str, Any]] = []
         self._publication_paths: dict[str, str] = {}
         self._review_corpus: dict[str, Any] = {}
         self._stage_metrics: list[dict[str, Any]] = []
-        self._venue_name = venue_name
+        # Preserve an explicitly configured manuscript profile unless the
+        # caller asks for a different one for this run.
+        self._venue_name = venue_name or (
+            self.manuscript.venue.name if self.manuscript is not None else "generic_journal"
+        )
+        if self.manuscript is not None and venue_name:
+            self.manuscript.venue = get_venue_profile(venue_name)
+        venue_name = self._venue_name
         _last_stage_time = time.monotonic()
 
         def record(stage: str, status: str, **ids: Any) -> None:
@@ -236,10 +247,11 @@ class WorkflowService:
             # provenance; no extra mislabeled run is created.
             freeze = await stage_invoke("methodology", lambda: self.freezer.freeze(
                 candidate, selection_rationale=rationale, portfolio_id=str(portfolio_row.id),
+                venue_profile=get_venue_profile(venue_name),
             ))
             record("methodology", "completed", methodology_freeze_id=freeze.id, version=freeze.version,
                    candidate_id=freeze.candidate_id, artifact=freeze.artifact_path)
-        from autoresearch.novelty.methodology import publication_gaps_for_freeze
+        from autoresearch.novelty.methodology import publication_design_gaps as methodology_design_gaps
 
         methodology_payload: dict[str, Any] = {}
         try:
@@ -256,8 +268,20 @@ class WorkflowService:
             candidate=candidate_obj,
             methodology=methodology_payload,
         )
+        self._freeze_gaps = (
+            methodology_design_gaps(
+                methodology_payload, profile=get_venue_profile(venue_name)
+            )
+            if methodology_payload
+            else [{
+                "code": "methodology_artifact_unreadable",
+                "stage": "novelty",
+                "message": "frozen methodology artifact is unreadable",
+                "fatal": True,
+            }]
+        )
+        self._design_gaps = []
         self._publish_contract(project, contract)
-        self._merge_gaps(publication_gaps_for_freeze(freeze))
         if publication_track and self._fatal_for_stage("novelty"):
             record("methodology_gate", "publication_gap", gaps=self._fatal_for_stage("novelty"))
             return self._result(
@@ -306,7 +330,9 @@ class WorkflowService:
 
         from autoresearch.experiments.publication_design import publication_design_gaps
 
-        design_gaps = publication_design_gaps(spec)
+        design_gaps = publication_design_gaps(
+            spec, profile=get_venue_profile(venue_name)
+        )
         contract = build_contract(
             project_id=project,
             venue=get_venue_profile(venue_name),
@@ -315,8 +341,9 @@ class WorkflowService:
             methodology=methodology_payload,
             spec=spec,
         )
+        self._design_gaps = design_gaps
+        self._freeze_gaps = []
         self._publish_contract(project, contract)
-        self._merge_gaps(design_gaps)
         design_fatal = [
             gap for gap in design_gaps if gap.get("fatal", True)
         ]
@@ -378,6 +405,7 @@ class WorkflowService:
         else:
             record("experiment", "completed", spec_id=spec.id, report_id=report_row["id"],
                    decision=report_row["decision"])
+            self._rebuild_post_execution_contract(project, candidate_id)
 
         # ---- Stage 7: manuscript (consumes the exact validated lineage) ----
         if until == "manuscript":
@@ -393,7 +421,15 @@ class WorkflowService:
                 else:
                     self._retire_stale_running(project, PipelineKind.MANUSCRIPT)
                     try:
-                        outcome = await stage_invoke("manuscript", lambda: self.manuscript.generate(project))
+                        outcome = await stage_invoke(
+                            "manuscript",
+                            lambda: self.manuscript.generate(
+                                project,
+                                publication_contract_path=self._publication_paths.get(
+                                    "publication_contract"
+                                ),
+                            ),
+                        )
                         record("manuscript", str(outcome.get("status", "unknown")),
                                manuscript_id=outcome.get("manuscript_id"),
                                decision=outcome.get("decision"),
@@ -480,10 +516,12 @@ class WorkflowService:
         contract_path.write_text(
             json.dumps(contract.to_dict(), indent=2, sort_keys=True), encoding="utf-8"
         )
-        # Cumulative gaps, newest contract wins per code.
-        merged = {gap["code"]: gap for gap in self._publication_gaps}
-        for gap in contract.gaps:
-            merged[gap.code] = gap.to_dict()
+        # Rebuild from the current contract plus the current stage slices.
+        # Never keep a satisfied code from an older stage.
+        merged = {gap.code: gap.to_dict() for gap in contract.gaps}
+        for gap in [*self._freeze_gaps, *self._design_gaps]:
+            if isinstance(gap, dict) and gap.get("code"):
+                merged[str(gap["code"])] = gap
         self._publication_gaps = list(merged.values())
         gaps_path.write_text(
             json.dumps(
@@ -503,27 +541,49 @@ class WorkflowService:
             "publication_gaps": str(gaps_path),
         }
 
-    def _merge_gaps(self, gaps: list[dict[str, Any]]) -> None:
-        merged = {gap["code"]: gap for gap in self._publication_gaps}
-        for gap in gaps:
-            if isinstance(gap, dict) and gap.get("code"):
-                merged[str(gap["code"])] = gap
-        self._publication_gaps = list(merged.values())
-        path = self._publication_paths.get("publication_gaps")
-        project = getattr(self, "_publication_project", None)
-        if path and project:
-            Path(path).write_text(
-                json.dumps(
-                    {
-                        "workflow_id": self._workflow_id,
-                        "project_id": project,
-                        "gaps": self._publication_gaps,
-                    },
-                    indent=2,
-                    sort_keys=True,
-                ),
-                encoding="utf-8",
-            )
+    def _rebuild_post_execution_contract(self, project: str, candidate_id: str):
+        """Rebuild the contract with the executed analysis/report, not the plan."""
+        spec = self.repository.get_experiment_spec(candidate_id)
+        if spec is None:
+            return None
+        analysis = self.repository.get_statistical_analysis(spec.id)
+        if analysis is None:
+            return None
+        report = self.repository.get_experiment_report(analysis.id)
+        if report is None:
+            return None
+        reviewed_ids = set(self._review_corpus.get("reviewed_paper_ids") or [])
+        rows = self.repository.rows(
+            "SELECT * FROM papers WHERE project_id=?", (project,)
+        )
+        corpus = [row for row in rows if str(row.get("id")) in reviewed_ids] or rows
+        venue = get_venue_profile(self._venue_name)
+        readiness = assess_publication_readiness(
+            project_id=project,
+            spec=spec,
+            analysis=analysis,
+            report=report,
+            papers=corpus,
+            corpus_papers=corpus,
+            venue=venue,
+            execution_verified=True,
+        )
+        contract = build_contract(
+            project_id=project,
+            venue=venue,
+            review_corpus=self._review_corpus,
+            candidate=self.repository.get_novelty_candidate(candidate_id),
+            spec=spec,
+            analysis=analysis,
+            report=report,
+            execution_verified=True,
+            study_type=readiness.study_type,
+            provenance_sources=provenance_sources(self.repository, spec),
+        )
+        self._freeze_gaps = []
+        self._design_gaps = []
+        self._publish_contract(project, contract)
+        return contract
 
     def _fatal_for_stage(self, stage: str) -> list[dict[str, Any]]:
         return [

@@ -274,6 +274,7 @@ def test_readiness_accepts_a_real_powered_study(tmp_path):
     )
     spec = SimpleNamespace(
         repository=str(tmp_path),
+        dataset_identity="dataset A; dataset B",
         dataset_checksum="9f2c4e7a1b3d5f608c9e0a4b7d2f6e8c1a3b5d7f9e0c2a4b6d8f0e1c3a5b7d9f",
         baseline_commit="3b7cccd9a1f2e4d6c8b0a2f4e6d8c0b2a4f6e8d0",
         baseline_configuration="baseline A; baseline B",
@@ -318,6 +319,7 @@ def test_readiness_reads_the_production_dict_report_shape(tmp_path):
     )
     spec = SimpleNamespace(
         repository=str(tmp_path),
+        dataset_identity="dataset A; dataset B",
         dataset_checksum="9f2c4e7a1b3d5f608c9e0a4b7d2f6e8c1a3b5d7f9e0c2a4b6d8f0e1c3a5b7d9f",
         baseline_commit="3b7cccd9a1f2e4d6c8b0a2f4e6d8c0b2a4f6e8d0",
         baseline_configuration="baseline A; baseline B",
@@ -363,6 +365,7 @@ def test_weak_rng_simulation_cannot_be_submission_ready(tmp_path):
     )
     spec = SimpleNamespace(
         repository=str(tmp_path),
+        dataset_identity="dataset A; dataset B",
         dataset_checksum="9f2c4e7a1b3d5f608c9e0a4b7d2f6e8c1a3b5d7f9e0c2a4b6d8f0e1c3a5b7d9f",
         baseline_commit="3b7cccd9a1f2e4d6c8b0a2f4e6d8c0b2a4f6e8d0",
         baseline_configuration="baseline A; baseline B",
@@ -438,6 +441,7 @@ def test_dummy_source_without_execution_artifact_is_blocked(tmp_path):
     )
     spec = SimpleNamespace(
         repository=str(tmp_path),
+        dataset_identity="dataset A; dataset B",
         dataset_checksum="9f2c4e7a1b3d5f608c9e0a4b7d2f6e8c1a3b5d7f9e0c2a4b6d8f0e1c3a5b7d9f",
         baseline_commit="3b7cccd9a1f2e4d6c8b0a2f4e6d8c0b2a4f6e8d0",
         baseline_configuration="baseline A; baseline B",

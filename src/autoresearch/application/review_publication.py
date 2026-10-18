@@ -195,7 +195,9 @@ def build_review_publication(
             "code": "reviewed_papers_below_minimum",
             "stage": "review",
             "message": f"reviewed papers {len(reviewed_ids)} < {min_reviews}",
-            "fatal": True,
+            # Informational here; the venue-aware shared contract owns the
+            # fatal decision (workshop and journal minima differ).
+            "fatal": False,
         })
     if not top_ids:
         gaps.append({
