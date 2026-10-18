@@ -601,3 +601,30 @@ def test_abstract_stays_in_window_with_huge_recorded_fields(tmp_path):
     assert 150 <= words <= 250, words
     for part in ("Background:", "Gap in Knowledge:", "Contribution:", "Population & Methods:", "Results:", "Conclusion:"):
         assert any(part in line for line in lines), part
+
+
+def test_author_names_normalizes_all_stored_shapes():
+    """Regression (live PDF compile): the corpus stores authors as objects,
+    plain strings, and JSON lists of Python-repr strings. Any repr shape
+    leaked into references.bib and halted XeTeX."""
+    from autoresearch.application.manuscript import ManuscriptService
+
+    assert ManuscriptService._author_names('[{"fullname": "Ada Lovelace", "username": ""}]') == "Ada Lovelace"
+    assert ManuscriptService._author_names('["Grace Hopper", "Alan Turing"]') == "Grace Hopper and Alan Turing"
+    assert ManuscriptService._author_names(
+        '["{\'fullname\': \'Zhen Wang\', \'username\': \'\'}"]'
+    ) == "Zhen Wang"
+    assert ManuscriptService._author_names("[]") == "Unknown authors"
+    assert ManuscriptService._author_names(None) == "Unknown authors"
+
+
+def test_tex_escapes_unicode_and_markup_for_xetex():
+    """Regression (live PDF compile): μ/±/≥ and ^ ~ _ leaked into text mode
+    halted XeTeX with 'Missing $ inserted'."""
+    from autoresearch.application.manuscript import ManuscriptService
+
+    escaped = ManuscriptService._tex("anchor_mean μ ± σ_key^2 & 90% ≥ 1")
+    assert "μ" not in escaped and "\\mu" in escaped
+    assert "±" not in escaped and "\\pm" in escaped
+    assert "\\_" in escaped and "\\&" in escaped and "\\%" in escaped
+    assert "\\textasciicircum{}" in escaped and "≥" not in escaped

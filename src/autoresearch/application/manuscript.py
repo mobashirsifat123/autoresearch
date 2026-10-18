@@ -2013,9 +2013,44 @@ class ManuscriptService:
         ]
         return "figures/effect-sizes.svg", "\n".join(tikz_lines)
 
+    _TEX_UNICODE = {
+        "μ": r"$\mu$", "µ": r"$\mu$", "±": r"$\pm$", "×": r"$\times$", "·": r"$\cdot$",
+        "≥": r"$\geq$", "≤": r"$\leq$", "≠": r"$\neq$", "≈": r"$\approx$", "∞": r"$\infty$",
+        "→": r"$\rightarrow$", "←": r"$\leftarrow$", "∈": r"$\in$", "∑": r"$\sum$",
+        "α": r"$\alpha$", "β": r"$\beta$", "γ": r"$\gamma$", "δ": r"$\delta$",
+        "ε": r"$\epsilon$", "θ": r"$\theta$", "λ": r"$\lambda$", "π": r"$\pi$",
+        "ρ": r"$\rho$", "σ": r"$\sigma$", "τ": r"$\tau$", "φ": r"$\phi$", "ψ": r"$\psi$",
+        "ω": r"$\omega$", "Δ": r"$\Delta$", "Ω": r"$\Omega$", "Σ": r"$\Sigma$",
+        "−": "-", "–": "--", "—": "---", "…": r"\ldots{}", "“": "``", "”": "''",
+        "‘": "`", "’": "'", "†": r"\dag{}", "‡": r"\ddag{}", "§": r"\S{}", "¶": r"\P{}",
+    }
+
     @staticmethod
     def _tex(value: Any) -> str:
-        return str(value).replace("&", "\\&").replace("%", "\\%").replace("_", "\\_")
+        """Escape a free-text value for LaTeX text mode.
+
+        CV/ML evidence text routinely carries Unicode math (μ, ±, ≥) and
+        markup characters (^, ~). Inserted raw, XeTeX halts with
+        'Missing $ inserted' (observed live compiling the AutoFID
+        manuscript). Plain-text escapes run FIRST on the raw string, then
+        Unicode symbols are converted to math macros (which deliberately
+        introduce $ and braces).
+        """
+        text = str(value).replace("\\", r"\textbackslash{}")
+        text = (
+            text.replace("&", r"\&")
+            .replace("%", r"\%")
+            .replace("$", r"\$")
+            .replace("#", r"\#")
+            .replace("_", r"\_")
+            .replace("^", r"\textasciicircum{}")
+            .replace("~", r"\textasciitilde{}")
+            .replace("{", r"\{")
+            .replace("}", r"\}")
+        )
+        for symbol, latex in ManuscriptService._TEX_UNICODE.items():
+            text = text.replace(symbol, latex)
+        return text
 
     def _latex(
         self,
@@ -2156,7 +2191,7 @@ class ManuscriptService:
                 + ". Split: "
                 + self._tex(spec.split_definition)
                 + ". Metrics: "
-                + ", ".join(spec.metrics)
+                + ", ".join(self._tex(metric) for metric in spec.metrics)
                 + ". Seeds: "
                 + ", ".join(str(seed_value) for seed_value in spec.random_seeds)
                 + "."
@@ -2166,7 +2201,7 @@ class ManuscriptService:
         discussion = (
             (
                 "\\textbf{Recap.} Decision gates classified the outcome as "
-                + decision
+                + self._tex(decision)
                 + ": "
                 + self._tex(report["decision_evidence"])
                 + "\n\\textbf{Study Limitations (at least 3).}\n"
@@ -2231,12 +2266,12 @@ class ManuscriptService:
             + str(lineage.get("analysis_id"))
             + "; report "
             + str(lineage.get("report_id"))
-            + ". See evidence_bundle.json and manifest.json.\n"
-            "\\textbf{Appendix B. Raw seed metrics.} Persisted in evidence_bundle.json "
-            "(seed_level_results).\n"
+            + ". See evidence\\_bundle.json and manifest.json.\n"
+            "\\textbf{Appendix B. Raw seed metrics.} Persisted in evidence\\_bundle.json "
+            "(seed\\_level\\_results).\n"
             "\\textbf{Appendix C. Exact commands.} "
             + (
-                "; ".join(f"`{command}`" for command in self._exact_commands(report))
+                "; ".join(f"\\texttt{{{self._tex(command)}}}" for command in self._exact_commands(report))
                 or "No execution command recorded for this lineage."
             )
             + "\n"
@@ -2258,12 +2293,45 @@ class ManuscriptService:
         return build_result_tables(analysis)
 
     @staticmethod
+    def _author_names(authors_json: Any) -> str:
+        """Parse the stored author list into BibTeX-ready names.
+
+        The corpus stores authors in three shapes across sources: objects
+        ({'fullname': ...}), plain strings, and — observed live — a JSON list
+        whose entries are Python-repr strings of the object
+        ("{'fullname': 'Zhen Wang', 'username': ''}"). Joining the raw JSON
+        dumped reprs into the .bib file and XeTeX halted. Every shape is
+        normalized to the human name here.
+        """
+        import ast
+
+        try:
+            entries = json.loads(authors_json or "[]")
+        except (TypeError, ValueError):
+            return "Unknown authors"
+        names: list[str] = []
+        for entry in entries if isinstance(entries, list) else []:
+            candidate = entry
+            if isinstance(candidate, str) and candidate.strip().startswith("{"):
+                try:
+                    candidate = ast.literal_eval(candidate)
+                except (ValueError, SyntaxError):
+                    candidate = entry
+            if isinstance(candidate, dict):
+                name = candidate.get("fullname") or candidate.get("name") or candidate.get("username") or ""
+            else:
+                name = str(candidate)
+            if str(name).strip():
+                names.append(str(name).strip())
+        return " and ".join(names) or "Unknown authors"
+
+    @staticmethod
     def _bibtex(papers: list[dict[str, Any]], keys: dict[str, str]) -> str:
         entries = []
         for paper in papers:
             key = keys[paper["id"]]
             authors = (
-                " and ".join(json.loads(paper.get("authors_json") or "[]"))
+                ManuscriptService._author_names(paper.get("authors_json"))
                 or "Unknown authors"
             )
             title = (

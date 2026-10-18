@@ -18,6 +18,35 @@ two can never drift).
 
 from __future__ import annotations
 
+import math
+from typing import Any
+
+# LaTeX text-mode escape for free-form labels (metric names like
+# 'anchor_reported_correlation_pearson_r' broke XeTeX with 'Missing $').
+_TEX_UNICODE = {
+    "μ": r"$\mu$", "±": r"$\pm$", "×": r"$\times$", "≥": r"$\geq$", "≤": r"$\leq$",
+    "≠": r"$\neq$", "≈": r"$\approx$", "σ": r"$\sigma$", "α": r"$\alpha$", "β": r"$\beta$",
+    "Δ": r"$\Delta$", "→": r"$\rightarrow$", "−": "-", "…": r"\ldots{}",
+}
+
+
+def _tex_text(value: Any) -> str:
+    text = str(value).replace("\\", r"\textbackslash{}")
+    text = (
+        text.replace("&", r"\&")
+        .replace("%", r"\%")
+        .replace("$", r"\$")
+        .replace("#", r"\#")
+        .replace("_", r"\_")
+        .replace("^", r"\textasciicircum{}")
+        .replace("~", r"\textasciitilde{}")
+        .replace("{", r"\{")
+        .replace("}", r"\}")
+    )
+    for symbol, latex in _TEX_UNICODE.items():
+        text = text.replace(symbol, latex)
+    return text
+
 from typing import Any
 
 from autoresearch.experiments.result_analysis import _resolve_document_metric
@@ -132,17 +161,18 @@ def build_result_tables(analysis: Any) -> ResultTables:
         )
         # PEP-701-incompatible escapes (backslashes inside f-string
         # expressions) would break Python 3.11 — precompute the TeX cells.
-        before_tex = _cell(before).replace("±", "$\\pm$")
-        after_tex = _cell(after).replace("±", "$\\pm$")
+        metric_tex = _tex_text(metric)
+        before_tex = _tex_text(_cell(before))
+        after_tex = _tex_text(_cell(after))
         tex_rows.append(
-            f"{metric} & {before_tex} & {after_tex} & {delta_text} & {d_text} & "
+            f"{metric_tex} & {before_tex} & {after_tex} & {delta_text} & {d_text} & "
             f"{p_text} & {n} & {gate_text} \\\\"
         )
 
     markdown = "\n".join([header, divider, *rows]) if rows else header + "\n" + divider
     caption = (
-        f"Results over {n} seed{'s' if n != 1 else ''} (mean±std; exact two-sided "
-        "Wilcoxon signed-rank; Cohen's d on paired differences; every value "
+        f"Results over {n} seed{'s' if n != 1 else ''} ($\\pm$ = standard deviation; exact two-sided "
+        "Wilcoxon signed-rank; Cohen's $d$ on paired differences; every value "
         "deterministically derived from per-seed observations)."
     )
     latex = (
