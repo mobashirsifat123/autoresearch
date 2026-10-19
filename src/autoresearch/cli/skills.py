@@ -414,6 +414,8 @@ def _classify(exc: Exception) -> tuple[str, int]:
     if candidate:
         return candidate, EXIT_ERROR
     lowered = text.lower()
+    if "insufficient_evidence" in lowered:
+        return "insufficient_evidence", EXIT_INSUFFICIENT_EVIDENCE
     if "not found" in lowered:
         return "not_found", EXIT_NOT_FOUND
     return "internal_error", EXIT_ERROR
@@ -563,6 +565,10 @@ def review(
             "gap": _gap_summary(outcome.gap),
             "json_report": outcome.json_report,
             "markdown_report": outcome.markdown_report,
+            "review_corpus_path": outcome.review_corpus_path,
+            "citation_contexts_path": outcome.citation_contexts_path,
+            "review_audit_path": outcome.review_audit_path,
+            "publication_gaps": list(outcome.publication_gaps),
         }
 
     _invoke(operation, operation_name="review", project_id=project)
@@ -619,6 +625,23 @@ def novelty(
         }
 
     _invoke(operation, operation_name="novelty", project_id=project)
+
+
+@skill_app.command("state")
+def state(
+    project: str = typer.Option(..., "--project", help="Project ID to inspect."),
+) -> None:
+    """Read-only consolidated research state (question, novelty, experiment, recovery)."""
+
+    async def operation(c: ApplicationContainer) -> dict[str, Any]:
+        from autoresearch.application.research_state import write_research_state
+
+        snapshot = write_research_state(c.repository, project)
+        if snapshot is None:
+            raise ValueError(f"project_not_found: '{project}'")
+        return snapshot
+
+    _invoke(operation, operation_name="state", project_id=project)
 
 
 @skill_app.command("workflow")
@@ -770,7 +793,14 @@ def experiment_approve(
             "approved_budget": float(preview["budget"]),
             "expires_at": "9999-12-31T23:59:59+00:00",
             "status": "pending",
-            "approved_actions": preview["actions"],
+            # Bind the exact code and monitor contract the approver saw, not
+            # only the spec. Legacy approvals with a list remain valid.
+            "approved_actions": {
+                "actions": preview["actions"],
+                "implementation_checksum": preview.get("implementation_checksum", ""),
+                "implementation_verified": bool(preview.get("implementation_verified", False)),
+                "monitor_contract": preview.get("monitor_contract", {}),
+            },
         })
         approved = c.repository.approve_exact(str(approval["id"]), approver="claude-code-skill") or approval
         return {
@@ -793,6 +823,10 @@ def _approval_preview(preview: dict[str, Any]) -> dict[str, Any]:
         "worker": preview["worker"],
         "actions": preview["actions"],
         "budget": preview["budget"],
+        "implementation_checksum": preview.get("implementation_checksum", ""),
+        "implementation_verified": preview.get("implementation_verified", False),
+        "implementation_status": preview.get("implementation_status", "missing"),
+        "monitor_contract": preview.get("monitor_contract", {}),
     }
 
 
@@ -883,13 +917,9 @@ def experiment_cancel(
     """Cancel an experiment run that has not reached a terminal state."""
 
     async def operation(c: ApplicationContainer) -> dict[str, Any]:
-        run = c.repository.get_run(run_id)
-        if not run:
-            raise ValueError(f"run_not_found: run '{run_id}' not found")
-        c.repository.cancel_run(run_id)
-        return {"run_id": run_id, "status": "cancelled"}
+        return await c.experiment.cancel_run(run_id)
 
-    _invoke(operation, operation_name="experiment/cancel", candidate_id=candidate_id)
+    _invoke(operation, operation_name="experiment/cancel")
 
 
 skill_app.add_typer(experiment_app)

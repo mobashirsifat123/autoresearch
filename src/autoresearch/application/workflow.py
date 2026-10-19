@@ -26,6 +26,7 @@ from autoresearch.application.services import (
 )
 from autoresearch.application.publication_contract import build_contract
 from autoresearch.application.publication_readiness import assess_publication_readiness
+from autoresearch.application.research_state import write_research_state
 from autoresearch.application.venue_profiles import get_venue_profile
 from autoresearch.experiments.publication_design import provenance_sources
 from autoresearch.domain.models import PipelineKind, RunStatus
@@ -362,21 +363,34 @@ class WorkflowService:
         # (mechanism coverage + measurement contract). Failures are recorded,
         # never masked — an unverified implementation blocks honest execution.
         script_path = Path(str(spec.repository)) / "scripts" / "run_experiment.py"
-        if not script_path.is_file():
-            try:
-                implementation = await self.experiment.implement_candidate(candidate_id)
-                record("implementation", str(implementation.get("status", "unknown")),
-                       spec_id=spec.id, script=implementation.get("script_path"),
-                       fidelity=implementation.get("fidelity"),
-                       mechanism_coverage=implementation.get("verification", {}).get("mechanism_coverage"))
-            except Exception as exc:  # generation failure is reported, never masked
-                record("implementation", "failed", error=f"{type(exc).__name__}: {exc}"[:300])
-        else:
-            record("implementation", "reused", spec_id=spec.id, script=str(script_path),
-                   reason="user-supplied or previously generated script present")
+        implementation_status = "reused"
+        implementation_verified = False
+        try:
+            # Verify an existing user/generated script as well; a present file
+            # is not evidence that it meets the static contract.
+            implementation = await self.experiment.implement_candidate(candidate_id)
+            implementation_status = str(implementation.get("status", "unknown"))
+            implementation_verified = str(implementation.get("fidelity") or "") == "STATIC_VERIFIED"
+            record("implementation", implementation_status,
+                   spec_id=spec.id, script=implementation.get("script_path"),
+                   fidelity=implementation.get("fidelity"),
+                   mechanism_coverage=implementation.get("verification", {}).get("mechanism_coverage"))
+        except Exception as exc:  # generation failure is reported, never masked
+            implementation_status = "failed"
+            implementation_verified = False
+            record("implementation", "failed", error=f"{type(exc).__name__}: {exc}"[:300])
 
         if _STAGE_ORDER[until] <= _STAGE_ORDER["design"]:
             return self._result(project, dispositions, stopped_at=until)
+
+        # A generated or reused implementation that failed deterministic
+        # verification must never reach approval/execution.
+        if implementation_status == "failed" or not implementation_verified:
+            return self._result(
+                project, dispositions, stopped_at="implementation",
+                note="Implementation failed static verification; repair or regenerate it before "
+                     "approval. No execution was attempted.",
+            )
 
         # ---- Stage 5: execution — only under genuine existing approval ----
         package = self.experiment.approval_preview_for_candidate(candidate_id)
@@ -384,6 +398,9 @@ class WorkflowService:
         if not approval or approval.get("status") != "approved":
             record("experiment", "awaiting_approval", spec_id=spec.id,
                    checksum=package["checksum"], actions=package["actions"],
+                   implementation_checksum=package.get("implementation_checksum"),
+                   implementation_verified=package.get("implementation_verified"),
+                   monitor_contract=package.get("monitor_contract"),
                    missing_requirement="Exact-specification approval for the checksum above.")
             return self._result(project, dispositions, stopped_at="experiment",
                                 note="Execution package prepared; approval required before any run.")
@@ -392,19 +409,40 @@ class WorkflowService:
             await stage_invoke("experiment", lambda: self.experiment.execute_candidate(candidate_id, mode="execute"))
         except RuntimeError as exc:
             message = str(exc)
-            record("experiment", "worker_unavailable" if "worker_unavailable" in message else "execution_failed",
-                   spec_id=spec.id, error=message)
+            recovery = self.experiment.recovery_for_candidate(candidate_id) or {}
+            record(
+                "experiment",
+                "cancelled" if "execution_cancelled" in message else (
+                    "worker_unavailable" if "worker_unavailable" in message else "execution_failed"
+                ),
+                spec_id=spec.id,
+                error=message,
+                recovery_action=recovery.get("action"),
+                recovery_next_stage=recovery.get("next_stage"),
+                recovery_loop=recovery.get("loop"),
+                recovery_artifact=recovery.get("artifact_path"),
+            )
             return self._result(project, dispositions, stopped_at="experiment")
         # Execution completing proves only that the approved action ended; a
         # scientific report exists only after artifacts are ingested and
         # analyzed. Never fabricate a decision from a bare exit code.
         report_row = self._latest_report_for_candidate(candidate_id)
         if report_row is None:
+            recovery = self.experiment.recovery_for_candidate(candidate_id) or {}
             record("experiment", "executed_analysis_pending", spec_id=spec.id,
+                   recovery_action=recovery.get("action"),
+                   recovery_next_stage=recovery.get("next_stage"),
+                   recovery_loop=recovery.get("loop"),
+                   recovery_artifact=recovery.get("artifact_path"),
                    note="Approved action completed; awaiting artifact ingestion and statistical analysis before any interpretation.")
         else:
+            recovery = self.experiment.recovery_for_candidate(candidate_id) or {}
             record("experiment", "completed", spec_id=spec.id, report_id=report_row["id"],
-                   decision=report_row["decision"])
+                   decision=report_row["decision"],
+                   recovery_action=recovery.get("action"),
+                   recovery_next_stage=recovery.get("next_stage"),
+                   recovery_loop=recovery.get("loop"),
+                   recovery_artifact=recovery.get("artifact_path"))
             self._rebuild_post_execution_contract(project, candidate_id)
 
         # ---- Stage 7: manuscript (consumes the exact validated lineage) ----
@@ -619,15 +657,19 @@ class WorkflowService:
             ),
             encoding="utf-8",
         )
+        state_snapshot = write_research_state(self.repository, project)
         result: dict[str, Any] = {
             "workflow_id": getattr(self, "_workflow_id", uuid4().hex[:12]),
             "project_id": project,
             "stopped_at": stopped_at,
             "stages": dispositions,
+            "research_state": (state_snapshot or {}).get("state"),
+            "pending_recovery": (state_snapshot or {}).get("recovery"),
             "publication_gaps": getattr(self, "_publication_gaps", []),
             "artifacts": {
                 "stage_metrics": str(metrics_path),
                 **getattr(self, "_publication_paths", {}),
+                **({"research_state": state_snapshot["artifact_path"]} if state_snapshot and state_snapshot.get("artifact_path") else {}),
             },
         }
         if note:

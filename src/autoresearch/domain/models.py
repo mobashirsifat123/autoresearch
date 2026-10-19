@@ -521,6 +521,9 @@ class ExperimentSpec:
         "implementation_diff", "training_log", "checkpoint", "seed_metrics",
         "parameter_profile", "flop_profile", "latency_profile", "evaluation_report",
     )
+    # Optional pre-registered runtime perception contract (at most three
+    # signals). Empty is valid: process-level checks and watchdog still run.
+    monitor_contract: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

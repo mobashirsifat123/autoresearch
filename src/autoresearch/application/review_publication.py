@@ -115,6 +115,7 @@ def build_review_publication(
     claims: list[Any],
     top_paper_ids: Iterable[str],
     gap: Any | None = None,
+    audit: Mapping[str, Any] | None = None,
     min_reviews: int = PUBLICATION_MIN_REVIEWS,
 ) -> ReviewPublication:
     """Build the coverage summary and citation contexts from stored evidence."""
@@ -188,6 +189,9 @@ def build_review_publication(
         "closest_prior_work": top_ids[:5],
         "top_paper_ids": top_ids,
         "citation_contexts": len(contexts),
+        # Deterministic evidence audit (not a semantic entailment result).
+        "cross_paper_conflicts": list((audit or {}).get("cross_paper_conflicts") or []),
+        "missing_evidence": list((audit or {}).get("missing_evidence") or []),
     }
     gaps: list[dict[str, Any]] = []
     if len(reviewed_ids) < min_reviews:

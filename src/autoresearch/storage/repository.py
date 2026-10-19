@@ -54,7 +54,7 @@ from autoresearch.domain.models import (
 )
 
 
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 
 
 def _register_project_root(project_id: str, data_root: str) -> None:
@@ -164,6 +164,22 @@ class ResearchRepository:
             if current < 16:
                 connection.executescript(_SCHEMA_V16)
                 connection.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(?,?)", (16, utc_now()))
+            if current < 17:
+                # v17 is applied column-by-column so a crash between the two
+                # ALTERs is recoverable instead of failing on a duplicate
+                # column during the next startup.
+                columns = {
+                    str(row[1]): row for row in connection.execute("PRAGMA table_info(experiment_specs)")
+                }
+                if "monitor_contract_json" not in columns:
+                    connection.execute(
+                        "ALTER TABLE experiment_specs ADD COLUMN monitor_contract_json TEXT NOT NULL DEFAULT '{}'"
+                    )
+                if "required_artifacts_json" not in columns:
+                    connection.execute(
+                        "ALTER TABLE experiment_specs ADD COLUMN required_artifacts_json TEXT"
+                    )
+                connection.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(?,?)", (17, utc_now()))
             latest = int(connection.execute("SELECT COALESCE(MAX(version), 0) FROM schema_migrations").fetchone()[0])
             if latest != SCHEMA_VERSION:
                 raise RuntimeError(f"Unsupported database schema v{latest}; expected v{SCHEMA_VERSION}.")
@@ -212,7 +228,13 @@ class ResearchRepository:
 
     def finish_run(self, run_id: str, *, error: str | None = None) -> None:
         status = RunStatus.FAILED if error else RunStatus.COMPLETED
-        self.execute("UPDATE pipeline_runs SET status=?,completed_at=?,error=? WHERE id=?", (status.value, utc_now(), error, run_id))
+        # An explicit cancellation is terminal: a later finish bookkeeping
+        # call must not resurrect the run as completed.
+        self.execute(
+            "UPDATE pipeline_runs SET status=?,completed_at=?,error=? "
+            "WHERE id=? AND status != ?",
+            (status.value, utc_now(), error, run_id, RunStatus.CANCELLED.value),
+        )
 
     def resume_run(self, run_id: str) -> PipelineRun:
         run = self.get_run(run_id)
@@ -686,8 +708,8 @@ class ResearchRepository:
     # Experiment methods
     def save_experiment_spec(self, spec: ExperimentSpec) -> None:
         self.execute(
-            "INSERT OR REPLACE INTO experiment_specs(id,project_id,run_id,candidate_id,hypothesis,causal_mechanism,falsification_condition,repository,baseline_commit,dataset_identity,dataset_checksum,split_definition,baseline_configuration,proposed_change,independent_variables_json,controlled_variables_json,metrics_json,random_seeds_json,ablations_json,robustness_tests_json,statistical_plan,compute_budget,stopping_conditions_json,expected_outputs_json,artifact_contract,provenance_json,metric_direction_json,minimum_meaningful_effect_json,required_seed_count,network_policy,target_worker,approval_required,gap_id,methodology_freeze_id,interpretation_rules_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (spec.id, spec.project_id, spec.run_id, spec.candidate_id, spec.hypothesis, spec.causal_mechanism, spec.falsification_condition, spec.repository, spec.baseline_commit, spec.dataset_identity, spec.dataset_checksum, spec.split_definition, spec.baseline_configuration, spec.proposed_change, _json(spec.independent_variables), _json(spec.controlled_variables), _json(spec.metrics), _json(spec.random_seeds), _json(spec.ablations), _json(spec.robustness_tests), spec.statistical_plan, spec.compute_budget, _json(spec.stopping_conditions), _json(spec.expected_outputs), spec.artifact_contract, _json_provenance(spec.provenance), _json(spec.metric_direction), _json(spec.minimum_meaningful_effect), spec.required_seed_count, spec.network_policy, spec.target_worker, int(spec.approval_required), spec.gap_id, spec.methodology_freeze_id, _json(spec.interpretation_rules))
+            "INSERT OR REPLACE INTO experiment_specs(id,project_id,run_id,candidate_id,hypothesis,causal_mechanism,falsification_condition,repository,baseline_commit,dataset_identity,dataset_checksum,split_definition,baseline_configuration,proposed_change,independent_variables_json,controlled_variables_json,metrics_json,random_seeds_json,ablations_json,robustness_tests_json,statistical_plan,compute_budget,stopping_conditions_json,expected_outputs_json,artifact_contract,provenance_json,metric_direction_json,minimum_meaningful_effect_json,required_seed_count,network_policy,target_worker,approval_required,gap_id,methodology_freeze_id,interpretation_rules_json,monitor_contract_json,required_artifacts_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (spec.id, spec.project_id, spec.run_id, spec.candidate_id, spec.hypothesis, spec.causal_mechanism, spec.falsification_condition, spec.repository, spec.baseline_commit, spec.dataset_identity, spec.dataset_checksum, spec.split_definition, spec.baseline_configuration, spec.proposed_change, _json(spec.independent_variables), _json(spec.controlled_variables), _json(spec.metrics), _json(spec.random_seeds), _json(spec.ablations), _json(spec.robustness_tests), spec.statistical_plan, spec.compute_budget, _json(spec.stopping_conditions), _json(spec.expected_outputs), spec.artifact_contract, _json_provenance(spec.provenance), _json(spec.metric_direction), _json(spec.minimum_meaningful_effect), spec.required_seed_count, spec.network_policy, spec.target_worker, int(spec.approval_required), spec.gap_id, spec.methodology_freeze_id, _json(spec.interpretation_rules), _json(spec.monitor_contract), _json(spec.required_artifacts) if spec.required_artifacts else None)
         )
 
     def get_experiment_spec(self, candidate_id: str) -> ExperimentSpec | None:
@@ -891,6 +913,24 @@ class ResearchRepository:
     def save_exact_approval(self, approval: dict[str, Any]) -> dict[str, Any]:
         existing = self.row("SELECT * FROM experiment_approvals WHERE run_id=? AND specification_checksum=?", (approval["run_id"], approval["specification_checksum"]))
         if existing:
+            new_actions = approval.get("approved_actions")
+            old_actions = _loads(existing.get("approved_actions_json"), [])
+            if new_actions and new_actions != old_actions:
+                # A regenerated implementation under the same spec keeps the
+                # specification checksum but has a new digest. Re-bind it and
+                # return the approval to pending so --accept records consent
+                # for the new bytes.
+                self.execute(
+                    "UPDATE experiment_approvals SET approved_actions_json=?, approver=?, "
+                    "approved_budget=?, approved_target=?, expires_at=?, status='pending', revoked_at=NULL "
+                    "WHERE id=?",
+                    (_json(new_actions), approval["approver"], approval["approved_budget"],
+                     approval["approved_target"], approval["expires_at"], existing["id"]),
+                )
+                refreshed = self.row("SELECT * FROM experiment_approvals WHERE id=?", (existing["id"],))
+                if refreshed:
+                    refreshed["approved_actions"] = _loads(refreshed.pop("approved_actions_json"), [])
+                return refreshed or existing
             return existing
         self.execute("INSERT INTO experiment_approvals(id,run_id,specification_checksum,approver,approved_scope,approved_target,approved_budget,expires_at,created_at,status,revoked_at,approved_actions_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (approval["id"], approval["run_id"], approval["specification_checksum"], approval["approver"], approval["approved_scope"], approval["approved_target"], approval["approved_budget"], approval["expires_at"], approval.get("created_at", utc_now()), approval.get("status", "pending"), approval.get("revoked_at"), _json(approval.get("approved_actions", []))))
         return self.row("SELECT * FROM experiment_approvals WHERE id=?", (approval["id"],)) or approval
@@ -1014,7 +1054,7 @@ def _methodology_freeze(row: dict[str, Any]) -> "MethodologyFreeze":
 
 
 def _experiment_spec(row: dict[str, Any]) -> ExperimentSpec:
-    return ExperimentSpec(row["id"], row["project_id"], row["run_id"], row["candidate_id"], row["hypothesis"], row["causal_mechanism"], row["falsification_condition"], row["repository"], row["baseline_commit"], row["dataset_identity"], row["dataset_checksum"], row["split_definition"], row["baseline_configuration"], row["proposed_change"], tuple(_loads(row["independent_variables_json"], [])), tuple(_loads(row["controlled_variables_json"], [])), tuple(_loads(row["metrics_json"], [])), tuple(_loads(row["random_seeds_json"], [])), tuple(_loads(row["ablations_json"], [])), tuple(_loads(row["robustness_tests_json"], [])), row["statistical_plan"], row["compute_budget"], tuple(_loads(row["stopping_conditions_json"], [])), tuple(_loads(row["expected_outputs_json"], [])), row["artifact_contract"], _provenance(row["provenance_json"]), _loads(row.get("metric_direction_json"), {}), _loads(row.get("minimum_meaningful_effect_json"), {}), int(row.get("required_seed_count", 1)), row.get("network_policy", "disabled"), row.get("target_worker", "local"), bool(row.get("approval_required", 1)), str(row.get("gap_id") or ""), str(row.get("methodology_freeze_id") or ""), tuple(_loads(row.get("interpretation_rules_json"), [])))
+    return ExperimentSpec(row["id"], row["project_id"], row["run_id"], row["candidate_id"], row["hypothesis"], row["causal_mechanism"], row["falsification_condition"], row["repository"], row["baseline_commit"], row["dataset_identity"], row["dataset_checksum"], row["split_definition"], row["baseline_configuration"], row["proposed_change"], tuple(_loads(row["independent_variables_json"], [])), tuple(_loads(row["controlled_variables_json"], [])), tuple(_loads(row["metrics_json"], [])), tuple(_loads(row["random_seeds_json"], [])), tuple(_loads(row["ablations_json"], [])), tuple(_loads(row["robustness_tests_json"], [])), row["statistical_plan"], row["compute_budget"], tuple(_loads(row["stopping_conditions_json"], [])), tuple(_loads(row["expected_outputs_json"], [])), row["artifact_contract"], _provenance(row["provenance_json"]), _loads(row.get("metric_direction_json"), {}), _loads(row.get("minimum_meaningful_effect_json"), {}), int(row.get("required_seed_count", 1)), row.get("network_policy", "disabled"), row.get("target_worker", "local"), bool(row.get("approval_required", 1)), str(row.get("gap_id") or ""), str(row.get("methodology_freeze_id") or ""), tuple(_loads(row.get("interpretation_rules_json"), [])), monitor_contract=_loads(row.get("monitor_contract_json"), {}), **({"required_artifacts": tuple(_loads(row.get("required_artifacts_json"), []))} if _loads(row.get("required_artifacts_json"), []) else {}))
 
 def _environment_manifest(row: dict[str, Any]) -> EnvironmentManifest:
     return EnvironmentManifest(row["id"], row["project_id"], row["run_id"], row["spec_id"], row["operating_system"], row["python_version"], row["environment_manager"], row["dependency_lock_checksum"], row["cuda_compatibility"], row["gpu_model"], row["gpu_memory"], row["disk_space"], tuple(_loads(row["dataset_paths_json"], [])), _loads(row["sample_counts_json"], {}), tuple(_loads(row["splits_json"], [])), row["pretrained_checkpoint_identity"], row["reproducibility_flags"], _provenance(row["provenance_json"]))
@@ -1732,4 +1772,12 @@ ALTER TABLE execution_results ADD COLUMN command_json TEXT NOT NULL DEFAULT '';
 _SCHEMA_V16 = """
 ALTER TABLE projects ADD COLUMN state_db_path TEXT;
 UPDATE projects SET state_db_path = (SELECT hex(randomblob(0))) WHERE 0; -- no-op placeholder
+"""
+
+# V17 (additive): pre-registered runtime perception contract for experiment
+# execution. Empty JSON means "no declared telemetry"; the deterministic
+# process-level checks and watchdog still apply.
+_SCHEMA_V17 = """
+ALTER TABLE experiment_specs ADD COLUMN monitor_contract_json TEXT NOT NULL DEFAULT '{}';
+ALTER TABLE experiment_specs ADD COLUMN required_artifacts_json TEXT;
 """

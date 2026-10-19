@@ -210,7 +210,31 @@ class ImplementationVerifier:
         if missing_artifacts:
             reasons.append(f"ARTIFACT_TYPES_MISSING: {missing_artifacts}")
 
-        # 7. Mechanism coverage (methodology components → code symbols)
+        # 7. Runtime perception contract: declared signals must actually be
+        # emitted on the probe line protocol. Without this gate a monitor
+        # contract could pass planning and then observe nothing at runtime.
+        monitors = [
+            str(item.get("name") or "").strip()
+            for item in ((getattr(spec, "monitor_contract", {}) or {}).get("monitors") or [])
+            if isinstance(item, dict) and str(item.get("name") or "").strip()
+        ]
+        if monitors:
+            missing_probes = [
+                name for name in monitors
+                if not re.search(
+                    r"(AUTORESEARCH_PROBE|EA_PROBE):[^\n]*[\"']name[\"']\s*:\s*[\"']"
+                    + re.escape(name) + r"[\"'][^\n]*[\"']value[\"']\s*:",
+                    source,
+                )
+            ]
+            report.checks["monitor_contract_probed"] = not missing_probes
+            if missing_probes:
+                reasons.append(
+                    "MONITOR_CONTRACT_NOT_PROBED: declare a live line for each signal "
+                    f"{missing_probes} using print('AUTORESEARCH_PROBE:' + json.dumps({{'name': ..., 'value': ...}}), flush=True)"
+                )
+
+        # 8. Mechanism coverage (methodology components → code symbols)
         components = mechanism_components(methodology, spec)
         defined = {
             node.name.lower() for node in ast.walk(tree)
@@ -312,15 +336,49 @@ class ImplementationGenerator:
         root = self.repository.artifact_root / spec.project_id / spec.run_id
         root.mkdir(parents=True, exist_ok=True)
         verification_path = root / f"implementation-verification-{spec.id[:8]}.json"
-        verification_path.write_text(json.dumps(verification_payload, indent=2), encoding="utf-8")
+        verification_text = json.dumps(verification_payload, indent=2)
+        verification_path.write_text(verification_text, encoding="utf-8")
+        verification_checksum = content_checksum(verification_text)
+        # Re-verifying an unchanged script must not append a new artifact after
+        # an approval (that would look like a post-approval re-baseline).
+        existing = self.repository.rows(
+            "SELECT id FROM artifacts WHERE project_id=? AND artifact_type='implementation_verification' "
+            "AND checksum=? LIMIT 1",
+            (spec.project_id, verification_checksum),
+        )
+        if existing:
+            return {
+                "spec_id": spec.id,
+                "candidate_id": spec.candidate_id,
+                "script_path": str(script_path),
+                "status": status,
+                "verification": verification_payload,
+                "fidelity": "STATIC_VERIFIED" if report.level == "STATIC_VERIFIED" else "UNVERIFIED",
+            }
         if source:
-            self.repository.save_artifact(ArtifactReference(
-                uuid4().hex, project_id=spec.project_id, run_id=spec.run_id,
-                artifact_type="experiment_implementation", path=str(script_path),
-                source_evidence=(spec.id,), provider="model", model="implementation-generator",
-                prompt_version=IMPLEMENTATION_PROMPT_VERSION,
-                checksum=content_checksum(source),
-            ))
+            # Only a PASSING implementation may claim the verified artifact
+            # type. A failed generated script is retained for inspection but
+            # can never satisfy the worker's verification gate.
+            artifact_type = (
+                "experiment_implementation"
+                if report.level == "STATIC_VERIFIED"
+                else "experiment_implementation_unverified"
+            )
+            source_checksum = content_checksum(source)
+            # Re-verifying identical bytes must not append a new artifact
+            # after approval (that would look like a re-baseline).
+            existing_source = self.repository.rows(
+                "SELECT id FROM artifacts WHERE project_id=? AND artifact_type=? AND checksum=? LIMIT 1",
+                (spec.project_id, artifact_type, source_checksum),
+            )
+            if not existing_source:
+                self.repository.save_artifact(ArtifactReference(
+                    uuid4().hex, project_id=spec.project_id, run_id=spec.run_id,
+                    artifact_type=artifact_type, path=str(script_path),
+                    source_evidence=(spec.id,), provider="model", model="implementation-generator",
+                    prompt_version=IMPLEMENTATION_PROMPT_VERSION,
+                    checksum=source_checksum,
+                ))
         self.repository.save_artifact(ArtifactReference(
             uuid4().hex, project_id=spec.project_id, run_id=spec.run_id,
             artifact_type="implementation_verification", path=str(verification_path),
@@ -396,11 +454,15 @@ class ImplementationGenerator:
                     "derive values from computation over the methodology's mechanism).\n"
                     "3. Write one artifact file per required artifact type under 'run_outputs/' "
                     f"(types: {required_artifacts}) and collect their descriptors.\n"
-                    '4. End the script with exactly:\n'
+                    f"4. Runtime perception contract (declared signals): {json.dumps(getattr(spec, 'monitor_contract', {}) or {})}\n"
+                    "   For every declared monitor, emit a live scalar summary at each evaluation step:\n"
+                    "       print('AUTORESEARCH_PROBE:' + json.dumps({\"name\": \"<signal>\", \"value\": <float>, \"step\": <int>}), flush=True)\n"
+                    "   The worker terminates the process when a declared bound/trend is violated; never fabricate a value.\n"
+                    '5. End the script with exactly:\n'
                     'print(json.dumps({"identity": IDENTITY, "seeds": seed_rows, "artifacts": artifact_rows}))\n'
                     "   where seed_rows = [{\"seed\": s, \"baseline\": {metric: value}, \"candidate\": {metric: value}}, ...]\n"
                     "   and artifact_rows = [{\"artifact_type\": t, \"path\": str(p)}, ...]\n"
-                    "5. Implement each methodology component as a named function whose name contains the component term."
+                    "6. Implement each methodology component as a named function whose name contains the component term."
                 ),
             },
         ]

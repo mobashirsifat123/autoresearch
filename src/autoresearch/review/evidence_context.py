@@ -34,6 +34,7 @@ def build_evidence_context(
     counter_claim_ids: Iterable[str] = (),
     candidate_id: str | None = None,
     gap_row: dict[str, Any] | None = None,
+    review_run_id: str | None = None,
 ) -> dict[str, Any]:
     """Collect papers, review methods, and validated claims for prompt grounding.
 
@@ -99,6 +100,14 @@ def build_evidence_context(
         "counter_evidence_claims": counter_claims,
     }
 
+    # Corpus-level conflict candidates are retrieval aids, not verified
+    # contradictions. They let novelty explicitly resolve a disagreement
+    # instead of treating the literature as unanimous. Bounded and optional.
+    review_run_id = review_run_id or str((gap_row or {}).get("run_id") or "") or None
+    conflict_rows = _latest_conflicts(repository, project_id, run_id=review_run_id)
+    if conflict_rows:
+        context["cross_paper_conflicts"] = conflict_rows
+
     if gap_row is not None:
         context["gap"] = {
             "statement": str(gap_row.get("statement") or ""),
@@ -116,6 +125,39 @@ def build_evidence_context(
             }
 
     return context
+
+
+def _latest_conflicts(
+    repository: ResearchRepository,
+    project_id: str,
+    *,
+    run_id: str | None = None,
+    limit: int = 6,
+) -> list[dict[str, Any]]:
+    """Read the selected review run's conflict candidates, if they exist."""
+    try:
+        if run_id:
+            rows = repository.rows(
+                "SELECT path FROM artifacts WHERE project_id=? AND run_id=? "
+                "AND artifact_type='review_audit' ORDER BY rowid DESC LIMIT 1",
+                (project_id, run_id),
+            )
+        else:
+            rows = repository.rows(
+                "SELECT path FROM artifacts WHERE project_id=? AND artifact_type='review_audit' "
+                "ORDER BY rowid DESC LIMIT 1",
+                (project_id,),
+            )
+        if not rows:
+            return []
+        import json as _json
+        from pathlib import Path as _Path
+
+        payload = _json.loads(_Path(str(rows[0]["path"])).read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError):
+        return []
+    conflicts = payload.get("cross_paper_conflicts") or []
+    return [dict(item) for item in conflicts[:limit] if isinstance(item, dict)]
 
 
 def _paper_entry(repository: ResearchRepository, project_id: str, paper_id: str) -> dict[str, Any] | None:
@@ -184,6 +226,20 @@ def format_evidence_context(context: dict[str, Any] | None) -> str:
             "Closest prior methods identified by prior-art check: "
             f"paper_ids={prior.get('paper_ids')} overlap_status={prior.get('overlap_status')} "
             f"comparison: {prior.get('mechanism_comparison')}"
+        )
+    conflicts = context.get("cross_paper_conflicts") or []
+    if conflicts:
+        lines = [
+            f"- [{item['left']['claim_id']} vs {item['right']['claim_id']}] "
+            f"shared={item.get('shared_terms')} | {item['left']['paper_id']}: "
+            f"'{item['left']['statement'][:220]}' vs {item['right']['paper_id']}: "
+            f"'{item['right']['statement'][:220]}'"
+            for item in conflicts
+        ]
+        parts.append(
+            "Candidate cross-paper conflicts (heuristic retrieval candidates, NOT verified "
+            "contradictions; check datasets/metrics/protocols). A candidate that resolves one "
+            "of these conflicts has a concrete contribution to test:\n" + "\n".join(lines)
         )
     findings = context.get("findings_memory") or []
     if findings:

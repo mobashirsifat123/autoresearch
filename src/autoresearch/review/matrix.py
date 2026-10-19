@@ -14,6 +14,7 @@ absence is recorded as absence.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
@@ -74,6 +75,17 @@ def build_evidence_matrix(
         for row in repository.rows("SELECT paper_id, total FROM priority_scores WHERE run_id=?", (run_id,))
     }
     gap = repository.gap_for_run(run_id)
+    audit: dict[str, Any] = {}
+    try:
+        audit_rows = repository.rows(
+            "SELECT path FROM artifacts WHERE run_id=? AND artifact_type='review_audit' "
+            "ORDER BY rowid DESC LIMIT 1",
+            (run_id,),
+        )
+        if audit_rows:
+            audit = json.loads(Path(str(audit_rows[0]["path"])).read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError):
+        audit = {}
 
     matrix: list[dict[str, Any]] = []
     for review in reviews:
@@ -131,6 +143,8 @@ def build_evidence_matrix(
             "gap_id": str(gap.id) if gap else None,
             "counter_claim_ids": list(gap.counter_evidence_claim_ids) if gap else [],
         },
+        "cross_paper_conflicts": list(audit.get("cross_paper_conflicts") or []),
+        "missing_evidence": list(audit.get("missing_evidence") or []),
         "matrix": matrix,
     }
 

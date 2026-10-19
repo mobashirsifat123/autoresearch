@@ -154,6 +154,10 @@ invent a percentage before a progress line arrives; report stalls honestly.
   that the pipeline produced no candidate meeting the scientific requirements.
 - If the `scientific_critic` role is unconfigured (check `skill doctor`),
   critic scores will be absent — say so instead of summarizing empty critiques.
+- Candidate generation also receives the newest review audit's **candidate
+  cross-paper conflicts** (heuristic, not verified contradictions). A candidate
+  that claims to resolve one of these conflicts should state which conflict and
+  how; never treat the conflict as established fact.
 - Surface counter-evidence and overlap honestly; the user needs accurate
   information to decide whether to proceed to the experiment skill.
 - The `low_risk_candidate_id` (or whichever the user chooses) is the

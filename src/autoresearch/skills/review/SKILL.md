@@ -122,6 +122,13 @@ After a successful run, the JSON contains:
   themes, method families, datasets, years, closest prior work.
 - `citation_contexts_path` — exact quote/page/section/relationship for every
   cited claim; the manuscript cites only through these contexts.
+- `review_audit_path` — deterministic review audit containing
+  `cross_paper_conflicts` and `missing_evidence`. Conflicts are **candidate
+  conflicts** (shared content terms + opposing result polarity), explicitly
+  labelled `candidate_conflict_not_verified`; they are never reported as
+  verified contradictions. Missing evidence records claims without a
+  page/section, abstract-only papers, failed reviews, and absent
+  counter-evidence.
 - `publication_gaps` — exact blockers such as `reviewed_papers_below_minimum`
   (<20 for `generic_journal`), `closest_prior_work_missing`, or
   `full_text_ratio_below_threshold`. They are reported, never hidden.
@@ -177,6 +184,10 @@ invent a percentage before a progress line arrives; report stalls honestly.
   never invent terms to reach a count. If the durable record honestly
   provides fewer than 3 terms, report that instead of padding.
 - If `gap.classification` is `hypothesis`, say so — do not present it as a proven gap.
+- If `review_audit_path` is present, surface the number of conflict
+  candidates and missing-evidence items. Call them **candidate conflicts**;
+  do not claim that the literature is contradictory without checking
+  datasets, metrics, and protocols.
 - If `failed_reviews` significantly exceeds `reviewed`, warn the user (PDFs may be
   image-only or paywalled, causing no verbatim excerpts to be found).
 - If a provider role is unconfigured (check `skill doctor`), tell the user which

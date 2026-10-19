@@ -54,6 +54,40 @@ SPEC_SCHEMA = {
             "type": "array", "items": {"type": "string"}, "minItems": 1,
             "description": "Pre-registered rules for interpreting positive, negative, null, failed, and unavailable outcomes",
         },
+        "monitor_contract": {
+            "type": "object",
+            "description": "Optional runtime perception contract: at most 3 scalar signals the implementation must emit while running.",
+            "properties": {
+                "stall_seconds": {"type": "integer", "minimum": 0, "description": "Abort if no stdout/probe arrives for this many seconds; 0 disables."},
+                "monitors": {
+                    "type": "array", "maxItems": 3,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "constraint_id": {"type": "string"},
+                            "units": {"type": "string"},
+                            "cadence": {"type": "string"},
+                            "healthy": {
+                                "type": "object",
+                                "properties": {
+                                    "min": {"type": "number"},
+                                    "max": {"type": "number"},
+                                    "trend": {"type": "string", "enum": ["increasing", "decreasing"]},
+                                },
+                                "additionalProperties": False,
+                            },
+                            "abort_if": {"type": "string", "description": "Safe scalar predicate over value/prev/step, e.g. 'value > 1e6'."},
+                            "why": {"type": "string"},
+                        },
+                        "required": ["name", "why"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            "required": ["monitors"],
+            "additionalProperties": False,
+        },
     },
     "required": [
         "hypothesis", "causal_mechanism", "falsification_condition",
@@ -159,6 +193,11 @@ _FIELD_CONTRACT = (
     "- compute_budget: string\n"
     "- stopping_conditions: array of strings\n"
     "- expected_outputs: array of strings containing the Python experiment script (e.g. 'scripts/run_experiment.py') and metric log files\n"
+    "- monitor_contract: {monitors: [{name, units, cadence, healthy:{min,max,trend}, abort_if, why}], stall_seconds}\n"
+    "  Optional but strongly preferred: declare at most 3 scalar signals that reveal a doomed run early\n"
+    "  (for example loss, gradient norm, validation score, checkpoint age). Use only quantities the\n"
+    "  implementation can emit while running; never invent measured values. `abort_if` is a scalar\n"
+    "  expression over value/prev/step (abs/min/max/isnan/isinf allowed); leave it empty when bounds suffice.\n"
     "- artifact_contract: string\n"
     "- metric_direction: object mapping metric name to 'maximize' or 'minimize'\n"
     "- minimum_meaningful_effect: object mapping metric name to a number\n"
@@ -312,6 +351,7 @@ class ExperimentSpecGenerator:
             # implementation generator honor the subset. Empty keeps the full
             # universal contract (the analyzer's default).
             required_artifacts=tuple(str(item) for item in selected.get("required_artifacts", []) or ()),
+            monitor_contract=selected.get("monitor_contract") if isinstance(selected.get("monitor_contract"), dict) else {},
         )
 
     async def _generate_single(self, candidate: NoveltyCandidate, focus: str, grounding_block: str = "") -> dict:

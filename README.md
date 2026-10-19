@@ -10,8 +10,10 @@ review → novelty → experiment → manuscript
 - **review** — discovers real literature (Semantic Scholar, OpenAlex,
   Crossref, arXiv, OpenReview), extracts verbatim-verified evidence, and
   surfaces a cited research question with counter-evidence. It writes a
-  review corpus and citation contexts, and reports publication gaps when
-  fewer than 20 papers are reviewed.
+  review corpus and citation contexts, a **review audit** with bounded
+  cross-paper conflict candidates (heuristic, explicitly not verified
+  contradictions) and a missing-evidence ledger, and reports publication
+  gaps when fewer than 20 papers are reviewed.
 - **novelty** — generates candidate methods grounded in the reviewed
   evidence, checks them against prior art, critiques them adversarially, and
   freezes the selected methodology (versioned, checksummed) with a
@@ -23,6 +25,19 @@ review → novelty → experiment → manuscript
   checksum and baseline commit from the real target, reports
   publication-design gaps before execution, and ingests identity-checked
   measurements. Negative and null results are valid outcomes.
+  During execution, an optional pre-registered **monitor contract** is
+  enforced deterministically: generated code emits
+  `AUTORESEARCH_PROBE:{"name": ..., "value": ...}` lines; NaN/Inf, bound
+  breaches, persistent trend violations, stalls, and guard events terminate
+  the run early. Suspect observations are retained as evidence. When a
+  verified implementation artifact exists, the executed script must byte-match
+  it or execution is refused.
+- **recovery** — every failed approved execution (and measurement-ingestion
+  failure) produces a checksummed `recovery_decision` (fast loop: retry /
+  repair / parameter adjustment; slow loop: redesign / return to novelty /
+  return to review / stop) with a rationale and evidence ids. The failure is
+  also persisted to Findings Memory. Expensive follow-up work is recommended,
+  never auto-executed without a fresh approval or explicit resume.
 - **manuscript** — assembles the validated lineage into an editable,
   cited manuscript (Markdown + LaTeX + BibTeX + tables + manifest) behind a
   publication-readiness gate. It distinguishes a complete evidence chain
@@ -33,7 +48,11 @@ review → novelty → experiment → manuscript
   an explicitly incomplete draft or a gated `draft`, never a fabricated
   submission.
 - **workflow** — one durable loop over all four stages, reusing completed
-  work and stopping where asked.
+  work and stopping where asked. At the end of every invocation it writes
+  `research_state.json` (current question, novelty/methodology/experiment
+  lineage, latest decision, pending recovery, conflicts, manuscript status)
+  and exposes the exact path in the JSON result. `autoresearch skill state
+  --project <id>` prints the same snapshot on demand.
 
 Every analyzed outcome is persisted to a shared **Findings Memory**
 (including failures and refutations) that conditions later runs, so the
@@ -119,6 +138,10 @@ five skills into your agent host as explicit slash commands
   audited (every number, citation, and overclaim checked) and falls back to
   the deterministic draft on any violation.
 - An incomplete result stays visibly incomplete.
+- Runtime perception and recovery are deterministic; no LLM is called at
+  stream rate, and a suspect observation never aborts a run by itself.
+- Cross-paper conflicts are labelled candidates for expert verification, not
+  asserted contradictions.
 
 ## Verify
 

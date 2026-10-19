@@ -53,6 +53,7 @@ class NoveltyPipeline:
             supporting_paper_ids=gap.supporting_paper_ids,
             supporting_claim_ids=gap.supporting_claim_ids,
             counter_claim_ids=gap.counter_evidence_claim_ids,
+            review_run_id=gap.run_id,
         )
         if findings:
             evidence_context["findings_memory"] = findings

@@ -34,11 +34,21 @@ class ScientificReportWriter:
         measurements = {metric: {"value": value, "classification": "MEASURED RESULT"} for metric, value in analysis.proposed_metrics.items()}
         repository_available = repository or self.repository
         exact_commands: tuple[str, ...] = ()
+        failed_runs = 0
         if repository_available is not None:
             try:
                 exact_commands = tuple(repository_available.execution_commands_for_spec(spec.id))
             except Exception:  # noqa: BLE001 - command recording is best-effort; absence is reported honestly
                 exact_commands = ()
+            try:
+                row = repository_available.row(
+                    "SELECT COUNT(*) AS n FROM worker_jobs WHERE spec_id=? "
+                    "AND state IN ('FAILED','STALE','CANCELED')",
+                    (spec.id,),
+                ) or {}
+                failed_runs = int(row.get("n") or 0)
+            except Exception:  # noqa: BLE001
+                failed_runs = 0
         # The manuscript template (FastTrack, template-spec.json) requires the
         # Discussion to list at least 3 study limitations. Every entry here is
         # an objective fact about this run — never an invented weakness.
@@ -52,6 +62,11 @@ class ScientificReportWriter:
             if not analysis.ablation_contributions
             else "Ablation contributions are measured only for recorded descendant runs.",
             "Robustness tests were not run; robustness is not claimed unless represented by validated artifacts.",
+            *((
+                f"{failed_runs} earlier execution attempt(s) failed, stalled, or were cancelled; "
+                "their monitor reports and recovery decisions are retained in the evidence bundle. "
+                "Only completed runs contribute measurements.",
+            ) if failed_runs else ()),
         )
         return ExperimentReport(
             id=uuid4().hex, project_id=spec.project_id, run_id=spec.run_id, analysis_id=analysis.id,
@@ -63,7 +78,7 @@ class ScientificReportWriter:
             exact_commands=exact_commands, baseline_results=analysis.baseline_metrics, aggregated_results=measurements,
             uncertainty="Derived statistics are limited to the recorded raw seed observations.",
             ablations="ABLATION_NOT_RUN" if not analysis.ablation_contributions else "Derived from measured descendant runs.",
-            robustness_tests="Not claimed unless represented by validated artifacts.", failed_runs=0,
+            robustness_tests="Not claimed unless represented by validated artifacts.", failed_runs=failed_runs,
             cost=analysis.training_inference_cost,
             limitations=limitations,
             reproducibility_instructions="Inspect the artifact contract, identity fields, raw seed observations, and exact statistics.",

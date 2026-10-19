@@ -27,7 +27,14 @@ class ExecutionAction:
 
 
 def specification_checksum(spec: ExperimentSpec, actions: tuple[ExecutionAction, ...], worker: str) -> str:
-    payload = {"spec": asdict(spec), "actions": [asdict(action) for action in actions], "worker": worker}
+    payload_spec = asdict(spec)
+    # Backward compatibility: the pre-v17 payload had no monitor_contract
+    # key. Omitting an EMPTY contract preserves every existing approval's
+    # checksum; a non-empty contract is new information and legitimately
+    # requires a fresh approval.
+    if not payload_spec.get("monitor_contract"):
+        payload_spec.pop("monitor_contract", None)
+    payload = {"spec": payload_spec, "actions": [asdict(action) for action in actions], "worker": worker}
     return hashlib.sha256(json.dumps(payload, default=str, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 

@@ -127,6 +127,12 @@ invent a percentage before a progress line arrives; report stalls honestly.
 - `executed_analysis_pending` is honest: a completed approved action is not a
   scientific result until artifacts are ingested and analyzed. Report that
   state; never infer a decision from an exit code.
+- `research_state` and `pending_recovery` — the consolidated state snapshot
+  and its artifact path. When an execution fails, `pending_recovery.action`
+  and `next_stage` say whether the next step is operational (retry/repair/
+  adjust) or scientific (redesign/novelty/review/stop). Nothing expensive is
+  auto-executed; resume explicitly after the user decides. `autoresearch
+  skill state --project <id>` prints the same snapshot.
 - `publication_gaps` — cumulative machine-readable blockers owned by review,
   novelty, or experiment (for example `reviewed_papers_below_minimum`,
   `baselines_below_minimum`, `execution_artifact_missing`).

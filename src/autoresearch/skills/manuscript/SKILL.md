@@ -100,6 +100,9 @@ keyword rules; each theme is a narrative built only from recorded problem,
 method, results, and limitation fields, followed by a comparison table and an
 explicit positioning paragraph. Every paper carries a citation key. A paper
 with no recorded review still contributes metadata; no claim is invented.
+When the review audit recorded cross-paper conflict candidates, the synthesis
+adds a **Conflicting evidence** subsection that quotes both claim statements
+and labels them heuristic candidates, not verified contradictions.
 
 ## Reviewer panel
 

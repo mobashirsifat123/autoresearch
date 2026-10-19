@@ -157,8 +157,49 @@ class FindingsMemory:
         reason: str,
         *,
         fidelity: str = "SMOKE",
+        failure_classification: str = "measurement_ingestion_failure",
     ) -> ResearchFinding:
-        """Persist an implementation/measurement failure as a first-class finding."""
+        """Persist an implementation/measurement/operational failure as a
+        first-class finding. The classification is explicit so a crashed
+        process is never conflated with a rejected hypothesis."""
+        if failure_classification == "operational_execution_failure":
+            lesson = (
+                f"Execution of spec {spec.id} did not complete: {reason[:300]}. "
+                "This is an operational failure, not evidence against the hypothesis; "
+                "repair the run and preserve the attempt in the record."
+            )
+            next_action = (
+                "Classify the cause (perception abort, timeout, stall, or crash), apply only the "
+                "matching operational repair, and re-approve; do not report a scientific decision."
+            )
+        elif failure_classification == "implementation_generation_failure":
+            lesson = (
+                f"Implementation generation for spec {spec.id} failed deterministic verification: "
+                f"{reason[:300]}. The method has not been executed."
+            )
+            next_action = (
+                "Fix the implementation against the verifier reasons, then re-verify; do not "
+                "execute an unverified script and do not treat this as a hypothesis test."
+            )
+        elif failure_classification == "insufficient_evidence":
+            lesson = (
+                f"The analysis for spec {spec.id} did not produce a decision-grade result: "
+                f"{reason[:300]}. The hypothesis was not tested."
+            )
+            next_action = (
+                "Redesign for discriminability (stronger manipulation, lower-variance metric, "
+                "more seeds) or stop; do not report a supported/refuted conclusion."
+            )
+        else:
+            lesson = (
+                f"Execution of spec {spec.id} completed but its measurements did not pass ingestion "
+                f"validation: {reason[:300]}. Repair the implementation's measurement contract before "
+                f"re-proposing this method."
+            )
+            next_action = (
+                "Repair the implementation (contract emission or identity binding), then re-execute; "
+                "do not treat as a scientific result."
+            )
         finding = ResearchFinding(
             id=uuid4().hex,
             project_id=spec.project_id,
@@ -177,15 +218,11 @@ class FindingsMemory:
             interpretation="",
             uncertainty="",
             fidelity=fidelity,
-            failure_classification="measurement_ingestion_failure",
-            lesson=(
-                f"Execution of spec {spec.id} completed but its measurements did not pass ingestion "
-                f"validation: {reason[:300]}. Repair the implementation's measurement contract before "
-                f"re-proposing this method."
-            ),
+            failure_classification=failure_classification,
+            lesson=lesson,
             applicability=f"dataset={spec.dataset_identity}",
             open_questions_json="[]",
-            next_action="Repair the implementation (contract emission or identity binding), then re-execute; do not treat as a scientific result.",
+            next_action=next_action,
             keywords_json=json.dumps(_keywords(spec.proposed_change, spec.hypothesis)),
             provenance=ArtifactProvenance.create(
                 project_id=spec.project_id, run_id=spec.run_id,

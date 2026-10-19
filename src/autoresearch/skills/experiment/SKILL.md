@@ -112,8 +112,11 @@ First show the exact action plan preview **without** `--accept`:
   --candidate-id "<candidate_id>"
 ```
 
-**STOP. Show the user the exact `actions`, `checksum`, `worker`, and `budget`
-from the preview. Ask for explicit confirmation before proceeding.**
+**STOP. Show the user the exact `actions`, `checksum`, `worker`, `budget`,
+`implementation_checksum`, `implementation_verified`, and
+`monitor_contract` from the preview. The monitor contract can terminate the
+run, and the implementation digest binds the code that will execute. Ask for
+explicit confirmation before proceeding.**
 
 Only after the user explicitly confirms, record the approval:
 
@@ -134,6 +137,29 @@ Only valid after Step 3 `--accept` has been recorded.
 ```
 
 **Output:** run status and worker `jobs`.
+
+While the process runs, the worker enforces the spec's optional
+`monitor_contract` deterministically (no model call):
+
+- generated code emits `AUTORESEARCH_PROBE:{"name": ..., "value": ...}`
+  (the legacy `EA_PROBE:` prefix is also accepted);
+- NaN/Inf, a declared min/max breach, a persisted trend violation, a guard
+  event, or a stall terminates the process group early;
+- a bounded `execution_monitor` artifact records per-signal summaries, all
+  non-info verdicts, unobserved monitors, predicate status, and malformed
+  probe counts;
+- suspect observations are retained as evidence but never abort alone;
+- when a verified implementation artifact exists, the script must byte-match
+  it or the worker refuses to execute it (`implementation_integrity`);
+  the workflow re-verifies any existing script before approval and stops on
+  failure. A direct execution with no verification artifact is recorded as
+  unverified and still requires the exact approval.
+
+A failed execution creates a checksummed `recovery_decision` and a Findings
+Memory entry. The decision classifies the failure as a **fast operational**
+problem (retry the same spec / repair the implementation / adjust parameters)
+or a **slow scientific** problem (redesign / return to novelty / return to
+review / stop). It is a recommendation; nothing expensive runs automatically.
 
 ### Step 5 — Report
 
@@ -201,6 +227,9 @@ invent a percentage before a progress line arrives; report stalls honestly.
 - `spec.metrics` — what is measured.
 - `spec.random_seeds` — reproducibility seeds (from power analysis).
 - `spec.statistical_plan` — frequentist + Bayesian approach.
+- `spec.monitor_contract` — optional pre-registered runtime signals
+  (≤3) with units, healthy bounds/trend, a safe `abort_if` predicate, and an
+  optional `stall_seconds`. Empty means process-level checks only.
 - `approval.worker` — the worker type (e.g., `local`).
 - `approval.actions` — the exact actions to be executed.
 - `approval.checksum` — the tamper-detection checksum.
@@ -212,6 +241,10 @@ invent a percentage before a progress line arrives; report stalls honestly.
   `implementation_failure`, `optimization_failure`, `data_limitation`,
   `evaluation_artifact`, `cost_prohibitive`, `domain_specific`, `mechanism_contradicted`.
 - `decision_evidence` — the specific evidence for the decision.
+- `recovery` — when a `recovery_decision` exists: `action`, `loop`
+  (`fast`/`slow`), `next_stage`, rationale, and artifact path. A fast-loop
+  action does not revise the scientific hypothesis; a slow-loop action
+  requires an explicit resume.
 - `limitations` — at least 3 study-limitation rows (measurement provenance,
   dataset/split/seed bounds, unrun ablations/robustness). The manuscript
   Discussion lists them; observations and interpretations stay in separate
@@ -249,6 +282,12 @@ Raw seed observations (checksummed) feed the manuscript Appendices
   the last approval — re-run the approve step before executing.
 - If `decision` is `implementation_failure` or `evaluation_artifact`, do NOT
   claim the experiment succeeded — report the failure honestly.
+- A runtime abort is an operational event, not evidence against the
+  hypothesis. Report the exact monitor reason and do not describe the run as
+  a scientific result.
+- Report the `recovery.action` and `next_stage` verbatim; never silently
+  retry, edit code after approval, or start a novelty/review cycle without an
+  explicit user resume.
 - Surface `decision_evidence` to the user verbatim; do not paraphrase the
   scientific conclusions.
 - The report must carry at least 3 study-limitation rows so the manuscript

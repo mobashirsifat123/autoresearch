@@ -5,8 +5,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import signal
 import time
 from collections.abc import Sequence
+from datetime import datetime, timezone
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -54,6 +57,12 @@ from autoresearch.providers.errors import ErrorKind, ProviderError
 from autoresearch.experiments.integrity import IntegrityFailure
 from autoresearch.experiments.matrix import ExperimentMatrix
 from autoresearch.application.findings import FindingsMemory
+from autoresearch.application.recovery import (
+    classify_execution_failure,
+    classify_report_decision,
+    latest_recovery_decision,
+    write_recovery_decision,
+)
 from autoresearch.providers.redaction import redact_text
 from autoresearch.providers.router import ModelRouter
 
@@ -189,6 +198,7 @@ class ReviewOutcome:
     review_corpus_path: str | None = None
     citation_contexts_path: str | None = None
     publication_gaps: tuple[dict[str, Any], ...] = ()
+    review_audit_path: str | None = None
 
 
 class SearchStrategyGenerator:
@@ -1132,6 +1142,28 @@ class LiteratureReviewService:
                 build_review_publication,
             )
 
+            # Cross-paper conflict candidates + missing-evidence ledger. This
+            # is deterministic and must not block the review if it fails.
+            audit: dict[str, Any] | None = None
+            try:
+                from autoresearch.review.conflicts import save_review_audit
+
+                audit, audit_artifact = save_review_audit(
+                    self.repository, project_id=project_id, run_id=run_id
+                )
+                self.repository.complete_checkpoint(
+                    run_id,
+                    "review_audit",
+                    payload={
+                        "path": audit_artifact.path,
+                        "checksum": audit_artifact.checksum,
+                    },
+                )
+            except Exception:
+                logger.warning(
+                    "Review audit persistence failed for run %s", run_id, exc_info=True
+                )
+
             try:
                 publication = build_review_publication(
                     self.repository,
@@ -1142,6 +1174,7 @@ class LiteratureReviewService:
                     claims=claims,
                     top_paper_ids=[score.paper_id for score in top_scores],
                     gap=gap,
+                    audit=audit,
                 )
                 self.repository.complete_checkpoint(
                     run_id,
@@ -1200,6 +1233,7 @@ class LiteratureReviewService:
                 publication.corpus_path if publication else None,
                 publication.contexts_path if publication else None,
                 tuple(publication.gaps) if publication else (),
+                audit_artifact.path if audit is not None else None,
             )
         except BaseException as exc:
             if isinstance(exc, asyncio.CancelledError):
@@ -1330,6 +1364,9 @@ class LiteratureReviewService:
         markdown_artifacts = [
             item for item in artifacts if item.artifact_type == "gap_report_markdown"
         ]
+        audit_artifacts = [
+            item for item in artifacts if item.artifact_type == "review_audit"
+        ]
         if not gap or not json_artifacts or not markdown_artifacts:
             raise RuntimeError(
                 f"Completed review run '{run_id}' has incomplete artifacts."
@@ -1363,6 +1400,7 @@ class LiteratureReviewService:
             str(corpus_path) if corpus_path else None,
             str(contexts_path) if contexts_path else None,
             publication_gaps,
+            audit_artifacts[-1].path if audit_artifacts else None,
         )
 
 
@@ -1672,6 +1710,105 @@ class ExperimentService:
             report_writer=ScientificReportWriter(router),
         )
         self.worker = worker
+        self._last_recovery: dict[str, dict[str, Any]] = {}
+
+    def recovery_for_candidate(self, candidate_id: str) -> dict[str, Any] | None:
+        """Latest persisted recovery decision for a candidate, if any."""
+        cached = self._last_recovery.get(candidate_id)
+        if cached is not None:
+            return cached
+        spec = self.repository.get_experiment_spec(candidate_id)
+        if spec is None:
+            return None
+        decision = latest_recovery_decision(
+            self.repository, project_id=spec.project_id, run_id=spec.run_id
+        )
+        if decision is not None:
+            self._last_recovery[candidate_id] = decision
+        return decision
+
+    def _record_execution_failure(
+        self,
+        spec: ExperimentSpec,
+        *,
+        category: str,
+        reason: str,
+        attempt: int,
+        monitor: dict[str, Any] | None = None,
+        state: str = "FAILED",
+        failure_classification: str = "operational_execution_failure",
+    ) -> dict[str, Any]:
+        """Persist an operational failure as a recovery decision AND a finding.
+
+        Bookkeeping must never hide the original failure; the caller still
+        raises/reports the execution error.
+        """
+        decision = classify_execution_failure(
+            project_id=spec.project_id,
+            run_id=spec.run_id,
+            spec_id=spec.id,
+            state=state,
+            error_category=category,
+            error_reason=reason,
+            attempt=attempt,
+            monitor=monitor,
+        )
+        try:
+            payload = write_recovery_decision(self.repository, decision)
+        except Exception:  # noqa: BLE001 — preserve the execution error
+            logger.warning(
+                "Recovery decision could not be persisted for spec %s", spec.id,
+                exc_info=True,
+            )
+            payload = decision.to_dict()
+            payload["artifact_path"] = None
+        self._last_recovery[spec.candidate_id] = payload
+        try:
+            self.findings.record_failure(
+                spec,
+                f"operational execution failure ({category}): {reason}"[:500],
+                fidelity="EXECUTION",
+                failure_classification=failure_classification,
+            )
+        except Exception:  # noqa: BLE001 — memory bookkeeping only
+            logger.warning(
+                "Operational failure finding could not be recorded for spec %s",
+                spec.id, exc_info=True,
+            )
+        return payload
+
+    def _record_report_recovery(
+        self, spec: ExperimentSpec, outcome: dict[str, Any]
+    ) -> dict[str, Any]:
+        decision = classify_report_decision(
+            project_id=spec.project_id,
+            run_id=spec.run_id,
+            spec_id=spec.id,
+            decision=str(outcome.get("decision") or "insufficient_evidence"),
+            report_id=str(outcome.get("report_id") or ""),
+            analysis_id=str(outcome.get("analysis_id") or ""),
+        )
+        existing = latest_recovery_decision(
+            self.repository, project_id=spec.project_id, run_id=spec.run_id
+        )
+        if (
+            existing
+            and existing.get("source") == "report"
+            and existing.get("outcome") == decision.outcome
+        ):
+            self._last_recovery[spec.candidate_id] = existing
+            return existing
+        try:
+            payload = write_recovery_decision(self.repository, decision)
+        except Exception:  # noqa: BLE001 — preserve the report path
+            logger.warning(
+                "Report recovery decision could not be persisted for spec %s",
+                spec.id, exc_info=True,
+            )
+            payload = decision.to_dict()
+            payload["artifact_path"] = None
+        self._last_recovery[spec.candidate_id] = payload
+        return payload
 
     async def import_candidate(
         self, candidate_data: dict[str, Any]
@@ -1802,6 +1939,32 @@ class ExperimentService:
             return self.worker.worker_id
         return spec.target_worker or "local"
 
+    def _implementation_binding(self, spec: ExperimentSpec) -> dict[str, Any]:
+        """Expose the exact code the approval will bind, not just the plan."""
+        checksum = ""
+        for artifact in self.repository.artifacts_for_run(spec.run_id):
+            if artifact.artifact_type == "experiment_implementation" and spec.id in artifact.source_evidence:
+                checksum = artifact.checksum
+        verified = False
+        status = "missing"
+        for artifact in self.repository.artifacts_for_run(spec.run_id):
+            if artifact.artifact_type != "implementation_verification":
+                continue
+            try:
+                payload = json.loads(Path(artifact.path).read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if str(payload.get("spec_id") or "") != spec.id:
+                continue
+            verified = str(payload.get("level") or "") == "STATIC_VERIFIED"
+            status = str(payload.get("status") or "unknown")
+        return {
+            "implementation_checksum": checksum,
+            "implementation_verified": verified,
+            "implementation_status": status,
+            "monitor_contract": dict(getattr(spec, "monitor_contract", {}) or {}),
+        }
+
     def approval_preview(self, run_id: str) -> dict[str, object]:
         run = self.repository.get_run(run_id)
         if not run:
@@ -1836,6 +1999,7 @@ class ExperimentService:
             ],
             "budget": 0.0,
             "expires_at": None,
+            **self._implementation_binding(typed_spec),
         }
 
     def approval_preview_for_candidate(self, candidate_id: str) -> dict[str, object]:
@@ -1863,6 +2027,7 @@ class ExperimentService:
             ],
             "budget": 3600.0,
             "expires_at": None,
+            **self._implementation_binding(spec),
         }
 
     def _methodology_for_spec(self, spec: ExperimentSpec) -> dict[str, Any] | None:
@@ -1887,7 +2052,11 @@ class ExperimentService:
             raise ValueError(
                 f"no_experiment_spec: plan the experiment for candidate {candidate_id} first"
             )
-        require_provider_credentials(self.router, ModelRole.RESEARCH_REASONING)
+        script_path = Path(str(spec.repository)) / "scripts" / "run_experiment.py"
+        # An existing script can be verified deterministically without a model
+        # call. Only generation needs a configured provider.
+        if not script_path.is_file():
+            require_provider_credentials(self.router, ModelRole.RESEARCH_REASONING)
         freeze = self.repository.latest_methodology_freeze(spec.project_id)
         methodology = self._methodology_for_spec(spec)
         findings = self.findings.context_block(spec.project_id, spec.hypothesis)
@@ -1908,6 +2077,7 @@ class ExperimentService:
                 "implementation generation failed static verification: "
                 + "; ".join(record["verification"]["reasons"][:3]),
                 fidelity="STATIC",
+                failure_classification="implementation_generation_failure",
             )
         self.repository.append_api_event(
             spec.run_id,
@@ -1967,6 +2137,67 @@ class ExperimentService:
             ),
         )
 
+    async def cancel_run(self, run_id: str) -> dict[str, Any]:
+        """Cancel a run and any live worker process group it owns.
+
+        The database is shared, so cancellation must work from a different
+        process than the one running the experiment.
+        """
+        run = self.repository.get_run(run_id)
+        if not run:
+            raise ValueError(f"run_not_found: run '{run_id}' not found")
+        jobs = self.repository.rows(
+            "SELECT id,process_group_id,state,heartbeat_at FROM worker_jobs WHERE run_id=? "
+            "AND state IN ('QUEUED','LEASED','RUNNING','ANALYZING')",
+            (run_id,),
+        )
+        killpg = getattr(os, "killpg", None)
+        cancelled: list[str] = []
+        signalled: list[tuple[str, int]] = []
+        now = datetime.now(timezone.utc)
+        for row in jobs:
+            # Only signal a RECENT heartbeat. A crashed worker leaves a stale
+            # PGID that may already belong to an unrelated process.
+            fresh = False
+            try:
+                if row.get("heartbeat_at"):
+                    fresh = (now - datetime.fromisoformat(str(row["heartbeat_at"]))).total_seconds() <= 120
+            except ValueError:
+                fresh = False
+            if fresh and killpg is not None and row.get("process_group_id"):
+                try:
+                    pgid = int(row["process_group_id"])
+                    killpg(pgid, signal.SIGTERM)
+                    signalled.append((str(row["id"]), pgid))
+                except (ProcessLookupError, PermissionError, ValueError):
+                    pass
+            current = self.repository.worker_job(str(row["id"]))
+            if current is not None:
+                previous = str(current.get("state") or "")
+                current["state"] = "CANCELED"
+                current["updated_at"] = utc_now()
+                self.repository.save_worker_job(current)
+                self.repository.append_worker_transition(
+                    run_id, previous, "CANCELED", reason="cancellation requested",
+                    worker_id=str(current.get("worker") or "local"),
+                    attempt=int(current.get("attempt") or 0),
+                )
+            cancelled.append(str(row["id"]))
+        if signalled:
+            # Give cooperative handlers a moment, then force the group down.
+            await asyncio.sleep(2.0)
+            for _, pgid in signalled:
+                try:
+                    killpg(pgid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+        self.repository.cancel_run(run_id)
+        self.repository.append_api_event(run_id, "run.cancel_requested", {
+            "jobs": cancelled,
+            "process_groups_signalled": len([row for row in jobs if row.get("process_group_id")]),
+        })
+        return {"run_id": run_id, "status": "cancelled", "worker_jobs": cancelled}
+
     async def report_for_candidate(self, candidate_id: str) -> dict[str, Any]:
         """Complete the result path for an executed candidate: reuse the
         validated statistical analysis and write (or reuse) the deterministic
@@ -1983,7 +2214,7 @@ class ExperimentService:
         )
         if existing:
             completeness = ExperimentMatrix.from_spec(spec).completeness(["main"])
-            return {
+            result = {
                 "report_id": existing["id"],
                 "decision": existing["decision"],
                 "decision_evidence": existing["decision_evidence"],
@@ -1992,6 +2223,8 @@ class ExperimentService:
                 "candidate_id": candidate_id,
                 "experiment_completeness": completeness,
             }
+            result["recovery"] = self._record_report_recovery(spec, result)
+            return result
         analysis = self.repository.get_statistical_analysis(spec.id)
         if not analysis:
             raise ValueError(
@@ -1999,10 +2232,19 @@ class ExperimentService:
                 "execute the approved experiment (measurement ingestion and analysis run automatically) "
                 "or inspect the recorded integrity failure"
             )
-        report = await self.pipeline.report_writer.write(spec, analysis)
+        try:
+            report = await self.pipeline.report_writer.write(spec, analysis)
+        except IntegrityFailure as exc:
+            if "INSUFFICIENT_EVIDENCE" in str(exc).upper():
+                self._record_report_recovery(spec, {
+                    "decision": "insufficient_evidence",
+                    "report_id": "",
+                    "analysis_id": analysis.id,
+                })
+            raise
         self.repository.save_experiment_report(report)
         completeness = ExperimentMatrix.from_spec(spec).completeness(["main"])
-        return {
+        result = {
             "report_id": report.id,
             "decision": report.decision.value,
             "decision_evidence": report.decision_evidence,
@@ -2011,6 +2253,8 @@ class ExperimentService:
             "candidate_id": candidate_id,
             "experiment_completeness": completeness,
         }
+        result["recovery"] = self._record_report_recovery(spec, result)
+        return result
 
     async def execute_candidate(
         self,
@@ -2052,6 +2296,9 @@ class ExperimentService:
             run_candidate = replace(candidate, run_id=run.id)
             if mode == "report":
                 outcome = await self.report_for_candidate(candidate_id)
+                spec_for_report = self.repository.get_experiment_spec(candidate_id)
+                if spec_for_report is not None:
+                    self._record_report_recovery(spec_for_report, outcome)
                 if owns_run:
                     self.repository.finish_run(run.id)
                 return str(outcome["spec_id"])
@@ -2105,6 +2352,9 @@ class ExperimentService:
                     raise RuntimeError(
                         "worker_unavailable: no policy-controlled execution worker is configured"
                     )
+                current_run = self.repository.get_run(run.id)
+                if current_run is not None and current_run.status is RunStatus.CANCELLED:
+                    raise RuntimeError("execution_cancelled: this run was cancelled before execution")
                 preview = self.approval_preview_for_candidate(candidate_id)
                 approval = self.repository.approval_by_checksum(
                     str(preview["checksum"])
@@ -2124,22 +2374,51 @@ class ExperimentService:
                 from autoresearch.application.progress import report as _progress
 
                 _progress("experiment.worker", 0, 4, detail="approved execution starting", remaining=["execution", "ingestion", "analysis", "report"])
-                result = await self.worker.run(
-                    spec,
-                    self.action_plan(spec),
-                    approved_checksum=str(preview["checksum"]),
-                    timeout_seconds=int(approval.get("approved_budget") or 3600),
-                )
+                try:
+                    result = await self.worker.run(
+                        spec,
+                        self.action_plan(spec),
+                        approved_checksum=str(preview["checksum"]),
+                        timeout_seconds=int(approval.get("approved_budget") or 3600),
+                    )
+                except Exception as exc:  # integrity/launch failure before a worker result
+                    self._record_execution_failure(
+                        spec,
+                        category="WORKER_EXCEPTION",
+                        reason=f"{type(exc).__name__}: {exc}",
+                        attempt=0,
+                        state="FAILED",
+                    )
+                    raise
                 _progress("experiment.worker", 1, 4, detail=f"worker state: {result.get('state')}", remaining=["ingestion", "analysis", "report"])
                 if result.get("state") != "COMPLETED":
+                    perception = dict(result.get("perception") or {})
+                    category = str(perception.get("category") or "EXIT_CODE")
+                    reason = str(
+                        perception.get("reason")
+                        or "worker did not complete the approved scientific action"
+                    )
+                    recovery = self._record_execution_failure(
+                        spec,
+                        category=category,
+                        reason=reason,
+                        attempt=int(result.get("attempt") or 1),
+                        monitor=perception,
+                        state=str(result.get("state") or "FAILED"),
+                    )
                     raise RuntimeError(
-                        "execution_failed: worker did not complete the approved scientific action"
+                        "execution_failed: worker did not complete the approved scientific action "
+                        f"({category}: {reason[:300]}; recovery={recovery.get('action')} -> "
+                        f"{recovery.get('next_stage')})"
                     )
                 # Complete the result path: ingest the measured artifacts the
                 # implementation emitted, run the deterministic statistical
                 # analysis, and write the fail-closed report. Any integrity
                 # failure is recorded and leaves the honest pending state —
                 # a completed command never implies a scientific result.
+                latest_run = self.repository.get_run(run.id)
+                if latest_run is not None and latest_run.status is RunStatus.CANCELLED:
+                    raise RuntimeError("execution_cancelled: run was cancelled before analysis")
                 try:
                     analysis = self.repository.get_statistical_analysis(spec.id)
                     if analysis is None:
@@ -2162,7 +2441,11 @@ class ExperimentService:
                         detail="deterministic statistical analysis complete",
                         remaining=["report"],
                     )
+                    latest_run = self.repository.get_run(run.id)
+                    if latest_run is not None and latest_run.status is RunStatus.CANCELLED:
+                        raise RuntimeError("execution_cancelled: run was cancelled before report")
                     report = await self.report_for_candidate(candidate_id)
+                    self._record_report_recovery(spec, report)
                     _progress(
                         "experiment.worker", 4, 4,
                         detail="report written; result path complete",
@@ -2215,15 +2498,31 @@ class ExperimentService:
                             "reason": redact_text(f"{type(exc).__name__}: {exc}"),
                         },
                     )
-                    try:
-                        self.findings.record_failure(
-                            spec, f"{type(exc).__name__}: {exc}"
-                        )
-                    except Exception:  # memory bookkeeping only
-                        logger.warning(
-                            "Failure-finding recording failed for spec %s",
-                            spec.id,
-                            exc_info=True,
+                    if "INSUFFICIENT_EVIDENCE" in str(exc).upper():
+                        # A completed run whose analysis cannot support a
+                        # decision is a slow-loop outcome, not an operational
+                        # crash. The hypothesis was not tested.
+                        self._record_report_recovery(spec, {
+                            "decision": "insufficient_evidence",
+                            "report_id": "",
+                            "analysis_id": analysis.id if analysis else "",
+                        })
+                        try:
+                            self.findings.record_failure(
+                                spec,
+                                f"insufficient evidence: {exc}"[:500],
+                                fidelity="CONFIRMATORY",
+                                failure_classification="insufficient_evidence",
+                            )
+                        except Exception:  # noqa: BLE001 — memory bookkeeping only
+                            logger.warning("Insufficient-evidence finding failed for spec %s", spec.id, exc_info=True)
+                    else:
+                        self._record_execution_failure(
+                            spec,
+                            category="INGESTION",
+                            reason=f"{type(exc).__name__}: {exc}",
+                            attempt=int(result.get("attempt") or 1),
+                            failure_classification="measurement_ingestion_failure",
                         )
             if owns_run:
                 self.repository.finish_run(run.id)

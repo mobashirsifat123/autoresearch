@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Mapping
 
 _THEME_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -117,6 +118,8 @@ class LiteratureSynthesis:
     comparison_table: str = ""
     positioning: str = ""
     gap_statement: str = ""
+    conflicts: tuple[dict[str, Any], ...] = ()
+    missing_evidence: tuple[dict[str, Any], ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -125,6 +128,8 @@ class LiteratureSynthesis:
             "themes": list(self.themes),
             "comparison_table": self.comparison_table,
             "positioning": self.positioning,
+            "conflicts": [dict(item) for item in self.conflicts],
+            "missing_evidence": [dict(item) for item in self.missing_evidence],
             "n_papers": len(self.papers),
         }
 
@@ -179,6 +184,28 @@ class LiteratureSynthesis:
             lines += ["### Comparison of reviewed studies", "", self.comparison_table, ""]
         if self.positioning:
             lines += ["### Positioning of this study", "", self.positioning, ""]
+        if self.conflicts:
+            lines += [
+                "### Conflicting evidence",
+                "",
+                "The review audit identified the following candidate conflicts. They are "
+                "heuristic retrieval candidates, not verified contradictions; datasets, "
+                "metrics, and protocols must be compared before treating them as disagreements.",
+                "",
+            ]
+            key_by_id = {paper.paper_id: paper.key for paper in self.papers}
+            for item in self.conflicts:
+                left = item.get("left") or {}
+                right = item.get("right") or {}
+                left_ref = f"[@{key_by_id[left.get('paper_id')]}]" if key_by_id.get(left.get("paper_id")) else f"`{left.get('paper_id', '')}`"
+                right_ref = f"[@{key_by_id[right.get('paper_id')]}]" if key_by_id.get(right.get("paper_id")) else f"`{right.get('paper_id', '')}`"
+                lines.append(
+                    f"- {left_ref} reports \"{_clean(left.get('statement', ''), 180)}\" "
+                    f"({left.get('polarity', 'unknown')}), while {right_ref} reports "
+                    f"\"{_clean(right.get('statement', ''), 180)}\" ({right.get('polarity', 'unknown')}). "
+                    f"Shared terms: {', '.join(item.get('shared_terms') or [])}."
+                )
+            lines.append("")
         return lines
 
 
@@ -325,6 +352,9 @@ def build_literature_synthesis(
         + (f". The preregistered hypothesis is: {hypothesis}" if hypothesis else ".")
     )
 
+    conflicts, missing_evidence = _latest_review_audit(
+        repository, project_id, review_run_id=review_run_id, allowed_paper_ids=set(by_id)
+    )
     return LiteratureSynthesis(
         papers=tuple(papers),
         themes=themes,
@@ -333,4 +363,49 @@ def build_literature_synthesis(
         gap_statement=_clean(getattr(gap, "statement", "") if gap is not None else "", 280)
         if not isinstance(gap, Mapping)
         else _clean(gap.get("statement") or "", 280),
+        conflicts=conflicts,
+        missing_evidence=missing_evidence,
     )
+
+
+def _latest_review_audit(
+    repository: Any,
+    project_id: str,
+    *,
+    review_run_id: str | None = None,
+    allowed_paper_ids: set[str] | None = None,
+) -> tuple[tuple[dict[str, Any], ...], tuple[dict[str, Any], ...]]:
+    """Read the review audit for the SELECTED review run; absence degrades to
+    an empty section. Conflicts citing papers outside the manuscript corpus are
+    dropped so the section cannot mention an uncited paper."""
+    try:
+        if review_run_id:
+            rows = repository.rows(
+                "SELECT path FROM artifacts WHERE project_id=? AND run_id=? "
+                "AND artifact_type='review_audit' ORDER BY rowid DESC LIMIT 1",
+                (project_id, review_run_id),
+            )
+        else:
+            rows = repository.rows(
+                "SELECT path FROM artifacts WHERE project_id=? AND artifact_type='review_audit' "
+                "ORDER BY rowid DESC LIMIT 1",
+                (project_id,),
+            )
+        if not rows:
+            return (), ()
+        payload = json.loads(Path(str(rows[0]["path"])).read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError):
+        return (), ()
+    conflicts = tuple(
+        item for item in (payload.get("cross_paper_conflicts") or [])
+        if isinstance(item, dict)
+        and (
+            allowed_paper_ids is None
+            or (
+                str((item.get("left") or {}).get("paper_id") or "") in allowed_paper_ids
+                and str((item.get("right") or {}).get("paper_id") or "") in allowed_paper_ids
+            )
+        )
+    )
+    missing = tuple(item for item in (payload.get("missing_evidence") or []) if isinstance(item, dict))
+    return conflicts, missing
